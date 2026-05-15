@@ -58,6 +58,7 @@ MODULE post_scf_bandstructure_utils
    USE input_constants,                 ONLY: int_ldos_z,&
                                               large_cell_Gamma,&
                                               large_cell_Gamma_ri_rs,&
+                                              non_periodic_ri_rs,&
                                               small_cell_full_kp
    USE input_section_types,             ONLY: section_vals_get,&
                                               section_vals_get_subs_vals,&
@@ -148,7 +149,7 @@ CONTAINS
       CALL set_heuristic_parameters(bs_env)
 
       SELECT CASE (bs_env%small_cell_full_kp_or_large_cell_Gamma)
-      CASE (large_cell_Gamma, large_cell_Gamma_ri_rs)
+      CASE (large_cell_Gamma, large_cell_Gamma_ri_rs, non_periodic_ri_rs)
 
          CALL setup_kpoints_DOS_large_cell_Gamma(qs_env, bs_env, bs_env%kpoints_DOS)
 
@@ -882,9 +883,9 @@ CONTAINS
       IF (dft_control%nimages == 1) THEN
          IF (bs_env%do_gw_ri_rs) THEN
             IF (ANY(periodic /= 0)) THEN
-               CPABORT("RI-RS Not Implemented for Periodic Calculations")
-            ELSE
                bs_env%small_cell_full_kp_or_large_cell_Gamma = large_cell_Gamma_ri_rs
+            ELSE
+               bs_env%small_cell_full_kp_or_large_cell_Gamma = non_periodic_ri_rs
             END IF
          ELSE
             bs_env%small_cell_full_kp_or_large_cell_Gamma = large_cell_Gamma
@@ -1169,7 +1170,7 @@ CONTAINS
          DO ispin = 1, bs_env%n_spin
 
             SELECT CASE (bs_env%small_cell_full_kp_or_large_cell_Gamma)
-            CASE (large_cell_Gamma, large_cell_Gamma_ri_rs)
+            CASE (large_cell_Gamma, large_cell_Gamma_ri_rs, non_periodic_ri_rs)
 
                ! 1. get H^KS_µν(k_i) from H^KS_µν(k=0)
                CALL cfm_ikp_from_fm_Gamma(cfm_ks_ikp, bs_env%fm_ks_Gamma(ispin), &
@@ -1632,7 +1633,7 @@ CONTAINS
 
       ! 1. get V^SOC_µν,σσ'(k_i)
       SELECT CASE (bs_env%small_cell_full_kp_or_large_cell_Gamma)
-      CASE (large_cell_Gamma, large_cell_Gamma_ri_rs)
+      CASE (large_cell_Gamma, large_cell_Gamma_ri_rs, non_periodic_ri_rs)
 
          ! 1. get V^SOC_µν,σσ'(k_i) from V^SOC_µν,σσ'(k=0)
          CALL cfm_ikp_from_cfm_spinor_Gamma(cfm_SOC_ikp_spinor, &
@@ -2686,7 +2687,7 @@ CONTAINS
       ! Calculate H^SOC_µν,σσ'(k) = sum_α V^SOC_µν^(α)(k)*Pauli-matrix^(α)_σσ'
       ! see Hartwigsen, Goedecker, Hutter, Eq.(18) (doi.org/10.1103/PhysRevB.58.3641)
       SELECT CASE (bs_env%small_cell_full_kp_or_large_cell_Gamma)
-      CASE (large_cell_Gamma, large_cell_Gamma_ri_rs)
+      CASE (large_cell_Gamma, large_cell_Gamma_ri_rs, non_periodic_ri_rs)
 
          ! H^SOC_µν,σσ' = sum_α V^SOC_µν^(α)*Pauli-matrix^(α)_σσ'
          CALL H_KS_spinor_Gamma(bs_env)

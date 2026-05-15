@@ -63,6 +63,7 @@ MODULE gw_utils
    USE input_constants,                 ONLY: do_potential_truncated,&
                                               large_cell_Gamma,&
                                               large_cell_Gamma_ri_rs,&
+                                              non_periodic_ri_rs,&
                                               ri_rpa_g0w0_crossing_newton,&
                                               rtp_method_bse,&
                                               small_cell_full_kp,&
@@ -190,7 +191,7 @@ CONTAINS
       CALL create_tensors(qs_env, bs_env)
 
       SELECT CASE (bs_env%small_cell_full_kp_or_large_cell_Gamma)
-      CASE (large_cell_Gamma, large_cell_Gamma_ri_rs)
+      CASE (large_cell_Gamma, large_cell_Gamma_ri_rs, non_periodic_ri_rs)
 
          CALL allocate_GW_eigenvalues(bs_env)
 
@@ -500,7 +501,7 @@ CONTAINS
                nkp_grid_extra(i_dim) = 1
             CASE (1)
                SELECT CASE (bs_env%small_cell_full_kp_or_large_cell_Gamma)
-               CASE (large_cell_Gamma, large_cell_Gamma_ri_rs)
+               CASE (large_cell_Gamma, large_cell_Gamma_ri_rs, non_periodic_ri_rs)
                   nkp_grid(i_dim) = 4
                   nkp_grid_extra(i_dim) = 6
                CASE (small_cell_full_kp)
@@ -1755,7 +1756,7 @@ CONTAINS
       energy_ex = energy%ex
 
       SELECT CASE (bs_env%small_cell_full_kp_or_large_cell_Gamma)
-      CASE (large_cell_Gamma, large_cell_Gamma_ri_rs)
+      CASE (large_cell_Gamma, large_cell_Gamma_ri_rs, non_periodic_ri_rs)
 
          NULLIFY (mat_ks_without_v_xc)
          CALL dbcsr_allocate_matrix_set(mat_ks_without_v_xc, bs_env%n_spin)
@@ -1874,7 +1875,7 @@ CONTAINS
       DO ispin = 1, bs_env%n_spin
          homo = bs_env%n_occ(ispin)
          SELECT CASE (bs_env%small_cell_full_kp_or_large_cell_Gamma)
-         CASE (large_cell_Gamma, large_cell_Gamma_ri_rs)
+         CASE (large_cell_Gamma, large_cell_Gamma_ri_rs, non_periodic_ri_rs)
             E_min_ispin = bs_env%eigenval_scf_Gamma(homo + 1, ispin) - &
                           bs_env%eigenval_scf_Gamma(homo, ispin)
             E_max_ispin = bs_env%eigenval_scf_Gamma(n_mo, ispin) - &
