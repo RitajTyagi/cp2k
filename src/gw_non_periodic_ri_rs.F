@@ -10,11 +10,11 @@
 !> \par History
 !>      04.2026 created [Ritaj Tyagi]
 ! **************************************************************************************************
-MODULE gw_large_cell_Gamma_ri_rs
+MODULE gw_non_periodic_ri_rs
    USE atomic_kind_types,               ONLY: atomic_kind_type
    USE basis_set_types,                 ONLY: gto_basis_set_type
    USE cell_types,                      ONLY: cell_type,&
-                                              pbc, get_cell
+                                              pbc
    USE constants_operator,              ONLY: operator_coulomb
    USE input_constants,                 ONLY: rtp_method_bse
    USE cp_dbcsr_api,                    ONLY: &
@@ -61,9 +61,7 @@ MODULE gw_large_cell_Gamma_ri_rs
                                               fill_fm_Sigma_c_Gamma_time,&
                                               multiply_fm_W_MIC_time_with_Minv_Gamma, &
                                               create_fm_W_MIC_time, Fourier_transform_w_to_t,&
-                                              compute_fm_chi_Gamma_freq, fm_write, get_W_MIC
-   USE gw_non_periodic_ri_rs,           ONLY: ri_rs_grid_assembler, &
-                                              get_basis_offsets
+                                              compute_fm_chi_Gamma_freq, fm_write
    USE kpoint_coulomb_2c,               ONLY: build_2c_coulomb_matrix_kp
    USE mp2_ri_2c,                       ONLY: RI_2c_integral_mat
    USE parallel_gemm_api,               ONLY: parallel_gemm
@@ -87,9 +85,10 @@ MODULE gw_large_cell_Gamma_ri_rs
 
    PRIVATE
 
-   CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_large_cell_Gamma_ri_rs'
+   CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_non_periodic_ri_rs'
 
-   PUBLIC :: gw_calc_large_cell_Gamma_ri_rs
+   PUBLIC :: gw_calc_non_periodic_ri_rs, ri_rs_grid_assembler, &
+             get_basis_offsets
 
 CONTAINS
 
@@ -99,12 +98,12 @@ CONTAINS
 !> \param bs_env ...
 ! **************************************************************************************************
 
-   SUBROUTINE gw_calc_large_cell_Gamma_ri_rs(qs_env, bs_env)
+   SUBROUTINE gw_calc_non_periodic_ri_rs(qs_env, bs_env)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'gw_calc_large_cell_Gamma_ri_rs'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'gw_calc_non_periodic_ri_rs'
 
       INTEGER                                            :: handle
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_Sigma_x_Gamma, fm_W_time
@@ -157,10 +156,10 @@ CONTAINS
                                  bs_env%ri_rs%mat_phi_mu_l, bs_env%ri_rs%mat_Z_lP)
 
        !!========================================================================
-       !! 5. Compute Screened Interaction (W^MIC)
-       !!    χ_PQ(iτ) -> χ_PQ(iω) -> ε_PQ(iω) -> W_PQ(iω) -> W^MIC_PQ(iτ)
+       !! 5. Compute Screened Interaction (W)
+       !!    χ_PQ(iτ) -> χ_PQ(iω) -> ε_PQ(iω) -> W_PQ(iω) -> W_PQ(iτ)
        !!========================================================================
-      CALL get_W_MIC(bs_env, qs_env, bs_env%mat_chi_Gamma_tau, fm_W_time)
+      CALL compute_W(bs_env, qs_env, bs_env%mat_chi_Gamma_tau, fm_W_time)
 
        !!========================================================================
        !! 6. Compute Exact Exchange Self-Energy (Σ^x)
@@ -175,9 +174,9 @@ CONTAINS
 
        !!========================================================================
        !! 7. Compute Correlation Self-Energy (Σ^c)
-       !!    W^MIC_ll'(iτ) =  sum_PQ Z_lP W^MIC_PQ(iτ) Z_l'Q
-       !!    Σ^c_ll'(iτ)   = -G^occ_ll'(i|τ|) * W^MIC_ll'(iτ), for τ < 0
-       !!    Σ^c_ll'(iτ)   =  G^vir_ll'(i|τ|) * W^MIC_ll'(iτ), for τ > 0
+       !!    W_ll'(iτ)     =  sum_PQ Z_lP W^MIC_PQ(iτ) Z_l'Q
+       !!    Σ^c_ll'(iτ)   = -G^occ_ll'(i|τ|) * W_ll'(iτ), for τ < 0
+       !!    Σ^c_ll'(iτ)   =  G^vir_ll'(i|τ|) * W_ll'(iτ), for τ > 0
        !!    Σ^c_λσ(iτ)    =  sum_ll' Φ_λ(r_l) Σ^c_ll'(iτ) Φ_σ(r_l')
        !!========================================================================
       CALL compute_Sigma_c(bs_env, fm_W_time, bs_env%ri_rs%mat_phi_mu_l, &
@@ -194,8 +193,176 @@ CONTAINS
 
       CALL timestop(handle)
 
-   END SUBROUTINE gw_calc_large_cell_Gamma_ri_rs
+   END SUBROUTINE gw_calc_non_periodic_ri_rs
 
+! **************************************************************************************************
+!> \brief Compute grid points for RI-RS
+!>        Right now based on Ivan and Xavier implementation
+!>        JCP 150, 174120 (2019), JCTC 17, 2383 (2021)
+!> \param qs_env ...
+!> \param bs_env ...
+!> \param ri_rs_grid_points ...
+! **************************************************************************************************
+
+   SUBROUTINE ri_rs_grid_assembler(qs_env, bs_env, ri_rs_grid_points)
+
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(KIND=dp), ALLOCATABLE, INTENT(OUT)            :: ri_rs_grid_points(:, :)
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'ri_rs_grid_assembler'
+
+      INTEGER                                            :: atom_idx, end_idx, handle, ikind, j, &
+                                                            natom, nkind, start_idx, &
+                                                            total_grid_npts
+      INTEGER, ALLOCATABLE                               :: atom_to_kind(:), ri_rs_grid_offsets(:)
+      REAL(KIND=dp)                                      :: atomic_center(3)
+      TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+
+      CALL timeset(routineN, handle)
+
+       !! Get the information about the atoms in the system
+      CALL get_qs_env(qs_env, atomic_kind_set=atomic_kind_set, particle_set=particle_set)
+
+      nkind = SIZE(atomic_kind_set)
+      natom = SIZE(particle_set)
+
+       !! 1. Build the grid cache
+      CALL build_grid_cache(bs_env, atomic_kind_set)
+
+       !! 2. Calculate grid counts and offsets
+      ALLOCATE (ri_rs_grid_offsets(natom + 1))
+      ALLOCATE (atom_to_kind(natom))
+
+      total_grid_npts = 0
+      DO ikind = 1, nkind
+         DO j = 1, SIZE(atomic_kind_set(ikind)%atom_list)
+            atom_idx = atomic_kind_set(ikind)%atom_list(j)
+            atom_to_kind(atom_idx) = ikind
+            ri_rs_grid_offsets(atom_idx) = total_grid_npts + 1
+            total_grid_npts = total_grid_npts + bs_env%ri_rs%grid_cache(ikind)%npts
+         END DO
+      END DO
+
+      ri_rs_grid_offsets(natom + 1) = total_grid_npts + 1
+
+      IF (bs_env%unit_nr > 0) THEN
+         WRITE (bs_env%unit_nr, FMT="(T2,A,T69,I12)") &
+            'Total grid points used for RI-RS:', total_grid_npts
+         WRITE (bs_env%unit_nr, "(A)") ' '
+      END IF
+
+       !! 3. Allocate the global ri_rs_grid arrays
+      ALLOCATE (ri_rs_grid_points(3, total_grid_npts))
+
+       !! 4. Parallelize the grid generation loop
+      !$OMP PARALLEL DO DEFAULT(NONE) &
+      !$OMP SHARED(ri_rs_grid_points, ri_rs_grid_offsets, atom_to_kind, &
+      !$OMP        particle_set, bs_env, natom) &
+      !$OMP PRIVATE(atom_idx, ikind, atomic_center, start_idx, end_idx) &
+      !$OMP SCHEDULE(DYNAMIC, 1)
+      DO atom_idx = 1, natom
+         ikind = atom_to_kind(atom_idx)
+         atomic_center(:) = particle_set(atom_idx)%r(:)
+
+         start_idx = ri_rs_grid_offsets(atom_idx)
+         end_idx = ri_rs_grid_offsets(atom_idx + 1) - 1
+
+          !! Shift the cached origin grid by the atom's center
+         ri_rs_grid_points(1, start_idx:end_idx) = bs_env%ri_rs%grid_cache(ikind)%raw_points(1, :) + atomic_center(1)
+         ri_rs_grid_points(2, start_idx:end_idx) = bs_env%ri_rs%grid_cache(ikind)%raw_points(2, :) + atomic_center(2)
+         ri_rs_grid_points(3, start_idx:end_idx) = bs_env%ri_rs%grid_cache(ikind)%raw_points(3, :) + atomic_center(3)
+
+      END DO
+      !$OMP END PARALLEL DO
+
+       !! 5. Cleanup memory
+      IF (ALLOCATED(bs_env%ri_rs%grid_cache)) THEN
+         DO ikind = 1, nkind
+            IF (ALLOCATED(bs_env%ri_rs%grid_cache(ikind)%raw_points)) DEALLOCATE (bs_env%ri_rs%grid_cache(ikind)%raw_points)
+         END DO
+         DEALLOCATE (bs_env%ri_rs%grid_cache)
+      END IF
+
+      DEALLOCATE (atom_to_kind, ri_rs_grid_offsets)
+      CALL timestop(handle)
+
+   END SUBROUTINE ri_rs_grid_assembler
+
+! **************************************************************************************************
+!> \brief Reads grids from .ion files and stores them in memory based on grid_select
+!> \param bs_env ...
+!> \param atomic_kind_set ...
+! **************************************************************************************************
+
+   SUBROUTINE build_grid_cache(bs_env, atomic_kind_set)
+
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
+
+      CHARACTER(LEN=256)                                 :: atom_sym, filename, full_path, line, &
+                                                            suffix
+      INTEGER                                            :: colon_idx, i, ierr, ikind, iunit, nkind
+      REAL(KIND=dp)                                      :: pt(3)
+
+      ! Determine the file suffix based on the user's choice
+      IF (bs_env%ri_rs%grid_select == 1) THEN
+         suffix = "_def2-tzvp-rs.ion"
+      ELSE IF (bs_env%ri_rs%grid_select == 2) THEN
+         suffix = "_cc-pvtz-rs.ion"
+      ELSE
+         CPABORT("Unknown grid_select value. Valid options are 1 (def2-TZVPP) or 2 (cc-pVTZ).")
+      END IF
+
+      nkind = SIZE(atomic_kind_set)
+      IF (.NOT. ALLOCATED(bs_env%ri_rs%grid_cache)) ALLOCATE (bs_env%ri_rs%grid_cache(nkind))
+
+      DO ikind = 1, nkind
+         atom_sym = TRIM(atomic_kind_set(ikind)%element_symbol)
+         filename = TRIM(atom_sym)//TRIM(suffix)
+
+         full_path = "ri_rs_grid/"//TRIM(filename)
+
+         CALL open_file(file_name=TRIM(full_path), unit_number=iunit, &
+                        file_action="READ", file_status="OLD")
+
+         ! Parse the preamble for 'n points'
+         bs_env%ri_rs%grid_cache(ikind)%npts = 0
+         DO
+            READ (iunit, '(A)', IOSTAT=ierr) line
+            IF (ierr /= 0) EXIT
+            IF (INDEX(line, 'n points') > 0) THEN
+               colon_idx = INDEX(line, ':')
+               READ (line(colon_idx + 1:), *) bs_env%ri_rs%grid_cache(ikind)%npts
+               EXIT
+            END IF
+         END DO
+
+         ! Allocate the cache array for this specific element
+         ALLOCATE (bs_env%ri_rs%grid_cache(ikind)%raw_points(3, bs_env%ri_rs%grid_cache(ikind)%npts))
+
+         ! Fast-forward to the <grid_points> tag
+         REWIND (iunit)
+         DO
+            READ (iunit, '(A)', IOSTAT=ierr) line
+            IF (ierr /= 0) EXIT
+            IF (INDEX(line, '<grid_points>') > 0) EXIT
+         END DO
+
+         ! Read the raw grid coordinates
+         DO i = 1, bs_env%ri_rs%grid_cache(ikind)%npts
+            READ (iunit, *, IOSTAT=ierr) pt(1), pt(2), pt(3)
+            IF (ierr /= 0) THEN
+               CPABORT("Unexpected EOF in grid file ")
+            END IF
+            bs_env%ri_rs%grid_cache(ikind)%raw_points(:, i) = pt(:)
+         END DO
+
+         CALL close_file(unit_number=iunit)
+      END DO
+
+   END SUBROUTINE build_grid_cache
 
 ! **************************************************************************************************
 !> \brief Evaluates atomic basis functions on a real-space grid and builds a sparse DBCSR matrix.
@@ -231,6 +398,7 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       ! Setup Grid Blocking
+      ! Right now using 256
       chunk_size = max_elements_per_block
 
       ! Extract environment variables
@@ -325,10 +493,6 @@ CONTAINS
       ! Finalize triggers internal MPI communication to route blocks to their correct 2D process owners
       CALL dbcsr_finalize(mat_phi_mu_l)
 
-      IF (bs_env%unit_nr > 0) THEN
-            WRITE (bs_env%unit_nr,*) "Done with evaluation of phi"
-      END IF
-
       ! -------------------------------------------------------------------------
       ! CLEANUP
       ! -------------------------------------------------------------------------
@@ -366,102 +530,94 @@ CONTAINS
                                                             l, last_sgf, lx, ly, lz, n_cart_total, &
                                                             row_idx
       REAL(KIND=dp)                                      :: alpha, dist_vec(3), exp_val, poly, r2, &
-                                                            r_atom(3), weight, dist_vec_raw(3)
+                                                            r_atom(3), weight
       TYPE(gto_basis_set_type), POINTER                  :: orb_basis_set
-      INTEGER                                            :: ix, iy, iz, ix_min, ix_max, iy_min, &
-                                                            iy_max, iz_min, iz_max
-      REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat
-      REAL(KIND=dp)                                      :: cell_vector(3)
-         
-      !REAL(KIND=dp)                                     :: alpha_min
-      !REAL(KIND=dp)                                     :: r2_threshold
 
       ! Get Atom Info
       ikind = particle_set(iatom)%atomic_kind%kind_number
       CALL get_qs_kind(qs_kind_set(ikind), basis_set=orb_basis_set, basis_type="ORB")
-      CALL get_cell(cell=cell, h=hmat)
-
       IF (.NOT. ASSOCIATED(orb_basis_set)) RETURN
 
-      IF (cell%perd(1)==1) THEN; ix_min = -1; ix_max = 1; ELSE; ix_min = 0; ix_max = 0; END IF
-      IF (cell%perd(2)==1) THEN; iy_min = -1; iy_max = 1; ELSE; iy_min = 0; iy_max = 0; END IF
-      IF (cell%perd(3)==1) THEN; iz_min = -1; iz_max = 1; ELSE; iz_min = 0; iz_max = 0; END IF
-        
       r_atom = particle_set(iatom)%r
 
-      !! need to check about r2_threshold if it change any results 
-      !alpha_min = HUGE(1.0_dp)
-      !DO iset = 1, orb_basis_set%nset
-      !  DO ipgf = 1, orb_basis_set%npgf(iset)
-      !      alpha_min = MIN(alpha_min, orb_basis_set%zet(ipgf, iset))
-      !  END DO
-      !END DO
-        
-      !r2_threshold = -LOG(bs_env%eps_filter) / alpha_min
-
       !$OMP PARALLEL DO DEFAULT(NONE) &
-      !$OMP SHARED(phi_val, ri_rs_grid, npts, orb_basis_set, r_atom, hmat, &
-      !$OMP        ncoset, indco, cell, ix_min, ix_max, &
-      !$OMP        iy_min, iy_max, iz_min, iz_max) &
-      !$OMP PRIVATE(i_pt, dist_vec_raw, ix, iy, iz, cell_vector, dist_vec, r2, iset, &
-      !$OMP         n_cart_total, ishell, l, istart_co, iend_co, first_sgf, last_sgf, &
-      !$OMP         ipgf, alpha, exp_val, isgf, ico, row_idx, weight, lx, ly, lz, poly) &
-      !$OMP SCHEDULE(DYNAMIC)
-
+      !$OMP SHARED(phi_val, ri_rs_grid, npts, orb_basis_set, r_atom, cell, ncoset, indco) &
+      !$OMP PRIVATE(i_pt, dist_vec, r2, iset, n_cart_total, ishell, l, istart_co, iend_co, &
+      !$OMP         first_sgf, last_sgf, ipgf, alpha, exp_val, isgf, ico, row_idx, weight, &
+      !$OMP         lx, ly, lz, poly) &
+      !$OMP SCHEDULE(STATIC)
       DO i_pt = 1, npts
+         dist_vec = pbc(ri_rs_grid(:, i_pt) - r_atom, cell)
+         r2 = DOT_PRODUCT(dist_vec, dist_vec)
 
-         dist_vec_raw = ri_rs_grid(:, i_pt) - r_atom
+         DO iset = 1, orb_basis_set%nset
+            n_cart_total = ncoset(orb_basis_set%lmax(iset))
 
-         DO ix = ix_min, ix_max
-         DO iy = iy_min, iy_max
-         DO iz = iz_min, iz_max
+            DO ishell = 1, orb_basis_set%nshell(iset)
+               l = orb_basis_set%l(ishell, iset)
+               istart_co = ncoset(l - 1) + 1
+               iend_co = ncoset(l)
 
-               cell_vector(1:3) = MATMUL(hmat,REAL([ix, iy, iz], dp))
+               first_sgf = orb_basis_set%first_sgf(ishell, iset)
+               last_sgf = orb_basis_set%last_sgf(ishell, iset)
 
-               dist_vec = dist_vec_raw - cell_vector
+               DO ipgf = 1, orb_basis_set%npgf(iset)
+                  alpha = orb_basis_set%zet(ipgf, iset)
+                  exp_val = EXP(-alpha*r2)
 
-               r2 = DOT_PRODUCT(dist_vec, dist_vec)
+                  DO isgf = first_sgf, last_sgf
+                     DO ico = istart_co, iend_co
+                        row_idx = (ipgf - 1)*n_cart_total + ico
+                        weight = orb_basis_set%sphi(row_idx, isgf)
+                        lx = indco(1, ico)
+                        ly = indco(2, ico)
+                        lz = indco(3, ico)
+                        poly = (dist_vec(1)**lx)*(dist_vec(2)**ly)*(dist_vec(3)**lz)
 
-               !IF (r2 > r2_threshold) CYCLE
+                        phi_val(i_pt, isgf) = phi_val(i_pt, isgf) + (weight*poly*exp_val)
 
-               DO iset = 1, orb_basis_set%nset
-                   n_cart_total = ncoset(orb_basis_set%lmax(iset))
-
-                   DO ishell = 1, orb_basis_set%nshell(iset)
-                        l = orb_basis_set%l(ishell, iset)
-                        istart_co = ncoset(l - 1) + 1
-                        iend_co = ncoset(l)
-
-                        first_sgf = orb_basis_set%first_sgf(ishell, iset)
-                        last_sgf = orb_basis_set%last_sgf(ishell, iset)
-
-                        DO ipgf = 1, orb_basis_set%npgf(iset)
-                             alpha = orb_basis_set%zet(ipgf, iset)
-                             exp_val = EXP(-alpha*r2)
-
-                             DO isgf = first_sgf, last_sgf
-                                DO ico = istart_co, iend_co
-                                    row_idx = (ipgf - 1)*n_cart_total + ico
-                                    weight = orb_basis_set%sphi(row_idx, isgf)
-                                    lx = indco(1, ico)
-                                    ly = indco(2, ico)
-                                    lz = indco(3, ico)
-                                    poly = (dist_vec(1)**lx)*(dist_vec(2)**ly)*(dist_vec(3)**lz)
-
-                                    phi_val(i_pt, isgf) = phi_val(i_pt, isgf) + (weight*poly*exp_val)
-
-                                END DO
-                             END DO
-                        END DO
-                   END DO
+                     END DO
+                  END DO
                END DO
-         END DO
-         END DO
+            END DO
          END DO
       END DO
       !$OMP END PARALLEL DO
 
    END SUBROUTINE fill_phi_for_atom
+
+! **************************************************************************************************
+!> \brief Helper for OMP threads to fill phi_val column values
+!> \param particle_set ...
+!> \param qs_kind_set ...
+!> \param first_sgf ...
+!> \param total_sgf ...
+! **************************************************************************************************
+
+   SUBROUTINE get_basis_offsets(particle_set, qs_kind_set, first_sgf, total_sgf)
+
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+      INTEGER, INTENT(OUT)                               :: first_sgf(:), total_sgf
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'get_basis_offsets'
+
+      INTEGER                                            :: handle, iatom, ikind, nsgf
+
+      CALL timeset(routineN, handle)
+
+      total_sgf = 0
+      DO iatom = 1, SIZE(particle_set)
+         first_sgf(iatom) = total_sgf + 1
+         ikind = particle_set(iatom)%atomic_kind%kind_number
+         CALL get_qs_kind(qs_kind_set(ikind), nsgf=nsgf, basis_type="ORB")
+         total_sgf = total_sgf + nsgf
+      END DO
+      first_sgf(SIZE(particle_set) + 1) = total_sgf + 1
+
+      CALL timestop(handle)
+
+   END SUBROUTINE get_basis_offsets
 
 ! **************************************************************************************************
 !> \brief Compute RI-RS Coefficients (Z_lP)
@@ -482,7 +638,7 @@ CONTAINS
       TYPE(dbcsr_type), INTENT(OUT)                      :: mat_Z_lP
 
       CHARACTER(LEN=*), PARAMETER :: key = 'PROPERTIES%BANDSTRUCTURE%GW%PRINT%RESTART', &
-                                     routineN = 'compute_coeff_Z_lP'
+         routineN = 'compute_coeff_Z_lP'
 
       INTEGER :: atom_P, chunk_size, col, current_chunk_size, global_i, global_j, group_handle, &
          handle, i, i_blk, info, istart_ao, j, j_ri, l, loc_idx, max_ao_size, max_loc_ri, &
@@ -492,7 +648,7 @@ CONTAINS
                                                             row_offset
       INTEGER, DIMENSION(:), POINTER                     :: col_dist_phi, col_dist_ri, r_blk_sizes, &
                                                             ri_blk_sizes, row_dist_grid
-      REAL(KIND=dp)                                      :: cutoff_ri, dist, t1, t2, t3
+      REAL(KIND=dp)                                      :: cutoff_ri, dist, t1
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: d_vec_local
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: D_local, d_lp_local, int_2d_local, &
                                                             phi_global, phi_local, rho_pair_local, &
@@ -506,33 +662,20 @@ CONTAINS
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(section_vals_type), POINTER                   :: input
-      TYPE(cell_type), POINTER                           :: cell
-      INTEGER                                            :: ix_min, ix_max, iy_min, iy_max, &
-                                                            iz_min, iz_max
-      REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat
-      REAL(KIND=dp), DIMENSION(3)                        :: dist_vec_raw
-      REAL(KIND=dp)                                      :: dist2_min, cutoff_ri_2
 
       CALL timeset(routineN, handle)
 
       ! Restrict integration domain to a localized sphere around the atom
       cutoff_ri = bs_env%ri_rs%cutoff_radius_ri_rs
+      cutoff_ri = 15.0_dp
 
       t1 = m_walltime()
 
-      CALL get_qs_env(qs_env, para_env=para_env, particle_set=particle_set, input=input, cell=cell)
-
-      CALL get_cell(cell=cell, h=hmat)
-      cutoff_ri_2 = cutoff_ri**2
+      CALL get_qs_env(qs_env, para_env=para_env, particle_set=particle_set, input=input)
 
       natom = SIZE(bs_env%i_RI_start_from_atom)
       n_ao_total = bs_env%i_ao_end_from_atom(natom)
       n_grid_total = SIZE(ri_rs_grid_points, 2)
-
-      ! Determine Periodicity
-      IF (cell%perd(1)==1) THEN; ix_min = -1; ix_max = 1; ELSE; ix_min = 0; ix_max = 0; END IF
-      IF (cell%perd(2)==1) THEN; iy_min = -1; iy_max = 1; ELSE; iy_min = 0; iy_max = 0; END IF
-      IF (cell%perd(3)==1) THEN; iz_min = -1; iz_max = 1; ELSE; iz_min = 0; iz_max = 0; END IF
 
       ! =========================================================================
       ! 1. SETUP DBCSR TOPOLOGY & EXACT OFFSETS
@@ -625,9 +768,8 @@ CONTAINS
             ! ---------------------------------------------------------------------
             n_local_grid = 0
             DO l = 1, n_grid_total
-               dist_vec_raw = pbc(ri_rs_grid_points(1:3, l), pos_P(1:3), cell)
-               dist2_min = DOT_PRODUCT(dist_vec_raw, dist_vec_raw)
-               IF (dist2_min <= cutoff_ri_2) n_local_grid = n_local_grid + 1
+               dist = SQRT(SUM((ri_rs_grid_points(1:3, l) - pos_P(1:3))**2))
+               IF (dist <= cutoff_ri) n_local_grid = n_local_grid + 1
             END DO
 
             ALLOCATE (local_grid_idx(n_local_grid))
@@ -635,9 +777,8 @@ CONTAINS
 
             n_local_grid = 0
             DO l = 1, n_grid_total
-               dist_vec_raw = pbc(ri_rs_grid_points(1:3, l), pos_P(1:3), cell)
-               dist2_min = DOT_PRODUCT(dist_vec_raw, dist_vec_raw) 
-               IF (dist2_min <= cutoff_ri_2) THEN
+               dist = SQRT(SUM((ri_rs_grid_points(1:3, l) - pos_P(1:3))**2))
+               IF (dist <= cutoff_ri) THEN
                   n_local_grid = n_local_grid + 1
                   local_grid_idx(n_local_grid) = l
                   map_global_to_local(l) = n_local_grid
@@ -703,21 +844,8 @@ CONTAINS
 
             d_lp_local = 0.0_dp
 
-            IF (bs_env%unit_nr > 0) THEN
-               WRITE (bs_env%unit_nr,*) "Done with pre-evaluation for atom ", atom_P, m_walltime() - t1
-            END IF
-
-            t2 = m_walltime()
-
             CALL compute_d_lp(qs_env, bs_env, phi_local, d_lp_local, n_local_grid, &
-                              n_loc_ri, atom_P, rho_pair_local,int_3c_local, int_2d_local, max_ao_size, &
-                              cell)
-
-            IF (bs_env%unit_nr > 0) THEN
-                WRITE (bs_env%unit_nr,*) "Done with compute_d_lp for atom ", atom_P, m_walltime() - t2
-            END IF
-
-            t3 = m_walltime()
+                              n_loc_ri, atom_P, rho_pair_local, int_3c_local, int_2d_local, max_ao_size)
 
             !$OMP PARALLEL DO DEFAULT(NONE) &
             !$OMP SHARED(n_loc_ri, n_local_grid, d_lp_local, d_vec_local) &
@@ -779,7 +907,6 @@ CONTAINS
                   CALL dbcsr_put_block(mat_Z_lP, row=i_blk, col=atom_P, &
                                        block=Z_blk(1:current_chunk_size, 1:n_loc_ri))
                END IF
-               
             END DO
 
             DEALLOCATE (Z_global_temp, Z_blk)
@@ -787,10 +914,6 @@ CONTAINS
             DEALLOCATE (rho_pair_local, int_3c_local, int_2d_local)
 
             DEALLOCATE (local_grid_idx, phi_local)
-
-            IF (bs_env%unit_nr > 0) THEN
-                WRITE (bs_env%unit_nr,*) "Done with evaluation of atom ", atom_P, m_walltime() - t3
-            END IF
 
          END DO
 
@@ -837,11 +960,10 @@ CONTAINS
 !> \param int_3c ...
 !> \param int_2d ...
 !> \param max_ao_size ...
-!> \param cell ...
 ! **************************************************************************************************
 
    SUBROUTINE compute_d_lp(qs_env, bs_env, phi_val, d_lp, n_grid_total, n_loc_ri, atom_P, &
-                           rho_pair, int_3c, int_2d, max_ao_size, cell)
+                           rho_pair, int_3c, int_2d, max_ao_size)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
@@ -852,90 +974,31 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT)   :: int_3c
       REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: int_2d
       INTEGER, INTENT(IN)                                :: max_ao_size
-      TYPE(cell_type), POINTER                           :: cell
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_d_lp'
 
       INTEGER                                            :: atom_j, atom_k, handle, j, jk_idx, &
                                                             jsize, jstart, k, ksize, kstart, l, ri
 
-      INTEGER                                            :: ix_min, ix_max, iy_min, iy_max, iz_min, iz_max
-      INTEGER                                            :: ix_R, iy_R, iz_R, ix_S, iy_S, iz_S
-      INTEGER, DIMENSION(3)                              :: cell_R_vec, cell_S_vec, cell_P_vec  
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: int_3c_sum
-      REAL(KIND=dp)                                      :: abs_rab, max_dist
-      REAL(KIND=dp), DIMENSION(3)                        :: rab
-      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
-
       CALL timeset(routineN, handle)
 
-      CALL get_qs_env(qs_env, particle_set=particle_set)
-      max_dist = bs_env%max_dist_AO_atoms
-
-      ! Fix atom_P in the central cell (0,0,0)
-      cell_P_vec = 0
-
-      IF (cell%perd(1)==1) THEN; ix_min = -1; ix_max = 1; ELSE; ix_min = 0; ix_max = 0; END IF
-      IF (cell%perd(2)==1) THEN; iy_min = -1; iy_max = 1; ELSE; iy_min = 0; iy_max = 0; END IF
-      IF (cell%perd(3)==1) THEN; iz_min = -1; iz_max = 1; ELSE; iz_min = 0; iz_max = 0; END IF
-
-      ALLOCATE(int_3c_sum(max_ao_size, max_ao_size, n_loc_ri))
-
       DO atom_j = 1, SIZE(bs_env%i_ao_start_from_atom)
-         rab = pbc(particle_set(atom_j)%r(1:3), particle_set(atom_P)%r(1:3), cell)
-         abs_rab = SQRT(rab(1)**2 + rab(2)**2 + rab(3)**2)
-         IF (abs_rab > max_dist) CYCLE
-
          jstart = bs_env%i_ao_start_from_atom(atom_j)
          jsize = bs_env%i_ao_end_from_atom(atom_j) - jstart + 1
 
          DO atom_k = 1, SIZE(bs_env%i_ao_start_from_atom)
-            rab = pbc(particle_set(atom_k)%r(1:3), particle_set(atom_P)%r(1:3), cell)
-            abs_rab = SQRT(rab(1)**2 + rab(2)**2 + rab(3)**2)
-            IF (abs_rab > max_dist) CYCLE
-
-            rab = pbc(particle_set(atom_j)%r(1:3), particle_set(atom_k)%r(1:3), cell)
-            abs_rab = SQRT(rab(1)**2 + rab(2)**2 + rab(3)**2)
-            IF (abs_rab > max_dist) CYCLE
-
             kstart = bs_env%i_ao_start_from_atom(atom_k)
             ksize = bs_env%i_ao_end_from_atom(atom_k) - kstart + 1
 
-            int_3c_sum(1:jsize, 1:ksize, 1:n_loc_ri) = 0.0_dp
+            int_3c(1:jsize, 1:ksize, 1:n_loc_ri) = 0.0_dp
 
-            DO ix_R = ix_min, ix_max
-            DO iy_R = iy_min, iy_max
-            DO iz_R = iz_min, iz_max
-
-                cell_R_vec = (/ix_R, iy_R, iz_R/)
-
-                DO ix_S = ix_min, ix_max
-                DO iy_S = iy_min, iy_max
-                DO iz_S = iz_min, iz_max
-
-                    cell_S_vec = (/ix_S, iy_S, iz_S/)
-             
-                    int_3c(1:jsize, 1:ksize, 1:n_loc_ri) = 0.0_dp
-
-                    ! Compute B_{μν,P} = (μν|P)
-                    CALL build_3c_integral_block(int_3c(1:jsize, 1:ksize, 1:n_loc_ri), &
+            ! Compute B_{μν,P} = (μν|P)
+            CALL build_3c_integral_block(int_3c(1:jsize, 1:ksize, 1:n_loc_ri), &
                                          qs_env, bs_env%ri_metric, &
                                          basis_j=bs_env%basis_set_AO, &
                                          basis_k=bs_env%basis_set_AO, &
                                          basis_i=bs_env%basis_set_RI, &
-                                         cell_j=cell_R_vec, cell_k=cell_S_vec, cell_i=cell_P_vec, &
                                          atom_k=atom_k, atom_j=atom_j, atom_i=atom_P)
-
-                    int_3c_sum(1:jsize, 1:ksize, 1:n_loc_ri) = int_3c_sum(1:jsize, 1:ksize, 1:n_loc_ri) + &
-                                                               int_3c(1:jsize, 1:ksize, 1:n_loc_ri)
-
-                END DO
-                END DO
-                END DO ! End cell S loops
-                   
-            END DO
-            END DO
-            END DO ! End cell R loops
 
             ! Build Pair Density: ρ(l, μν) = Φ_μ(r_l) \times Φ_ν(r_l)
             !$OMP PARALLEL DO DEFAULT(NONE) &
@@ -954,14 +1017,14 @@ CONTAINS
 
             ! Flatten 3D B_{μν, P} tensor to 2D B_{(μν), P} matrix for BLAS
             !$OMP PARALLEL DO DEFAULT(NONE) &
-            !$OMP SHARED(n_loc_ri, ksize, jsize, int_2d, int_3c_sum) &
+            !$OMP SHARED(n_loc_ri, ksize, jsize, int_2d, int_3c) &
             !$OMP PRIVATE(ri, k, j, jk_idx) &
             !$OMP COLLAPSE(2)
             DO ri = 1, n_loc_ri
                DO k = 1, ksize
                   DO j = 1, jsize
                      jk_idx = (k - 1)*jsize + j
-                     int_2d(jk_idx, ri) = int_3c_sum(j, k, ri)
+                     int_2d(jk_idx, ri) = int_3c(j, k, ri)
                   END DO
                END DO
             END DO
@@ -974,8 +1037,7 @@ CONTAINS
                        1.0_dp, d_lp(1, 1), n_grid_total)
          END DO
       END DO
-      
-      DEALLOCATE(int_3c_sum)
+
       CALL timestop(handle)
 
    END SUBROUTINE compute_d_lp
@@ -1941,4 +2003,4 @@ CONTAINS
 
    END SUBROUTINE release_dbcsr_topology_and_matrices
 
-END MODULE gw_large_cell_Gamma_ri_rs
+END MODULE gw_non_periodic_ri_rs
