@@ -101,7 +101,9 @@ MODULE gw_large_cell_gamma
              fill_fm_Sigma_c_Gamma_time, delete_unnecessary_files, &
              multiply_fm_W_MIC_time_with_Minv_Gamma, get_W_MIC, &
              create_fm_W_MIC_time, Fourier_transform_w_to_t,&
-             compute_fm_chi_Gamma_freq, compute_QP_energies, fm_write
+             compute_fm_chi_Gamma_freq, compute_QP_energies, fm_write, &
+             compute_V_k_by_lattice_sum, compute_MinvVsqrt_Vsqrt, &
+             compute_cfm_W_ikp_freq_j, apply_extrapol_factor
 
 CONTAINS
 
@@ -917,12 +919,13 @@ CONTAINS
 !> \param ikp ...
 ! **************************************************************************************************
    SUBROUTINE compute_MinvVsqrt_Vsqrt(bs_env, qs_env, fm_V_kp, cfm_V_sqrt_ikp, &
-                                      cfm_M_inv_V_sqrt_ikp, ikp)
+                                      cfm_M_inv_V_sqrt_ikp, ikp, cfm_M_inv_ikp_out)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_V_kp
       TYPE(cp_cfm_type)                                  :: cfm_V_sqrt_ikp, cfm_M_inv_V_sqrt_ikp
       INTEGER                                            :: ikp
+      TYPE(cp_cfm_type), OPTIONAL                        :: cfm_M_inv_ikp_out
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_MinvVsqrt_Vsqrt'
 
@@ -984,6 +987,14 @@ CONTAINS
       ! get M^-1(k)*V^0.5(k)
       CALL parallel_gemm("N", "C", n_RI, n_RI, n_RI, z_one, cfm_M_inv_ikp, cfm_V_sqrt_ikp, &
                          z_zero, cfm_M_inv_V_sqrt_ikp)
+
+      ! Optionally hand back M^-1(k) itself (RI-RS grid path needs it to dress W per k)
+      IF (PRESENT(cfm_M_inv_ikp_out)) THEN
+         IF (.NOT. ASSOCIATED(cfm_M_inv_ikp_out%local_data)) THEN
+            CALL cp_cfm_create(cfm_M_inv_ikp_out, cfm_M_inv_ikp%matrix_struct)
+         END IF
+         CALL cp_cfm_to_cfm(cfm_M_inv_ikp, cfm_M_inv_ikp_out)
+      END IF
 
       CALL cp_cfm_release(cfm_M_inv_ikp)
 
