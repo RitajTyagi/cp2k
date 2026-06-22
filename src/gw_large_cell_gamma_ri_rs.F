@@ -59,7 +59,22 @@ MODULE gw_large_cell_Gamma_ri_rs
    USE gw_large_cell_gamma,             ONLY: &
         Fourier_transform_w_to_t, G_occ_vir, compute_QP_energies, compute_fm_chi_Gamma_freq, &
         create_fm_W_MIC_time, delete_unnecessary_files, fill_fm_Sigma_c_Gamma_time, fm_write, &
-        get_W_MIC, multiply_fm_W_MIC_time_with_Minv_Gamma
+        get_W_MIC, multiply_fm_W_MIC_time_with_Minv_Gamma, compute_V_k_by_lattice_sum, &
+        compute_MinvVsqrt_Vsqrt, compute_cfm_W_ikp_freq_j, apply_extrapol_factor
+   USE post_scf_bandstructure_utils,    ONLY: MIC_contribution_from_ikp
+   USE cp_cfm_types,                    ONLY: cp_cfm_create,&
+                                              cp_cfm_release,&
+                                              cp_cfm_type,&
+                                              cp_cfm_get_info,&
+                                              cp_cfm_set_all,&
+                                              cp_cfm_to_cfm,&
+                                              cp_cfm_to_fm,&
+                                              cp_fm_to_cfm
+   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_scale_and_add
+   USE rpa_gw_kpoints_util,             ONLY: cp_cfm_power
+   USE mathconstants,                   ONLY: twopi,&
+                                              z_one,&
+                                              z_zero
    USE gw_non_periodic_ri_rs,           ONLY: get_basis_offsets,&
                                               precompute_ri_rs_radii,&
                                               ri_rs_grid_assembler,&
@@ -107,10 +122,13 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gw_calc_large_cell_Gamma_ri_rs'
 
       INTEGER                                            :: handle
-      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_Sigma_x_Gamma, fm_W_time
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_Sigma_x_Gamma
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :, :)  :: fm_Sigma_c_Gamma_time
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: mat_chi_grid_tau, mat_W_tr_grid_tau
 
       CALL timeset(routineN, handle)
+
+      NULLIFY (mat_chi_grid_tau, mat_W_tr_grid_tau)
 
        !!========================================================================
        !! 0. Precompute AO and RI Radii
@@ -131,51 +149,60 @@ CONTAINS
 
        !!========================================================================
        !! 2. Atomic Basis Evaluation
-       !!    Compute values of spherical atomic basis functions at grid points.
-       !!    Expression: Φ_μl = Φ_μ(r_l) (mat_phi_mu_l)
+       !!    Compute values of spherical atomic basis functions at grid points
+       !!    and sum over adjacent periodic images of each atom.
+       !!    Expression: Φ_μl = sum_R Φ_μ^R(r_l) (mat_phi_mu_l)
        !!========================================================================
       CALL atomic_basis_at_grid_point(qs_env, bs_env, bs_env%ri_rs%grid_points, &
                                       bs_env%ri_rs%mat_phi_mu_l)
 
        !!========================================================================
-       !! 3. Compute RI-RS Coefficients (Z_lp)
+       !! 3. Compute RI-RS Coefficients (Z_lp(k=0))
        !!    Solve the regularized system for each atom P, where the grid domain
        !!    is restricted to r_l within a cutoff distance of atom P:
        !!    a. D_ll' = [ Σ_μ Φ_μ(r_l) Φ_μ(r_l') ]^2 (Equation 13)
-       !!    b. D_lP  = Σ_{μν} Φ_μ(r_l) Φ_ν(r_l) (μν|P) (Equation 15)
+       !!    b. D_lP  = Σ_{μν} Φ_μ(r_l) Φ_ν(r_l') (μν|P) (Equation 15)
        !!    c. Conditioning:
        !!       Dvec_l   = 1 / sqrt(D_ll)  (Diagonal scaling vector)
        !!       D'_ll' = Dvec_l * D_ll' * Dvec_l' + λδ_ll'
        !!       D'_lP  = Dvec_l * D_lP
        !!    d. Solve: Σ_l' D'_ll' * Z'_l'P = D'_lP (Equation 14)
-       !!    e. Rescale: Z_lP = Z'_lP * Dvec_l   (Z_lP stored in mat_Z_lP)
+       !!    e. Rescale: Z_lP(k=0) = Z'_lP * Dvec_l   (Z_lP stored in mat_Z_lP)
        !!========================================================================
       CALL compute_coeff_Z_lP(qs_env, bs_env, bs_env%ri_rs%grid_points, &
                               bs_env%ri_rs%mat_phi_mu_l, bs_env%ri_rs%mat_Z_lP)
 
        !!========================================================================
-       !! 4. Compute Independent-Particle Polarizability (χ)
-       !!    G^occ_µλ(i|τ|)  = sum_n^occ C_µn e^(-|(ϵ_n-ϵ_F)τ|) C_λn
-       !!    G^vir_µλ(i|τ|)  = sum_n^vir C_µn e^(-|(ϵ_n-ϵ_F)τ|) C_λn
-       !!    G^occ_ll'(i|τ|) = sum_µν Φ_µ(r_l) G^occ_µν Φ_ν(r_l')
-       !!    G^vir_ll'(i|τ|) = sum_µν Φ_µ(r_l) G^vir_µν Φ_ν(r_l')
-       !!    χ_ll'(iτ)       = G^occ_ll'(i|τ|) * G^vir_ll'(i|τ|)
-       !!    χ_PQ(iτ)        = sum_ll' Z_lP χ_ll'(iτ) Z_l'Q
+       !! 4. Compute Independent-Particle Polarizability (χ) in the GRID (ll') basis
+       !!    G^occ_µλ(i|τ|,k=0)  = sum_n^occ C_µn(k=0) e^(-|(ϵ_n-ϵ_F)τ|) C_λn(k=0)
+       !!    G^vir_µλ(i|τ|,k=0)  = sum_n^vir C_µn(k=0) e^(-|(ϵ_n-ϵ_F)τ|) C_λn(k=0)
+       !!    G^occ_ll'(i|τ|,k=0) = sum_µν Φ_µ(r_l) G^occ_µν(i|τ|,k=0) Φ_ν(r_l')
+       !!    G^vir_ll'(i|τ|,k=0) = sum_µν Φ_µ(r_l) G^vir_µν(i|τ|,k=0) Φ_ν(r_l')
+       !!    χ_ll'(iτ,k=0)       = G^occ_ll'(i|τ|,k=0) * G^vir_ll'(i|τ|,k=0)
+       !!    NOTE: χ is kept in the grid basis (NOT contracted to PQ) so the MIC
+       !!    truncation can be applied at full spatial resolution in step 5.
        !!========================================================================
-      CALL get_mat_chi_Gamma_tau(bs_env, bs_env%mat_chi_Gamma_tau, &
-                                 bs_env%ri_rs%mat_phi_mu_l, bs_env%ri_rs%mat_Z_lP)
+      CALL get_mat_chi_grid_tau(bs_env, mat_chi_grid_tau, bs_env%ri_rs%mat_phi_mu_l)
 
        !!========================================================================
-       !! 5. Compute Screened Interaction (W^MIC)
-       !!    χ_PQ(iτ) -> χ_PQ(iω) -> ε_PQ(iω) -> W_PQ(iω) -> W^MIC_PQ(iτ)
+       !! 5. Compute Screened Interaction with the MIC truncation in the GRID basis
+       !!    χ_ll'(iτ,k=0) -> χ_ll'(iω,k=0) -> [grid-MIC] χ_ll'(iω,k)
+       !!    χ_PQ(iω,k) = Z(k)^† χ_ll'(iω,k) Z(k) -> ε,W^V_PQ(iω,k)
+       !!    W̃_PQ = wkp · W^V (q→0 folded);  W̄_PQ = M⁻¹(k) W̃_PQ M⁻¹(k)
+       !!    W_ll'(iτ,k) = Z(k) W̄_PQ(iτ,k) Z(k)^†
+       !!    W^tr_ll'(iτ) = MIC-inverse-FT of W_ll'(iτ,k), truncated at a_min/2
+       !!    (mat_chi_grid_tau is deallocated inside compute_W_MIC_grid)
        !!========================================================================
-      CALL get_W_MIC(bs_env, qs_env, bs_env%mat_chi_Gamma_tau, fm_W_time)
+      CALL compute_W_MIC_grid(bs_env, qs_env, mat_chi_grid_tau, mat_W_tr_grid_tau)
+
+      ! grid-point coordinates are no longer needed after the screened interaction
+      IF (ALLOCATED(bs_env%ri_rs%grid_points)) DEALLOCATE (bs_env%ri_rs%grid_points)
 
        !!========================================================================
        !! 6. Compute Exact Exchange Self-Energy (Σ^x)
-       !!    D_µν          = sum_n^occ C_µn C_νn
+       !!    D_µν          = sum_n^occ C_µn(k=0) C_νn(k=0)
        !!    D_ll'         = sum_µν Φ_µ(r_l) D_µν Φ_ν(r_l')
-       !!    V^trunc_ll'   = sum_PQ Z_lP V^trunc_PQ Z_l'Q
+       !!    V^trunc_ll'   = sum_PQ Z_lP(k=0) V^trunc_PQ Z_l'Q(k=0)
        !!    Σ^x_ll'       = D_ll' * V^trunc_ll'
        !!    Σ^x_λσ(k=0)   = -sum_ll' Φ_λ(r_l) Σ^x_ll' Φ_σ(r_l')
        !!========================================================================
@@ -183,19 +210,18 @@ CONTAINS
                            bs_env%ri_rs%mat_Z_lP, fm_Sigma_x_Gamma)
 
        !!========================================================================
-       !! 7. Compute Correlation Self-Energy (Σ^c)
-       !!    W^MIC_ll'(iτ) =  sum_PQ Z_lP W^MIC_PQ(iτ) Z_l'Q
-       !!    Σ^c_ll'(iτ)   = -G^occ_ll'(i|τ|) * W^MIC_ll'(iτ), for τ < 0
-       !!    Σ^c_ll'(iτ)   =  G^vir_ll'(i|τ|) * W^MIC_ll'(iτ), for τ > 0
+       !! 7. Compute Correlation Self-Energy (Σ^c) from the grid-truncated W^tr
+       !!    Σ^c_ll'(iτ)   = -G^occ_ll'(i|τ|) * W^tr_ll'(iτ), for τ < 0
+       !!    Σ^c_ll'(iτ)   =  G^vir_ll'(i|τ|) * W^tr_ll'(iτ), for τ > 0
        !!    Σ^c_λσ(iτ)    =  sum_ll' Φ_λ(r_l) Σ^c_ll'(iτ) Φ_σ(r_l')
        !!========================================================================
-      CALL compute_Sigma_c(bs_env, fm_W_time, bs_env%ri_rs%mat_phi_mu_l, &
-                           bs_env%ri_rs%mat_Z_lP, fm_Sigma_c_Gamma_time)
+      CALL compute_Sigma_c(bs_env, mat_W_tr_grid_tau, bs_env%ri_rs%mat_phi_mu_l, &
+                           fm_Sigma_c_Gamma_time)
 
        !!========================================================================
        !! 8. Compute Quasiparticle Energies
-       !!    Σ^c_λσ(iτ) -> Σ^c_nn(ϵ)
-       !!    ϵ_nk^GW = ϵ_nk^DFT + Σ^c_nn(ϵ) + Σ^x_nn - v^xc_nn
+       !!    Σ^c_λσ(iτ,k=0) -> Σ^c_nn(ϵ,k)
+       !!    ϵ_nk^GW = ϵ_nk^DFT + Σ^c_nn(ϵ,k) + Σ^x_nn(k) - v^xc_nn(k)
        !!========================================================================
       CALL compute_QP_energies(bs_env, qs_env, fm_Sigma_x_Gamma, fm_Sigma_c_Gamma_time)
 
@@ -363,8 +389,7 @@ CONTAINS
 !> \param particle_set ...
 !> \param qs_kind_set ...
 !> \param cell ...
-!> \param r2_threshold per-image squared-distance threshold; CYCLE if r² > r2_threshold. Pass
-!>        HUGE(1.0_dp) to disable.
+!> \param r2_threshold 
 ! **************************************************************************************************
 
    SUBROUTINE fill_phi_for_atom(phi_val, ri_rs_grid, npts, iatom, &
@@ -897,7 +922,10 @@ CONTAINS
          DEALLOCATE (para_env_sub)
       END IF
 
-      DEALLOCATE (ri_rs_grid_points)
+      ! NOTE: ri_rs_grid_points (= bs_env%ri_rs%grid_points) is intentionally NOT
+      ! deallocated here. The grid-basis MIC k-construction in compute_W_MIC_grid needs
+      ! the grid-point coordinates to build the e^{ik.R} phase factors. It is freed by
+      ! the driver after the screened-interaction step.
 
       CALL timestop(handle)
 
@@ -1178,6 +1206,102 @@ CONTAINS
    END SUBROUTINE get_mat_chi_Gamma_tau
 
 ! **************************************************************************************************
+!> \brief Computes the χ_ll'(iτ, k=0) matrix and KEEPS it in the real-space grid (ll') basis,
+!>        i.e. it does NOT contract to the RI auxiliary (PQ) basis. The returned per-time-point
+!>        grid matrices feed the grid-basis MIC k-construction in compute_W_MIC_grid, where the
+!>        minimum-image truncation |r_l-(r_l'+R)|<a_min/2 is applied at full spatial resolution
+!>        (Eq. 74) instead of on the diffuse RI auxiliary functions.
+!> \param bs_env ...
+!> \param mat_chi_grid_tau output array (1:num_time_freq_points) of grid×grid χ_ll'(iτ,k=0)
+!> \param mat_phi_mu_l ...
+! **************************************************************************************************
+
+   SUBROUTINE get_mat_chi_grid_tau(bs_env, mat_chi_grid_tau, mat_phi_mu_l)
+
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: mat_chi_grid_tau
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_phi_mu_l
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'get_mat_chi_grid_tau'
+
+      INTEGER                                            :: handle, i, i_t, ispin, npcol
+      INTEGER, DIMENSION(:), POINTER                     :: blk_ao, blk_grid, dist_col_ao, &
+                                                            dist_col_grid, dist_row_grid
+      REAL(KIND=dp)                                      :: t1, tau
+      TYPE(dbcsr_distribution_type)                      :: dist_grid_grid, dist_phi
+      TYPE(dbcsr_type)                                   :: matrix_chi_grid_spin, &
+                                                            matrix_G_occ_grid, matrix_G_vir_grid
+
+      CALL timeset(routineN, handle)
+
+      ! Same grid×grid topology as get_mat_chi_Gamma_tau
+      CALL dbcsr_get_info(mat_phi_mu_l, distribution=dist_phi, row_blk_size=blk_grid, col_blk_size=blk_ao)
+      CALL dbcsr_distribution_get(dist_phi, row_dist=dist_row_grid, col_dist=dist_col_ao)
+
+      npcol = MAXVAL(dist_col_ao) + 1
+      ALLOCATE (dist_col_grid(SIZE(blk_grid)))
+      DO i = 1, SIZE(blk_grid)
+         dist_col_grid(i) = MOD(i - 1, npcol)
+      END DO
+
+      CALL dbcsr_distribution_new(dist_grid_grid, template=dist_phi, &
+                                  row_dist=dist_row_grid, col_dist=dist_col_grid)
+
+      CALL dbcsr_create(matrix_G_occ_grid, "G_occ_grid", dist_grid_grid, dbcsr_type_no_symmetry, blk_grid, blk_grid)
+      CALL dbcsr_create(matrix_G_vir_grid, "G_vir_grid", dist_grid_grid, dbcsr_type_no_symmetry, blk_grid, blk_grid)
+      CALL dbcsr_create(matrix_chi_grid_spin, "chi_grid_spin", dist_grid_grid, dbcsr_type_no_symmetry, blk_grid, blk_grid)
+
+      ! Output: one grid×grid χ per imaginary-time point
+      NULLIFY (mat_chi_grid_tau)
+      ALLOCATE (mat_chi_grid_tau(bs_env%num_time_freq_points))
+      DO i_t = 1, bs_env%num_time_freq_points
+         ALLOCATE (mat_chi_grid_tau(i_t)%matrix)
+         CALL dbcsr_create(mat_chi_grid_tau(i_t)%matrix, "chi_grid_tau", dist_grid_grid, &
+                           dbcsr_type_no_symmetry, blk_grid, blk_grid)
+      END DO
+
+      DO i_t = 1, bs_env%num_time_freq_points
+         t1 = m_walltime()
+
+         tau = bs_env%imag_time_points(i_t)
+         CALL dbcsr_set(mat_chi_grid_tau(i_t)%matrix, 0.0_dp)
+
+         DO ispin = 1, bs_env%n_spin
+
+            ! G^occ_ll'(i|τ|,k=0), G^vir_ll'(i|τ|,k=0)
+            CALL build_G_grid(bs_env, tau, ispin, .TRUE., .FALSE., mat_phi_mu_l, &
+                              matrix_G_occ_grid, bs_env%eps_filter)
+            CALL build_G_grid(bs_env, tau, ispin, .FALSE., .TRUE., mat_phi_mu_l, &
+                              matrix_G_vir_grid, bs_env%eps_filter)
+
+            ! χ_ll'(iτ,k=0) = G^occ_ll' * G^vir_ll'  (Hadamard), accumulate over spin
+            CALL hadamard_product(matrix_G_occ_grid, matrix_G_vir_grid, matrix_chi_grid_spin, &
+                                  bs_env%spin_degeneracy)
+            CALL dbcsr_add(mat_chi_grid_tau(i_t)%matrix, matrix_chi_grid_spin, 1.0_dp, 1.0_dp)
+
+         END DO ! ispin
+
+         IF (bs_env%unit_nr > 0) THEN
+            WRITE (bs_env%unit_nr, '(T2,A,I9,A,I3,A,F7.1,A)') &
+               'Computed χ_ll''(iτ,k=0) for time point', i_t, ' /', bs_env%num_time_freq_points, &
+               ',    Execution time', m_walltime() - t1, ' s'
+         END IF
+
+      END DO ! i_t
+
+      CALL dbcsr_release(matrix_G_occ_grid)
+      CALL dbcsr_release(matrix_G_vir_grid)
+      CALL dbcsr_release(matrix_chi_grid_spin)
+      CALL dbcsr_distribution_release(dist_grid_grid)
+      DEALLOCATE (dist_col_grid)
+
+      IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(A)') ' '
+
+      CALL timestop(handle)
+
+   END SUBROUTINE get_mat_chi_grid_tau
+
+! **************************************************************************************************
 !> \brief Computes Green's Function in grid basis
 !> \param bs_env ...
 !> \param tau ...
@@ -1330,6 +1454,616 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE hadamard_product
+
+! **************************************************************************************************
+!> \brief Cosine Fourier transform of the grid-basis polarizability from imaginary time to
+!>        imaginary frequency, kept in the grid (ll') basis (k-independent):
+!>        χ_ll'(iω_j,k=0) = Σ_iτ cos(τ_i ω_j) w_ij χ_ll'(iτ_i,k=0).
+!> \param bs_env ...
+!> \param mat_chi_grid_tau input grid χ per imaginary-time point (consumed by caller afterwards)
+!> \param mat_chi_grid_freq output grid χ per imaginary-frequency point
+! **************************************************************************************************
+
+   SUBROUTINE chi_grid_tau_to_freq(bs_env, mat_chi_grid_tau, mat_chi_grid_freq)
+
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: mat_chi_grid_tau, mat_chi_grid_freq
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'chi_grid_tau_to_freq'
+
+      INTEGER                                            :: handle, i_t, j_w
+      REAL(KIND=dp)                                      :: freq_j, time_i, weight_ij
+
+      CALL timeset(routineN, handle)
+
+      NULLIFY (mat_chi_grid_freq)
+      ALLOCATE (mat_chi_grid_freq(bs_env%num_time_freq_points))
+
+      DO j_w = 1, bs_env%num_time_freq_points
+         ALLOCATE (mat_chi_grid_freq(j_w)%matrix)
+         CALL dbcsr_create(mat_chi_grid_freq(j_w)%matrix, template=mat_chi_grid_tau(1)%matrix)
+         CALL dbcsr_set(mat_chi_grid_freq(j_w)%matrix, 0.0_dp)
+
+         freq_j = bs_env%imag_freq_points(j_w)
+         DO i_t = 1, bs_env%num_time_freq_points
+            time_i = bs_env%imag_time_points(i_t)
+            weight_ij = bs_env%weights_cos_t_to_w(j_w, i_t)
+            CALL dbcsr_add(mat_chi_grid_freq(j_w)%matrix, mat_chi_grid_tau(i_t)%matrix, &
+                           1.0_dp, COS(time_i*freq_j)*weight_ij)
+         END DO
+      END DO
+
+      CALL timestop(handle)
+
+   END SUBROUTINE chi_grid_tau_to_freq
+
+! **************************************************************************************************
+!> \brief Builds the real and imaginary parts of the grid-basis polarizability at k-point ikp from
+!>        the Γ (k=0) grid matrix using the minimum image convention applied directly to the grid
+!>        points (Eq. 74/76):
+!>          χ_ll'(iω,k) = Σ_R e^{ik.R} χ_ll'(iω,R),   χ_ll'(iω,R) = χ_ll'(iω,k=0) if
+!>          |r_l-(r_l'+R)| < a_min/2 else 0,  with R the closest image of r_l'.
+!>        For grid points in the home cell the closest image is the direct pbc wrap
+!>        n = nint(h^{-1}(r_l-r_l')), and the phase is e^{i 2π xkp·n}.
+!> \param mat_chi_freq input Γ grid matrix χ_ll'(iω,k=0)
+!> \param mat_chi_re output Re χ_ll'(iω,k)
+!> \param mat_chi_im output Im χ_ll'(iω,k)
+!> \param grid_points (3,N_grid) Cartesian grid-point coordinates (home cell)
+!> \param hmat cell h-matrix
+!> \param h_inv inverse cell h-matrix
+!> \param xkp_k fractional k-point coordinates
+!> \param a_min_half a_min/2 truncation radius
+! **************************************************************************************************
+
+   SUBROUTINE build_chi_ikp_grid(mat_chi_freq, mat_chi_re, mat_chi_im, grid_points, &
+                                 hmat, h_inv, xkp_k, a_min_half)
+
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_chi_freq, mat_chi_re, mat_chi_im
+      REAL(KIND=dp), INTENT(IN)                          :: grid_points(:, :), hmat(3, 3), &
+                                                            h_inv(3, 3), xkp_k(3), a_min_half
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'build_chi_ikp_grid'
+
+      INTEGER                                            :: col, handle, i, ib, j, l, lp, row
+      INTEGER, DIMENSION(3)                              :: n
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: col_off, row_off
+      INTEGER, DIMENSION(:), POINTER                     :: cbs, rbs
+      LOGICAL                                            :: found
+      REAL(KIND=dp)                                      :: arg, c, dmin, s, v
+      REAL(KIND=dp), DIMENSION(3)                        :: dvec, raw
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: blk_im, blk_re
+      TYPE(dbcsr_iterator_type)                          :: iter
+
+      CALL timeset(routineN, handle)
+
+      CALL dbcsr_copy(mat_chi_re, mat_chi_freq)
+      CALL dbcsr_copy(mat_chi_im, mat_chi_freq)
+
+      CALL dbcsr_get_info(mat_chi_re, row_blk_size=rbs, col_blk_size=cbs)
+      ALLOCATE (row_off(SIZE(rbs)), col_off(SIZE(cbs)))
+      row_off(1) = 0
+      DO ib = 2, SIZE(rbs)
+         row_off(ib) = row_off(ib - 1) + rbs(ib - 1)
+      END DO
+      col_off(1) = 0
+      DO ib = 2, SIZE(cbs)
+         col_off(ib) = col_off(ib - 1) + cbs(ib - 1)
+      END DO
+
+      CALL dbcsr_iterator_start(iter, mat_chi_re)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
+         CALL dbcsr_iterator_next_block(iter, row, col, blk_re)
+         CALL dbcsr_get_block_p(mat_chi_im, row, col, blk_im, found)
+         IF (.NOT. found) CYCLE
+
+         DO j = 1, SIZE(blk_re, 2)
+            lp = col_off(col) + j
+            DO i = 1, SIZE(blk_re, 1)
+               l = row_off(row) + i
+               raw(:) = grid_points(:, l) - grid_points(:, lp)
+               n(:) = NINT(MATMUL(h_inv, raw))
+               dvec(:) = raw(:) - MATMUL(hmat, REAL(n, dp))
+               dmin = NORM2(dvec)
+               IF (dmin >= a_min_half) THEN
+                  blk_re(i, j) = 0.0_dp
+                  blk_im(i, j) = 0.0_dp
+               ELSE
+                  arg = twopi*(xkp_k(1)*n(1) + xkp_k(2)*n(2) + xkp_k(3)*n(3))
+                  v = blk_re(i, j)
+                  c = COS(arg)
+                  s = SIN(arg)
+                  blk_re(i, j) = v*c
+                  blk_im(i, j) = v*s
+               END IF
+            END DO
+         END DO
+      END DO
+      CALL dbcsr_iterator_stop(iter)
+
+      DEALLOCATE (row_off, col_off)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE build_chi_ikp_grid
+
+! **************************************************************************************************
+!> \brief Builds the real and imaginary parts of the RI-RS coefficients at k-point ikp:
+!>          Z_lP(k) = Σ_R e^{ik.R} Z_lP(R),  Z_lP(R) = Z_lP(k=0) for R the closest image of atom P,
+!>        i.e. n = nint(h^{-1}(r_l - R_P)), phase e^{i 2π xkp·n}. The phase depends only on the
+!>        grid point l and the RI atom P (constant across the RI functions of P).
+!> \param mat_Z input Γ coefficients Z_lP(k=0) (grid×RI, RI column blocks = atoms)
+!> \param Zc output Re Z_lP(k)
+!> \param Zs output Im Z_lP(k)
+!> \param grid_points (3,N_grid) Cartesian grid-point coordinates
+!> \param particle_set ...
+!> \param h_inv inverse cell h-matrix
+!> \param xkp_k fractional k-point coordinates
+! **************************************************************************************************
+
+   SUBROUTINE build_Z_ikp_grid(mat_Z, Zc, Zs, grid_points, particle_set, h_inv, xkp_k)
+
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_Z, Zc, Zs
+      REAL(KIND=dp), INTENT(IN)                          :: grid_points(:, :), h_inv(3, 3), xkp_k(3)
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'build_Z_ikp_grid'
+
+      INTEGER                                            :: atom_P, col, handle, i, ib, j, l, row
+      INTEGER, DIMENSION(3)                              :: n
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: row_off
+      INTEGER, DIMENSION(:), POINTER                     :: rbs
+      LOGICAL                                            :: found
+      REAL(KIND=dp)                                      :: arg, c, s, v
+      REAL(KIND=dp), DIMENSION(3)                        :: R_P, raw
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: blk_c, blk_s
+      TYPE(dbcsr_iterator_type)                          :: iter
+
+      CALL timeset(routineN, handle)
+
+      CALL dbcsr_copy(Zc, mat_Z)
+      CALL dbcsr_copy(Zs, mat_Z)
+
+      CALL dbcsr_get_info(Zc, row_blk_size=rbs)
+      ALLOCATE (row_off(SIZE(rbs)))
+      row_off(1) = 0
+      DO ib = 2, SIZE(rbs)
+         row_off(ib) = row_off(ib - 1) + rbs(ib - 1)
+      END DO
+
+      CALL dbcsr_iterator_start(iter, Zc)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
+         CALL dbcsr_iterator_next_block(iter, row, col, blk_c)
+         CALL dbcsr_get_block_p(Zs, row, col, blk_s, found)
+         IF (.NOT. found) CYCLE
+
+         atom_P = col
+         R_P(:) = particle_set(atom_P)%r(:)
+
+         DO i = 1, SIZE(blk_c, 1)
+            l = row_off(row) + i
+            raw(:) = grid_points(:, l) - R_P(:)
+            n(:) = NINT(MATMUL(h_inv, raw))
+            arg = twopi*(xkp_k(1)*n(1) + xkp_k(2)*n(2) + xkp_k(3)*n(3))
+            c = COS(arg)
+            s = SIN(arg)
+            DO j = 1, SIZE(blk_c, 2)
+               v = blk_c(i, j)
+               blk_c(i, j) = v*c
+               blk_s(i, j) = v*s
+            END DO
+         END DO
+      END DO
+      CALL dbcsr_iterator_stop(iter)
+
+      DEALLOCATE (row_off)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE build_Z_ikp_grid
+
+! **************************************************************************************************
+!> \brief Scales each (P,Q) element of W_PQ(iω,k) by the angular-momentum-dependent k-weight that
+!>        integrates the q→0 Coulomb head (folding the correction into W_PQ before the grid
+!>        contraction, see scale via bs_env%l_RI / wkp / wkp_s_p / wkp_no_extra — same selection as
+!>        MIC_contribution_from_ikp). After this, the grid contraction + a_min/2 truncation carry no
+!>        angular-momentum dependence.
+!> \param cfm_W W_PQ(iω,k) (RI×RI), scaled in place
+!> \param bs_env ...
+!> \param ikp ...
+! **************************************************************************************************
+   SUBROUTINE scale_W_PQ_by_wkp(cfm_W, bs_env, ikp)
+      TYPE(cp_cfm_type), INTENT(INOUT)                   :: cfm_W
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      INTEGER, INTENT(IN)                                :: ikp
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'scale_W_PQ_by_wkp'
+
+      INTEGER                                            :: handle, i_row, j_col, ncol_local, &
+                                                            nrow_local, p_bf, q_bf
+      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
+      REAL(KIND=dp)                                      :: w
+
+      CALL timeset(routineN, handle)
+
+      CALL cp_cfm_get_info(matrix=cfm_W, nrow_local=nrow_local, ncol_local=ncol_local, &
+                           row_indices=row_indices, col_indices=col_indices)
+
+      DO j_col = 1, ncol_local
+         q_bf = col_indices(j_col)
+         DO i_row = 1, nrow_local
+            p_bf = row_indices(i_row)
+            SELECT CASE (bs_env%l_RI(p_bf) + bs_env%l_RI(q_bf))
+            CASE (0)
+               w = bs_env%kpoints_chi_eps_W%wkp(ikp)
+            CASE (1)
+               w = bs_env%wkp_s_p(ikp)
+            CASE DEFAULT
+               w = bs_env%wkp_no_extra(ikp)
+            END SELECT
+            cfm_W%local_data(i_row, j_col) = cfm_W%local_data(i_row, j_col)*w
+         END DO
+      END DO
+
+      CALL timestop(handle)
+
+   END SUBROUTINE scale_W_PQ_by_wkp
+
+! **************************************************************************************************
+!> \brief Accumulates one k-point's contribution of a grid operator O_ll'(k) into the real
+!>        minimum-image, a_min/2-truncated real-space operator O^tr_ll' (inverse BZ transform):
+!>          O^tr(l,l') += cos(2π k·n)·Re O(l,l',k) + sin(2π k·n)·Im O(l,l',k),
+!>        with n = nint(h⁻¹(r_l−r_l')) the closest image and the term kept only if
+!>        |r_l−(r_l'+h·n)| < a_min/2. The per-k contribution (combined+masked) is written in place
+!>        into O_re, which is then merged into O_tr (copy on the first k, add afterwards — the Wgr
+!>        sparsity pattern is k-independent).
+!> \param O_re Re O(l,l',k); overwritten with the combined+masked contribution
+!> \param O_im Im O(l,l',k)
+!> \param O_tr accumulator (real grid×grid)
+!> \param grid_points ...
+!> \param hmat ...
+!> \param h_inv ...
+!> \param xkp_k fractional k-point
+!> \param a_min_half a_min/2
+!> \param first_k .TRUE. on the first contributing k (copy instead of add)
+! **************************************************************************************************
+   SUBROUTINE accumulate_O_tr_grid(O_re, O_im, O_tr, grid_points, hmat, h_inv, xkp_k, &
+                                   a_min_half, first_k)
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: O_re, O_im, O_tr
+      REAL(KIND=dp), INTENT(IN)                          :: grid_points(:, :), hmat(3, 3), &
+                                                            h_inv(3, 3), xkp_k(3), a_min_half
+      LOGICAL, INTENT(IN)                                :: first_k
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'accumulate_O_tr_grid'
+
+      INTEGER                                            :: col, handle, i, ib, j, l, lp, row
+      INTEGER, DIMENSION(3)                              :: n
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: col_off, row_off
+      INTEGER, DIMENSION(:), POINTER                     :: cbs, rbs
+      LOGICAL                                            :: found
+      REAL(KIND=dp)                                      :: arg, dmin, val
+      REAL(KIND=dp), DIMENSION(3)                        :: dvec, raw
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: blk_im, blk_re, blk_tr
+      TYPE(dbcsr_iterator_type)                          :: iter
+
+      CALL timeset(routineN, handle)
+
+      CALL dbcsr_get_info(O_re, row_blk_size=rbs, col_blk_size=cbs)
+      ALLOCATE (row_off(SIZE(rbs)), col_off(SIZE(cbs)))
+      row_off(1) = 0
+      DO ib = 2, SIZE(rbs)
+         row_off(ib) = row_off(ib - 1) + rbs(ib - 1)
+      END DO
+      col_off(1) = 0
+      DO ib = 2, SIZE(cbs)
+         col_off(ib) = col_off(ib - 1) + cbs(ib - 1)
+      END DO
+
+      ! On the first k, overwrite O_re in place with the combined, masked contribution and copy
+      ! it to O_tr (establishing the k-independent sparsity pattern). On later k, accumulate the
+      ! contribution directly into the matching O_tr blocks (no dbcsr_add: avoids any sparsity-
+      ! merge ambiguity).
+      CALL dbcsr_iterator_start(iter, O_re)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
+         CALL dbcsr_iterator_next_block(iter, row, col, blk_re)
+         CALL dbcsr_get_block_p(O_im, row, col, blk_im, found)
+         IF (.NOT. found) CYCLE
+         IF (first_k) THEN
+            NULLIFY (blk_tr)
+         ELSE
+            CALL dbcsr_get_block_p(O_tr, row, col, blk_tr, found)
+            IF (.NOT. found) CYCLE
+         END IF
+         DO j = 1, SIZE(blk_re, 2)
+            lp = col_off(col) + j
+            DO i = 1, SIZE(blk_re, 1)
+               l = row_off(row) + i
+               raw(:) = grid_points(:, l) - grid_points(:, lp)
+               n(:) = NINT(MATMUL(h_inv, raw))
+               dvec(:) = raw(:) - MATMUL(hmat, REAL(n, dp))
+               dmin = NORM2(dvec)
+               IF (dmin >= a_min_half) THEN
+                  val = 0.0_dp
+               ELSE
+                  arg = twopi*(xkp_k(1)*n(1) + xkp_k(2)*n(2) + xkp_k(3)*n(3))
+                  val = COS(arg)*blk_re(i, j) + SIN(arg)*blk_im(i, j)
+               END IF
+               IF (first_k) THEN
+                  blk_re(i, j) = val
+               ELSE
+                  blk_tr(i, j) = blk_tr(i, j) + val
+               END IF
+            END DO
+         END DO
+      END DO
+      CALL dbcsr_iterator_stop(iter)
+
+      DEALLOCATE (row_off, col_off)
+
+      IF (first_k) CALL dbcsr_copy(O_tr, O_re)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE accumulate_O_tr_grid
+
+! **************************************************************************************************
+!> \brief Screened interaction with the MIC truncation applied in the real-space GRID (ll') basis,
+!>        which removes the RI-auxiliary-extent (2·r_RI) inflation of the required cell size. Per k:
+!>          χ_ll'(iω,k) = grid-MIC of χ_ll'(iω,k=0);   Z(k) = grid-MIC of Z_lP(k=0)
+!>          χ_PQ(iω,k)  = Z(k)^† χ_ll'(iω,k) Z(k) → ε,W^V_PQ(iω,k) (reused PQ routines)
+!>          W̃_PQ(iω,k)  = wkp_{l(P)+l(Q)}(k) · W^V_PQ(iω,k)   [q→0 head folded in, B2]
+!>          W̃_PQ(iτ,k)  = Σ_ω weights_cos·cos(ωτ)·W̃_PQ(iω,k)
+!>          W̄_PQ(iτ,k)  = M⁻¹(k) W̃_PQ(iτ,k) M⁻¹(k)
+!>          W_ll'(iτ,k) = Z(k) W̄_PQ(iτ,k) Z(k)^†
+!>          W^tr_ll'(iτ) += MIC-inverse-FT of W_ll'(iτ,k), truncated at a_min/2   [B1]
+!> \param bs_env ...
+!> \param qs_env ...
+!> \param mat_chi_grid_tau grid χ_ll'(iτ,k=0); deallocated here after the τ→ω transform
+!> \param mat_W_tr_grid_tau output grid-truncated W^tr_ll'(iτ) (1:num_time_freq_points)
+! **************************************************************************************************
+
+   SUBROUTINE compute_W_MIC_grid(bs_env, qs_env, mat_chi_grid_tau, mat_W_tr_grid_tau)
+
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: mat_chi_grid_tau, mat_W_tr_grid_tau
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_W_MIC_grid'
+
+      INTEGER                                            :: handle, i, i_t, ikp, ikp_batch, &
+                                                            ikp_in_batch, j_w, n_RI
+      LOGICAL                                            :: first_k
+      REAL(KIND=dp)                                      :: a_min_half, coeff, eps, freq_j, t1, time_i
+      REAL(KIND=dp), DIMENSION(3, 3)                     :: h_inv, hmat
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(cp_cfm_type)                                  :: cfm_chi_ikp_freq_j, cfm_M_inv_ikp, &
+                                                            cfm_M_inv_V_sqrt_ikp, cfm_V_sqrt_ikp, &
+                                                            cfm_W_ikp_freq_j, cfm_Wbar, cfm_work
+      TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:)       :: cfm_W_tilde_tau
+      TYPE(cp_fm_type)                                   :: fm_im, fm_re
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_V_kp
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: mat_chi_grid_freq
+      TYPE(dbcsr_type)                                   :: chi_im, chi_re, M_im, M_re, PQ_im, PQ_re, &
+                                                            Wbar_im, Wbar_re, Wgi, Wgr, Zc, Zs
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+
+      CALL timeset(routineN, handle)
+
+      eps = bs_env%eps_filter
+      n_RI = bs_env%n_RI
+
+      IF (bs_env%approx_kp_extrapol .AND. bs_env%unit_nr > 0) THEN
+         WRITE (bs_env%unit_nr, '(T2,A)') &
+            'WARNING: APPROX_KP_EXTRAPOL is ignored by the grid-truncated W path; '// &
+            'standard k-weights are used.'
+      END IF
+
+      CALL get_qs_env(qs_env, cell=cell, particle_set=particle_set)
+      CALL get_cell(cell=cell, h=hmat, h_inv=h_inv)
+
+      ! a_min/2 = 0.5 * min distance between opposite faces = 0.5 * min_i 1/|h_inv(i,:)|
+      a_min_half = HUGE(1.0_dp)
+      DO i = 1, 3
+         a_min_half = MIN(a_min_half, 1.0_dp/NORM2(h_inv(i, 1:3)))
+      END DO
+      a_min_half = 0.5_dp*a_min_half
+
+      ! χ_ll'(iτ,k=0) -> χ_ll'(iω,k=0) (k-independent); free the τ set
+      CALL chi_grid_tau_to_freq(bs_env, mat_chi_grid_tau, mat_chi_grid_freq)
+      CALL dbcsr_deallocate_matrix_set(mat_chi_grid_tau)
+
+      ! output: grid-truncated W^tr_ll'(iτ), one per imaginary-time point (filled on first k)
+      NULLIFY (mat_W_tr_grid_tau)
+      ALLOCATE (mat_W_tr_grid_tau(bs_env%num_time_freq_points))
+      DO i_t = 1, bs_env%num_time_freq_points
+         ALLOCATE (mat_W_tr_grid_tau(i_t)%matrix)
+         CALL dbcsr_create(mat_W_tr_grid_tau(i_t)%matrix, template=mat_chi_grid_freq(1)%matrix)
+      END DO
+
+      ! reusable scratch
+      CALL dbcsr_create(chi_re, template=mat_chi_grid_freq(1)%matrix)
+      CALL dbcsr_create(chi_im, template=mat_chi_grid_freq(1)%matrix)
+      CALL dbcsr_create(Wgr, template=mat_chi_grid_freq(1)%matrix)
+      CALL dbcsr_create(Wgi, template=mat_chi_grid_freq(1)%matrix)
+      CALL dbcsr_create(Zc, template=bs_env%ri_rs%mat_Z_lP)
+      CALL dbcsr_create(Zs, template=bs_env%ri_rs%mat_Z_lP)
+      CALL dbcsr_create(M_re, template=bs_env%ri_rs%mat_Z_lP)
+      CALL dbcsr_create(M_im, template=bs_env%ri_rs%mat_Z_lP)
+      CALL dbcsr_create(PQ_re, template=bs_env%mat_RI_RI%matrix)
+      CALL dbcsr_create(PQ_im, template=bs_env%mat_RI_RI%matrix)
+      CALL dbcsr_create(Wbar_re, template=bs_env%mat_RI_RI%matrix)
+      CALL dbcsr_create(Wbar_im, template=bs_env%mat_RI_RI%matrix)
+      CALL cp_fm_create(fm_re, bs_env%fm_RI_RI%matrix_struct)
+      CALL cp_fm_create(fm_im, bs_env%fm_RI_RI%matrix_struct)
+
+      ! per-τ PQ accumulators W̃_PQ(iτ,k) (reused each k), plus M⁻¹-dressing scratch
+      ALLOCATE (cfm_W_tilde_tau(bs_env%num_time_freq_points))
+      DO i_t = 1, bs_env%num_time_freq_points
+         CALL cp_cfm_create(cfm_W_tilde_tau(i_t), bs_env%fm_RI_RI%matrix_struct)
+      END DO
+      CALL cp_cfm_create(cfm_Wbar, bs_env%fm_RI_RI%matrix_struct)
+      CALL cp_cfm_create(cfm_work, bs_env%fm_RI_RI%matrix_struct)
+
+      first_k = .TRUE.
+
+      DO ikp_batch = 1, bs_env%num_chi_eps_W_batches
+
+         t1 = m_walltime()
+
+         ! V_PQ(k) = Σ_R e^{ikR} (P0|QR)
+         CALL compute_V_k_by_lattice_sum(bs_env, qs_env, fm_V_kp, ikp_batch)
+
+         DO ikp_in_batch = 1, bs_env%nkp_chi_eps_W_batch
+
+            ikp = (ikp_batch - 1)*bs_env%nkp_chi_eps_W_batch + ikp_in_batch
+            IF (ikp > bs_env%nkp_chi_eps_W_orig_plus_extra) CYCLE
+
+            ! V^0.5(k), M⁻¹(k)V^0.5(k), and M⁻¹(k) itself (to dress W per k)
+            CALL compute_MinvVsqrt_Vsqrt(bs_env, qs_env, fm_V_kp, &
+                                         cfm_V_sqrt_ikp, cfm_M_inv_V_sqrt_ikp, ikp, &
+                                         cfm_M_inv_ikp_out=cfm_M_inv_ikp)
+
+            CALL bs_env%para_env%sync()
+            CALL cp_fm_release(fm_V_kp(ikp, 1))
+            CALL cp_fm_release(fm_V_kp(ikp, 2))
+
+            ! Z(k) = grid-MIC Bloch sum of Z_lP(k=0)
+            CALL build_Z_ikp_grid(bs_env%ri_rs%mat_Z_lP, Zc, Zs, bs_env%ri_rs%grid_points, &
+                                  particle_set, h_inv, bs_env%kpoints_chi_eps_W%xkp(1:3, ikp))
+
+            ! zero the per-τ PQ accumulators for this k
+            DO i_t = 1, bs_env%num_time_freq_points
+               CALL cp_cfm_set_all(cfm_W_tilde_tau(i_t), z_zero)
+            END DO
+
+            DO j_w = 1, bs_env%num_time_freq_points
+
+               ! χ_ll'(iω,k) (re/im) from the Γ grid matrix via grid-MIC
+               CALL build_chi_ikp_grid(mat_chi_grid_freq(j_w)%matrix, chi_re, chi_im, &
+                                       bs_env%ri_rs%grid_points, hmat, h_inv, &
+                                       bs_env%kpoints_chi_eps_W%xkp(1:3, ikp), a_min_half)
+
+               ! M(k) = χ_ll'(iω,k) Z(k)   [grid×RI, complex via re/im]
+               CALL dbcsr_multiply("N", "N", 1.0_dp, chi_re, Zc, 0.0_dp, M_re, filter_eps=eps)
+               CALL dbcsr_multiply("N", "N", -1.0_dp, chi_im, Zs, 1.0_dp, M_re, filter_eps=eps)
+               CALL dbcsr_multiply("N", "N", 1.0_dp, chi_re, Zs, 0.0_dp, M_im, filter_eps=eps)
+               CALL dbcsr_multiply("N", "N", 1.0_dp, chi_im, Zc, 1.0_dp, M_im, filter_eps=eps)
+
+               ! χ_PQ(iω,k) = Z(k)^† M(k)   [RI×RI, complex via re/im]
+               CALL dbcsr_multiply("T", "N", 1.0_dp, Zc, M_re, 0.0_dp, PQ_re, filter_eps=eps)
+               CALL dbcsr_multiply("T", "N", 1.0_dp, Zs, M_im, 1.0_dp, PQ_re, filter_eps=eps)
+               CALL dbcsr_multiply("T", "N", 1.0_dp, Zc, M_im, 0.0_dp, PQ_im, filter_eps=eps)
+               CALL dbcsr_multiply("T", "N", -1.0_dp, Zs, M_re, 1.0_dp, PQ_im, filter_eps=eps)
+
+               ! assemble complex χ_PQ(iω,k)
+               CALL copy_dbcsr_to_fm(PQ_re, fm_re)
+               CALL copy_dbcsr_to_fm(PQ_im, fm_im)
+               CALL cp_cfm_create(cfm_chi_ikp_freq_j, bs_env%fm_RI_RI%matrix_struct)
+               CALL cp_fm_to_cfm(fm_re, fm_im, cfm_chi_ikp_freq_j)
+
+               ! remove negative eigenvalues of χ_PQ(iω,k)
+               CALL cp_cfm_power(cfm_chi_ikp_freq_j, threshold=0.0_dp, exponent=1.0_dp)
+
+               ! ε(iω,k), W^V_PQ(iω,k) (reused PQ routine; releases cfm_chi internally)
+               CALL compute_cfm_W_ikp_freq_j(bs_env, cfm_chi_ikp_freq_j, cfm_V_sqrt_ikp, &
+                                             cfm_M_inv_V_sqrt_ikp, cfm_W_ikp_freq_j)
+
+               ! fold the q→0 head weight (l_RI-dependent) into W_PQ(iω,k)
+               CALL scale_W_PQ_by_wkp(cfm_W_ikp_freq_j, bs_env, ikp)
+
+               ! accumulate iω→iτ in PQ: W̃_PQ(iτ,k) += weights_cos·cos(ωτ)·W̃_PQ(iω,k)
+               freq_j = bs_env%imag_freq_points(j_w)
+               DO i_t = 1, bs_env%num_time_freq_points
+                  time_i = bs_env%imag_time_points(i_t)
+                  coeff = bs_env%weights_cos_w_to_t(i_t, j_w)*COS(time_i*freq_j)
+                  CALL cp_cfm_scale_and_add(z_one, cfm_W_tilde_tau(i_t), &
+                                            CMPLX(coeff, 0.0_dp, KIND=dp), cfm_W_ikp_freq_j)
+               END DO
+
+               CALL cp_cfm_release(cfm_W_ikp_freq_j)
+
+            END DO ! j_w
+
+            ! per τ: M⁻¹(k) dressing, Z(k)-contraction to grid, MIC-truncate-accumulate over k
+            DO i_t = 1, bs_env%num_time_freq_points
+
+               ! W̄_PQ(iτ,k) = M⁻¹(k) W̃_PQ(iτ,k) M⁻¹(k)
+               CALL parallel_gemm("N", "N", n_RI, n_RI, n_RI, z_one, cfm_M_inv_ikp, &
+                                  cfm_W_tilde_tau(i_t), z_zero, cfm_work)
+               CALL parallel_gemm("N", "N", n_RI, n_RI, n_RI, z_one, cfm_work, &
+                                  cfm_M_inv_ikp, z_zero, cfm_Wbar)
+
+               CALL cp_cfm_to_fm(cfm_Wbar, fm_re, fm_im)
+               CALL copy_fm_to_dbcsr(fm_re, Wbar_re, keep_sparsity=.FALSE.)
+               CALL copy_fm_to_dbcsr(fm_im, Wbar_im, keep_sparsity=.FALSE.)
+
+               ! G1(k) = Z(k) W̄_PQ(iτ,k)   [grid×RI, complex via re/im]
+               ! No filter here: keep a purely structural (k-independent) sparsity so the per-k
+               ! Wgr/Wgi blocks always match the W^tr accumulator pattern.
+               CALL dbcsr_multiply("N", "N", 1.0_dp, Zc, Wbar_re, 0.0_dp, M_re)
+               CALL dbcsr_multiply("N", "N", -1.0_dp, Zs, Wbar_im, 1.0_dp, M_re)
+               CALL dbcsr_multiply("N", "N", 1.0_dp, Zc, Wbar_im, 0.0_dp, M_im)
+               CALL dbcsr_multiply("N", "N", 1.0_dp, Zs, Wbar_re, 1.0_dp, M_im)
+
+               ! W_ll'(iτ,k) = G1(k) Z(k)^†   [grid×grid, complex via re/im]
+               CALL dbcsr_multiply("N", "T", 1.0_dp, M_re, Zc, 0.0_dp, Wgr)
+               CALL dbcsr_multiply("N", "T", 1.0_dp, M_im, Zs, 1.0_dp, Wgr)
+               CALL dbcsr_multiply("N", "T", 1.0_dp, M_im, Zc, 0.0_dp, Wgi)
+               CALL dbcsr_multiply("N", "T", -1.0_dp, M_re, Zs, 1.0_dp, Wgi)
+
+               ! W^tr_ll'(iτ) += MIC-inverse-FT of W_ll'(iτ,k), truncated at a_min/2
+               CALL accumulate_O_tr_grid(Wgr, Wgi, mat_W_tr_grid_tau(i_t)%matrix, &
+                                         bs_env%ri_rs%grid_points, hmat, h_inv, &
+                                         bs_env%kpoints_chi_eps_W%xkp(1:3, ikp), a_min_half, &
+                                         first_k)
+            END DO ! i_t
+
+            first_k = .FALSE.
+
+            CALL cp_cfm_release(cfm_M_inv_ikp)
+
+         END DO ! ikp_in_batch
+
+         DEALLOCATE (fm_V_kp)
+
+         IF (bs_env%unit_nr > 0) THEN
+            WRITE (bs_env%unit_nr, '(T2,A,I8,A,I3,A,F10.1,A)') &
+               'Computed grid-truncated W^tr(iτ) for k-point batch', &
+               ikp_batch, ' /', bs_env%num_chi_eps_W_batches, &
+               ', Execution time', m_walltime() - t1, ' s'
+         END IF
+
+      END DO ! ikp_batch
+
+      ! cleanup
+      CALL cp_cfm_release(cfm_M_inv_V_sqrt_ikp)
+      CALL cp_cfm_release(cfm_V_sqrt_ikp)
+      CALL cp_cfm_release(cfm_Wbar)
+      CALL cp_cfm_release(cfm_work)
+      DO i_t = 1, bs_env%num_time_freq_points
+         CALL cp_cfm_release(cfm_W_tilde_tau(i_t))
+      END DO
+      DEALLOCATE (cfm_W_tilde_tau)
+      CALL cp_fm_release(fm_re)
+      CALL cp_fm_release(fm_im)
+      CALL dbcsr_release(chi_re)
+      CALL dbcsr_release(chi_im)
+      CALL dbcsr_release(Wgr)
+      CALL dbcsr_release(Wgi)
+      CALL dbcsr_release(Zc)
+      CALL dbcsr_release(Zs)
+      CALL dbcsr_release(M_re)
+      CALL dbcsr_release(M_im)
+      CALL dbcsr_release(PQ_re)
+      CALL dbcsr_release(PQ_im)
+      CALL dbcsr_release(Wbar_re)
+      CALL dbcsr_release(Wbar_im)
+      CALL dbcsr_deallocate_matrix_set(mat_chi_grid_freq)
+
+      IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(A)') ' '
+
+      CALL timestop(handle)
+
+   END SUBROUTINE compute_W_MIC_grid
 
 ! **************************************************************************************************
 !> \brief Compute screened Coulomb interaction matrix
@@ -1794,23 +2528,22 @@ CONTAINS
 !> \param fm_Sigma_c_Gamma_time ...
 ! **************************************************************************************************
 
-   SUBROUTINE compute_Sigma_c(bs_env, fm_W_time, mat_phi_mu_l, mat_Z_lP, fm_Sigma_c_Gamma_time)
+   SUBROUTINE compute_Sigma_c(bs_env, mat_W_tr_grid_tau, mat_phi_mu_l, fm_Sigma_c_Gamma_time)
 
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_W_time
-      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_phi_mu_l, mat_Z_lP
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: mat_W_tr_grid_tau
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_phi_mu_l
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :, :)  :: fm_Sigma_c_Gamma_time
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_Sigma_c'
 
       INTEGER                                            :: handle, i_t, ispin
-      INTEGER, DIMENSION(:), POINTER                     :: blk_aux, blk_grid, dist_col_grid, &
-                                                            dist_row_aux
+      INTEGER, DIMENSION(:), POINTER                     :: blk_grid, dist_col_grid
       REAL(KIND=dp)                                      :: t1, tau
-      TYPE(dbcsr_distribution_type)                      :: dist_aux_aux, dist_grid_grid
+      TYPE(dbcsr_distribution_type)                      :: dist_grid_grid
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: mat_Sigma_neg_tau, mat_Sigma_pos_tau
       TYPE(dbcsr_type) :: matrix_G_occ_grid, matrix_G_vir_grid, matrix_Sigma_neg_grid, &
-         matrix_Sigma_pos_grid, matrix_W_aux, matrix_W_grid
+         matrix_Sigma_pos_grid
 
       CALL timeset(routineN, handle)
 
@@ -1818,7 +2551,6 @@ CONTAINS
       ! 1. SETUP CORE TOPOLOGIES AND PRE-ALLOCATE OUTPUT ARRAYS
       ! =========================================================================
       CALL setup_square_topology(mat_phi_mu_l, 'ROW', dist_grid_grid, blk_grid, dist_col_grid)
-      CALL setup_square_topology(mat_Z_lP, 'COL', dist_aux_aux, blk_aux, dist_row_aux)
 
       ! Pre-allocate local DBCSR matrices to act as targets for final output
       NULLIFY (mat_Sigma_neg_tau, mat_Sigma_pos_tau)
@@ -1836,22 +2568,11 @@ CONTAINS
 
       ! =========================================================================
       ! 2. MAIN IMAGINARY TIME LOOP
+      ! W^tr_ll'(iτ) is supplied directly in the grid basis (already MIC-truncated
+      ! at a_min/2 by compute_W_MIC_grid); no Z-contraction needed here.
       ! =========================================================================
       DO i_t = 1, bs_env%num_time_freq_points
          tau = bs_env%imag_time_points(i_t)
-
-         ! -------------------------------------------------------------------
-         ! Compute W_grid = Z * W_aux * Z^T
-         ! -------------------------------------------------------------------
-         CALL dbcsr_create(matrix_W_aux, "W_aux", dist_aux_aux, dbcsr_type_no_symmetry, blk_aux, blk_aux)
-         CALL dbcsr_create(matrix_W_grid, "W_grid", dist_grid_grid, dbcsr_type_no_symmetry, blk_grid, blk_grid)
-
-         CALL copy_fm_to_dbcsr(fm_W_time(i_t), matrix_W_aux, keep_sparsity=.FALSE.)
-
-         ! W^MIC_ll'(iτ,k=0) = sum_PQ Z_lP W^MIC_PQ(iτ) Z_l'Q
-         CALL contract_A_B_A("N", "T", mat_Z_lP, matrix_W_aux, matrix_W_grid, bs_env%eps_filter)
-
-         CALL dbcsr_release(matrix_W_aux) ! Clean up aux basis immediately
 
          DO ispin = 1, bs_env%n_spin
             t1 = m_walltime()
@@ -1862,43 +2583,38 @@ CONTAINS
             CALL dbcsr_create(matrix_G_occ_grid, "G_occ_grid", dist_grid_grid, dbcsr_type_no_symmetry, blk_grid, blk_grid)
             CALL dbcsr_create(matrix_G_vir_grid, "G_vir_grid", dist_grid_grid, dbcsr_type_no_symmetry, blk_grid, blk_grid)
 
-            ! G^occ_µλ(i|τ|,k=0) = sum_G^occ_µλn^occ C_µn(k=0) e^(-|(ϵ_nk=0-ϵ_F)τ|) C_λn(k=0)
             ! G^occ_ll'(i|τ|,k=0) = sum_µν Φ_µ(r_l) G^occ_µν Φ_ν(r_l')
             CALL build_G_grid(bs_env, tau, ispin, .TRUE., .FALSE., mat_phi_mu_l, matrix_G_occ_grid, bs_env%eps_filter)
 
-            ! G^vir_µλ(i|τ|,k=0) = sum_n^vir C_µn(k=0) e^(-|(ϵ_nk=0-ϵ_F)τ|) C_λn(k=0)
             ! G^vir_ll'(i|τ|,k=0) = sum_µν Φ_µ(r_l) G^vir_µν Φ_ν(r_l')
             CALL build_G_grid(bs_env, tau, ispin, .FALSE., .TRUE., mat_phi_mu_l, matrix_G_vir_grid, bs_env%eps_filter)
 
             ! -------------------------------------------------------------------
             ! B. Element-wise Hadamard Products for Sigma_c on Grid
-            ! Σ_neg_grid = G_occ_grid ◦ W_grid
-            ! Σ_pos_grid = G_vir_grid ◦ W_grid
+            ! Σ_neg_grid = G_occ_grid ◦ W^tr_grid ; Σ_pos_grid = G_vir_grid ◦ W^tr_grid
             ! -------------------------------------------------------------------
-            CALL dbcsr_create(matrix_Sigma_neg_grid, template=matrix_W_grid)
-            CALL dbcsr_create(matrix_Sigma_pos_grid, template=matrix_W_grid)
+            CALL dbcsr_create(matrix_Sigma_neg_grid, template=mat_W_tr_grid_tau(i_t)%matrix)
+            CALL dbcsr_create(matrix_Sigma_pos_grid, template=mat_W_tr_grid_tau(i_t)%matrix)
 
-            ! Σ^c_ll'(iτ,k=0)   = -G^occ_ll'(i|τ|,k=0) * W^MIC_ll'(iτ,k=0), for τ < 0
-            CALL hadamard_product(matrix_G_occ_grid, matrix_W_grid, matrix_Sigma_neg_grid, 1.0_dp)
+            ! Σ^c_ll'(iτ)   = -G^occ_ll'(i|τ|) * W^tr_ll'(iτ), for τ < 0
+            CALL hadamard_product(matrix_G_occ_grid, mat_W_tr_grid_tau(i_t)%matrix, &
+                                  matrix_Sigma_neg_grid, 1.0_dp)
 
-            ! Σ^c_ll'(iτ,k=0)   =  G^vir_ll'(i|τ|,k=0) * W^MIC_ll'(iτ,k=0), for τ > 0
-            CALL hadamard_product(matrix_G_vir_grid, matrix_W_grid, matrix_Sigma_pos_grid, 1.0_dp)
+            ! Σ^c_ll'(iτ)   =  G^vir_ll'(i|τ|) * W^tr_ll'(iτ), for τ > 0
+            CALL hadamard_product(matrix_G_vir_grid, mat_W_tr_grid_tau(i_t)%matrix, &
+                                  matrix_Sigma_pos_grid, 1.0_dp)
 
             ! Instantly purge massive G_grid arrays to save memory
             CALL dbcsr_release(matrix_G_occ_grid)
             CALL dbcsr_release(matrix_G_vir_grid)
 
             ! -------------------------------------------------------------------
-            ! C. Transform Sigma back to AO Basis
-            ! Σ_AO = phi^T * Σ_grid * phi
+            ! C. Transform Sigma back to AO Basis: Σ_AO = phi^T * Σ_grid * phi
             ! -------------------------------------------------------------------
-
-            ! Σ^c_λσ(iτ,k=0)    = sum_ll' Φ_λ(r_l) Σ^c_ll'(iτ,k=0) Φ_σ(r_l'), for τ < 0
             CALL contract_A_B_A("T", "N", mat_phi_mu_l, matrix_Sigma_neg_grid, &
                                 mat_Sigma_neg_tau(i_t, ispin)%matrix, bs_env%eps_filter)
             CALL dbcsr_scale(mat_Sigma_neg_tau(i_t, ispin)%matrix, -1.0_dp)
 
-            ! Σ^c_λσ(iτ,k=0)    = sum_ll' Φ_λ(r_l) Σ^c_ll'(iτ,k=0) Φ_σ(r_l'), for τ > 0
             CALL contract_A_B_A("T", "N", mat_phi_mu_l, matrix_Sigma_pos_grid, &
                                 mat_Sigma_pos_tau(i_t, ispin)%matrix, bs_env%eps_filter)
 
@@ -1914,9 +2630,6 @@ CONTAINS
 
          END DO ! ispin
 
-         ! Release the W_grid for this time point
-         CALL dbcsr_release(matrix_W_grid)
-
       END DO ! i_t
 
       IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(A)') ' '
@@ -1927,13 +2640,12 @@ CONTAINS
       CALL fill_fm_Sigma_c_Gamma_time(fm_Sigma_c_Gamma_time, bs_env, &
                                       mat_Sigma_pos_tau, mat_Sigma_neg_tau)
 
-      CALL cp_fm_release(fm_W_time)
+      CALL dbcsr_deallocate_matrix_set(mat_W_tr_grid_tau)
 
       CALL dbcsr_deallocate_matrix_set(mat_Sigma_neg_tau)
       CALL dbcsr_deallocate_matrix_set(mat_Sigma_pos_tau)
 
       CALL release_dbcsr_topology_and_matrices(dist=dist_grid_grid, mapped_dist=dist_col_grid)
-      CALL release_dbcsr_topology_and_matrices(dist=dist_aux_aux, mapped_dist=dist_row_aux)
 
       CALL delete_unnecessary_files(bs_env)
       CALL timestop(handle)

@@ -160,6 +160,14 @@ CONTAINS
 
          CALL check_positive_definite_overlap_mat(bs_env, qs_env)
 
+         ! For the RI-RS variants the MIC truncation of G/χ/Σ is applied in the real-space
+         ! grid (ll') basis; report the cell half-width a_min/2 that bounds that locality
+         ! (Eq. 74). This is informational and does NOT replace the ORB overlap check above.
+         SELECT CASE (bs_env%small_cell_full_kp_or_large_cell_Gamma)
+         CASE (large_cell_Gamma_ri_rs, non_periodic_ri_rs)
+            CALL check_ri_rs_locality(bs_env, qs_env)
+         END SELECT
+
       CASE (small_cell_full_kp)
 
          CALL setup_kpoints_scf_desymm(qs_env, bs_env, bs_env%kpoints_scf_desymm, .TRUE.)
@@ -856,6 +864,79 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE check_positive_definite_overlap_mat
+
+! **************************************************************************************************
+!> \brief RI-RS grid-locality diagnostic. Reports a_min (minimum distance between opposite faces
+!>        of the unit cell) and the half-width a_min/2 that bounds the minimum-image truncation of
+!>        G, χ and Σ in the real-space grid (ll') basis (Eq. 74). Purely informational: it does
+!>        not abort and does not replace check_positive_definite_overlap_mat (the ORB overlap
+!>        S(k) ≻ 0 is still required for the QP generalized eigenproblem).
+!> \param bs_env ...
+!> \param qs_env ...
+! **************************************************************************************************
+   SUBROUTINE check_ri_rs_locality(bs_env, qs_env)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'check_ri_rs_locality'
+
+      INTEGER                                            :: handle, i, u
+      REAL(KIND=dp)                                      :: a_min, vol
+      REAL(KIND=dp), DIMENSION(3)                        :: cross_area
+      REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat
+      TYPE(cell_type), POINTER                           :: cell
+
+      CALL timeset(routineN, handle)
+
+      NULLIFY (cell)
+      CALL get_qs_env(qs_env=qs_env, cell=cell)
+      CALL get_cell(cell=cell, h=hmat)
+
+      ! a_min = min over i of (volume / |a_j x a_k|), i.e. the distance between opposite faces
+      vol = ABS(hmat(1, 1)*(hmat(2, 2)*hmat(3, 3) - hmat(3, 2)*hmat(2, 3)) &
+                - hmat(1, 2)*(hmat(2, 1)*hmat(3, 3) - hmat(3, 1)*hmat(2, 3)) &
+                + hmat(1, 3)*(hmat(2, 1)*hmat(3, 2) - hmat(3, 1)*hmat(2, 2)))
+
+      ! |a2 x a3|, |a3 x a1|, |a1 x a2| (lattice vectors are the columns of hmat)
+      cross_area(1) = NORM2(cross_prod(hmat(:, 2), hmat(:, 3)))
+      cross_area(2) = NORM2(cross_prod(hmat(:, 3), hmat(:, 1)))
+      cross_area(3) = NORM2(cross_prod(hmat(:, 1), hmat(:, 2)))
+
+      a_min = HUGE(1.0_dp)
+      DO i = 1, 3
+         IF (cross_area(i) > 1.0E-12_dp) a_min = MIN(a_min, vol/cross_area(i))
+      END DO
+
+      u = bs_env%unit_nr
+      IF (u > 0) THEN
+         WRITE (u, '(T2,A)') 'RI-RS grid-locality prerequisite (informational):'
+         WRITE (u, '(T4,A,F12.4,A)') 'a_min (min distance of opposite cell faces) = ', &
+            a_min, ' Bohr'
+         WRITE (u, '(T4,A,F12.4,A)') 'MIC truncation half-width a_min/2            = ', &
+            0.5_dp*a_min, ' Bohr'
+         WRITE (u, '(T4,A)') 'G, χ and Σ must decay within a_min/2 for the grid-MIC to be valid.'
+         WRITE (u, '(A)') ' '
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE check_ri_rs_locality
+
+! **************************************************************************************************
+!> \brief Cross product of two 3-vectors.
+!> \param a ...
+!> \param b ...
+!> \return a x b
+! **************************************************************************************************
+   PURE FUNCTION cross_prod(a, b) RESULT(c)
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: a, b
+      REAL(KIND=dp), DIMENSION(3)                        :: c
+
+      c(1) = a(2)*b(3) - a(3)*b(2)
+      c(2) = a(3)*b(1) - a(1)*b(3)
+      c(3) = a(1)*b(2) - a(2)*b(1)
+
+   END FUNCTION cross_prod
 
 ! **************************************************************************************************
 !> \brief ...
