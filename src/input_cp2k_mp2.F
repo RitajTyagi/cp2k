@@ -733,6 +733,19 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="DO_ST_COHSEX", &
+                          description="Compute a static COHSEX (st-COHSEX) band structure instead of the "// &
+                          "frequency-integrated G0W0. Only the static screened Coulomb interaction "// &
+                          "W^C(omega=0) is required and no analytic continuation is performed. The "// &
+                          "quasiparticle Hamiltonian H = eps_KS + (Sigma_x - v_xc) + Sigma_c is built in "// &
+                          "the KS-MO basis and its occupied-occupied and virtual-virtual blocks are "// &
+                          "diagonalized separately. W^C(0), the st-COHSEX eigenvalues and eigenvectors "// &
+                          "are stored for subsequent BSE calculations. Requires the RI_RPA / GW setup.", &
+                          usage="DO_ST_COHSEX .TRUE.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="CORR_MOS_OCC", &
                           variants=["CORR_OCC"], &
                           description="Number of occupied MOs whose energies are corrected in GW. "// &

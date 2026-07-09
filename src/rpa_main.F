@@ -91,6 +91,7 @@ MODULE rpa_main
                                               deallocate_matrices_gw_im_time,&
                                               get_fermi_level_offset
    USE rpa_gw_ic,                       ONLY: calculate_ic_correction
+   USE rpa_gw_stcohsex,                 ONLY: gw_stcohsex_energies
    USE rpa_gw_kpoints_util,             ONLY: get_bandstruc_and_k_dependent_MOs,&
                                               invert_eps_compute_W_and_Erpa_kp
    USE rpa_im_time,                     ONLY: compute_mat_P_omega,&
@@ -1121,7 +1122,7 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: col_blk_size, prim_blk_sizes, &
                                                             RI_blk_sizes
       LOGICAL :: do_apply_ic_corr_to_gw, do_gw_im_time, do_ic_model, do_kpoints_cubic_RPA, &
-         do_periodic, do_print, do_ri_Sigma_x, exit_ev_gw, first_cycle, &
+         do_periodic, do_print, do_ri_Sigma_x, do_st_cohsex, exit_ev_gw, first_cycle, &
          first_cycle_periodic_correction, my_open_shell, print_ic_values
       LOGICAL, ALLOCATABLE, DIMENSION(:, :, :, :, :)     :: has_mat_P_blocks
       REAL(KIND=dp) :: a_scaling, alpha, dbcsr_time, e_exchange, e_exchange_corr, eps_filter, &
@@ -1169,6 +1170,9 @@ CONTAINS
       nspins = SIZE(homo)
       nmo = homo(1) + virtual(1)
 
+      ! static COHSEX uses only W^C(omega=0) in the analytic (non-imaginary-time) GW path
+      do_st_cohsex = mp2_env%ri_g0w0%do_st_cohsex .AND. my_do_gw .AND. .NOT. do_im_time
+
       my_open_shell = (nspins == 2)
 
       do_gw_im_time = my_do_gw .AND. do_im_time
@@ -1192,6 +1196,11 @@ CONTAINS
             IF (iter_sc_GW0 /= 1 .AND. iter_evGW /= 1) CPABORT("Mixed scGW0/evGW not implemented.")
             ! in case of scGW0 with the N^4 algorithm, we use the evGW code but use the DFT eigenvalues for W
             IF (iter_sc_GW0 /= 1) iter_evGW = iter_sc_GW0
+         END IF
+         ! static COHSEX is a one-shot @KS calculation: force a single pass
+         IF (do_st_cohsex) THEN
+            iter_evGW = 1
+            iter_sc_GW0 = 1
          END IF
       ELSE
          ext_scaling = 0.0_dp
@@ -1433,7 +1442,28 @@ CONTAINS
             CALL rpa_sigma_create(rpa_sigma, mp2_env%ri_rpa%sigma_param, fm_mat_Q(1), unit_nr, para_env)
          END IF
 
+         ! ==== static COHSEX: a single evaluation at omega = 0, the frequency loop is skipped ====
+         IF (do_st_cohsex) THEN
+            omega = 0.0_dp
+            DO ispin = 1, nspins
+               CALL calc_mat_Q(fm_mat_S(ispin), do_ri_sos_laplace_mp2, .TRUE., virtual(ispin), &
+                               Eigenval(:, 1, ispin), homo(ispin), omega, omega_old, 1, mm_style, &
+                               dimen_RI_red, dimen_ia(ispin), alpha, fm_mat_Q(ispin), &
+                               fm_mat_Q_gemm(ispin), do_bse, fm_mat_Q_static_bse_gemm, dgemm_counter, &
+                               num_integ_points, count_ev_sc_GW)
+            END DO
+            DO ispin = 2, nspins
+               CALL cp_fm_scale_and_add(alpha=1.0_dp, matrix_a=fm_mat_Q(1), beta=1.0_dp, matrix_b=fm_mat_Q(ispin))
+            END DO
+            CALL Q_trace_and_add_unit_matrix(dimen_RI_red, trace_Qomega, fm_mat_Q(1))
+            CALL gw_stcohsex_energies(fm_mat_Q(1), fm_mat_S_gw, fm_mat_S_gw_work, &
+                                      dimen_RI_red, dimen_nm_gw, nmo, homo, &
+                                      gw_corr_lev_occ, gw_corr_lev_virt, &
+                                      Eigenval(:, 1, :), mo_coeff, para_env, qs_env, mp2_env, unit_nr)
+         END IF
+
          DO jquad = 1, num_integ_points
+            IF (do_st_cohsex) CYCLE
             IF (MODULO(jquad, num_integ_group) /= color_rpa_group) CYCLE
 
             CALL timeset(routineN//"_RPA_matrix_operations", handle3)
@@ -1684,7 +1714,7 @@ CONTAINS
          ! GW: for low-scaling calculation: Compute self-energy Sigma(i*tau), Sigma(i*omega)
          ! for low-scaling and ordinary-scaling: analytic continuation from Sigma(iw) -> Sigma(w)
          !                                       and correction of quasiparticle energies e_n^GW
-         IF (my_do_gw) THEN
+         IF (my_do_gw .AND. .NOT. do_st_cohsex) THEN
 
             CALL compute_QP_energies(vec_Sigma_c_gw, count_ev_sc_GW, gw_corr_lev_occ, &
                                      gw_corr_lev_tot, gw_corr_lev_virt, homo, &

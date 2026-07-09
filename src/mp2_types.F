@@ -16,7 +16,8 @@ MODULE mp2_types
                                               dbcsr_type
    USE cp_eri_mme_interface,            ONLY: cp_eri_mme_finalize,&
                                               cp_eri_mme_param
-   USE cp_fm_types,                     ONLY: cp_fm_type
+   USE cp_fm_types,                     ONLY: cp_fm_release,&
+                                              cp_fm_type
    USE hfx_types,                       ONLY: hfx_release,&
                                               hfx_type,&
                                               pair_list_element_type
@@ -244,6 +245,11 @@ MODULE mp2_types
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: xkp_special_kp
       TYPE(dbcsr_p_type), DIMENSION(:), ALLOCATABLE      :: matrix_sigma_x_minus_vxc, &
                                                             matrix_ks
+      ! static COHSEX (molecular O(N^4) path): switch, stored W^C(0), QP eigenvalues/eigenvectors for BSE
+      LOGICAL                                            :: do_st_cohsex = .FALSE.
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: stcohsex_eigenval
+      TYPE(cp_fm_type)                                   :: fm_W_c_zero
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_stcohsex_evec
       REAL(KIND=dp)                                      :: broadening_print_loc_bandgap = 0.0_dp, &
                                                             energy_window_print_loc_bandgap = 0.0_dp, &
                                                             ldos_thresh_print_loc_bandgap = 0.0_dp, &
@@ -437,7 +443,7 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'mp2_env_release'
 
-      INTEGER                                            :: handle
+      INTEGER                                            :: handle, handle_fm
 
       CALL timeset(routineN, handle)
 
@@ -458,6 +464,17 @@ CONTAINS
       IF (ASSOCIATED(mp2_env%ri_rpa_im_time%weights_cos_tf_w_to_t)) DEALLOCATE (mp2_env%ri_rpa_im_time%weights_cos_tf_w_to_t)
 
       CALL mp2_env%local_gemm_ctx%destroy()
+
+      ! release static COHSEX storage (W^C(0), eigenvalues, eigenvectors)
+      CALL cp_fm_release(mp2_env%ri_g0w0%fm_W_c_zero)
+      IF (ALLOCATED(mp2_env%ri_g0w0%fm_stcohsex_evec)) THEN
+         DO handle_fm = 1, SIZE(mp2_env%ri_g0w0%fm_stcohsex_evec)
+            CALL cp_fm_release(mp2_env%ri_g0w0%fm_stcohsex_evec(handle_fm))
+         END DO
+         DEALLOCATE (mp2_env%ri_g0w0%fm_stcohsex_evec)
+      END IF
+      IF (ALLOCATED(mp2_env%ri_g0w0%stcohsex_eigenval)) &
+         DEALLOCATE (mp2_env%ri_g0w0%stcohsex_eigenval)
 
       CALL timestop(handle)
 

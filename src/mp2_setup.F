@@ -166,6 +166,8 @@ CONTAINS
                                 l_val=mp2_env%ri_g0w0%print_self_energy)
       CALL section_vals_val_get(mp2_section, "RI_RPA%GW%RI_SIGMA_X", &
                                 l_val=mp2_env%ri_g0w0%do_ri_Sigma_x)
+      CALL section_vals_val_get(mp2_section, "RI_RPA%GW%DO_ST_COHSEX", &
+                                l_val=mp2_env%ri_g0w0%do_st_cohsex)
 
       NULLIFY (r_vals)
       CALL section_vals_val_get(mp2_section, "RI_RPA%GW%IC_CORR_LIST", &

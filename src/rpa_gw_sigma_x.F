@@ -504,8 +504,10 @@ CONTAINS
          END DO
 
          ! safe matrix_sigma_x_minus_vxc for later: for example, we will transform matrix_sigma_x_minus_vxc
-         ! to T-cell index and then to k-points for band structure calculation
-         IF (do_kpoints_from_Gamma) THEN
+         ! to T-cell index and then to k-points for band structure calculation.
+         ! For the molecular static-COHSEX path we also keep this AO matrix (= Sigma_x - v_xc), which is
+         ! later transformed to the MO basis to build the off-diagonal quasiparticle Hamiltonian blocks.
+         IF (do_kpoints_from_Gamma .OR. mp2_env%ri_g0w0%do_st_cohsex) THEN
             ! not yet there: open shell
             ALLOCATE (qs_env%mp2_env%ri_g0w0%matrix_sigma_x_minus_vxc(nspins))
             DO ispin = 1, nspins
