@@ -137,7 +137,7 @@ MODULE gw_non_periodic_ri_rs
              extract_grid_panel, collect_used_col_blocks, extract_masked_blocks, &
              reserve_blocks_within_radius, create_product_matrix, build_G_ao, &
              contract_grid_panels, contract_grid_panels_sigma_c, &
-             create_grid_panel_like, accumulate_grid_panel
+             hadamard_product
 
    ! Reporting and memory probing
    PUBLIC :: print_matrix_occupation, ri_rs_mem_avail_per_proc_GB, print_ri_rs_memory_estimate
@@ -216,6 +216,9 @@ CONTAINS
       ! flag the RI-RS grid as built so a subsequent RT-BSE run reuses Z_lP
       ! instead of rebuilding it
       bs_env%ri_rs%grid_built = .TRUE.
+
+      ! grid coordinates are only needed by the periodic minimum-image phases
+      IF (ALLOCATED(bs_env%ri_rs%grid_points)) DEALLOCATE (bs_env%ri_rs%grid_points)
 
       ! ==============================================================================
       ! 4. Polarizability matrix χ on the imaginary-time grid
@@ -1636,7 +1639,9 @@ CONTAINS
       DEALLOCATE (row_offset, ri_blk_sizes, col_dist_ri)
       CALL dbcsr_distribution_release(dist_Z)
 
-      DEALLOCATE (ri_rs_grid_points)
+      ! ri_rs_grid_points is deliberately NOT released here: the periodic grid-truncated W path
+      ! still needs the Cartesian grid coordinates to build the minimum-image Bloch phases
+      ! e^{i 2 pi k . n(l,l')} and e^{i 2 pi k . n(l,P)}. Each driver frees it once it is done.
 
       CALL timestop(handle)
 
@@ -3579,77 +3584,6 @@ CONTAINS
 !> \param col_used   optional mask over the parent's column blocks (neighborhood restriction)
 !> \param col_map    optional map compressed column index -> parent column block index
 ! **************************************************************************************************
-   SUBROUTINE create_grid_panel_like(mat_full, blk0, blk1, mat_out, col_used, col_map)
-
-      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_full
-      INTEGER, INTENT(IN)                                :: blk0, blk1
-      TYPE(dbcsr_type), INTENT(OUT)                      :: mat_out
-      LOGICAL, DIMENSION(:), INTENT(IN), OPTIONAL        :: col_used
-      INTEGER, ALLOCATABLE, DIMENSION(:), INTENT(OUT), &
-         OPTIONAL                                        :: col_map
-
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'create_grid_panel_like'
-
-      INTEGER                                            :: handle, jb, n_col_sub, npb, r
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_full, col_blk_use, &
-                                                            col_dist_full, col_dist_use, &
-                                                            row_blk_full, row_blk_pan, &
-                                                            row_dist_full, row_dist_pan
-      LOGICAL                                            :: own_cols
-      TYPE(dbcsr_distribution_type)                      :: dist_full, dist_pan
-
-      CALL timeset(routineN, handle)
-
-      CALL dbcsr_get_info(mat_full, distribution=dist_full, &
-                          row_blk_size=row_blk_full, col_blk_size=col_blk_full)
-      CALL dbcsr_distribution_get(dist_full, row_dist=row_dist_full, col_dist=col_dist_full)
-
-      npb = blk1 - blk0 + 1
-      ALLOCATE (row_dist_pan(npb), row_blk_pan(npb))
-      row_dist_pan(:) = row_dist_full(blk0:blk1)
-      row_blk_pan(:) = row_blk_full(blk0:blk1)
-
-      own_cols = PRESENT(col_used)
-      IF (own_cols) THEN
-         n_col_sub = COUNT(col_used)
-         CPASSERT(n_col_sub > 0)
-         ALLOCATE (col_blk_use(n_col_sub), col_dist_use(n_col_sub))
-         IF (PRESENT(col_map)) ALLOCATE (col_map(n_col_sub))
-         r = 0
-         DO jb = 1, SIZE(col_blk_full)
-            IF (.NOT. col_used(jb)) CYCLE
-            r = r + 1
-            col_blk_use(r) = col_blk_full(jb)
-            col_dist_use(r) = col_dist_full(jb)
-            IF (PRESENT(col_map)) col_map(r) = jb
-         END DO
-      ELSE
-         col_blk_use => col_blk_full
-         col_dist_use => col_dist_full
-         IF (PRESENT(col_map)) THEN
-            ALLOCATE (col_map(SIZE(col_blk_full)))
-            DO jb = 1, SIZE(col_blk_full)
-               col_map(jb) = jb
-            END DO
-         END IF
-      END IF
-
-      CALL dbcsr_distribution_new(dist_pan, template=dist_full, &
-                                  row_dist=row_dist_pan, col_dist=col_dist_use)
-      CALL dbcsr_create(mat_out, name="grid_panel_like", dist=dist_pan, &
-                        matrix_type=dbcsr_type_no_symmetry, &
-                        row_blk_size=row_blk_pan, col_blk_size=col_blk_use)
-      CALL dbcsr_distribution_release(dist_pan)
-
-      DEALLOCATE (row_dist_pan, row_blk_pan)
-      ! col_blk_use/col_dist_use alias mat_full's internals unless we built them here
-      IF (own_cols) DEALLOCATE (col_blk_use, col_dist_use)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE create_grid_panel_like
-
-! **************************************************************************************************
 !> \brief Scatters a grid panel back into its full grid x grid parent:
 !>          mat_full(blk0+ib-1, col_map(jb)) += alpha * mat_pan(ib, jb)
 !>        The inverse of extract_grid_panel / create_grid_panel_like. Purely local (zero
@@ -3664,61 +3598,6 @@ CONTAINS
 !>                         (mat_full must be finalized; this is the templated-W accumulation).
 !>                         .FALSE. (default): insert blocks as needed with summation; the caller
 !>                         must dbcsr_finalize(mat_full) once all panels have been scattered.
-! **************************************************************************************************
-   SUBROUTINE accumulate_grid_panel(mat_pan, blk0, mat_full, alpha, col_map, retain_sparsity)
-
-      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_pan, mat_full
-      INTEGER, INTENT(IN)                                :: blk0
-      REAL(KIND=dp), INTENT(IN)                          :: alpha
-      INTEGER, DIMENSION(:), INTENT(IN), OPTIONAL        :: col_map
-      LOGICAL, INTENT(IN), OPTIONAL                      :: retain_sparsity
-
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'accumulate_grid_panel'
-
-      INTEGER                                            :: col_full, handle, ib, jb, row_full
-      LOGICAL                                            :: found, my_retain
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: scaled
-      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: blk_full, blk_pan
-      TYPE(dbcsr_iterator_type)                          :: iter
-
-      CALL timeset(routineN, handle)
-
-      my_retain = .FALSE.
-      IF (PRESENT(retain_sparsity)) my_retain = retain_sparsity
-
-      CALL dbcsr_iterator_start(iter, mat_pan)
-      DO WHILE (dbcsr_iterator_blocks_left(iter))
-         CALL dbcsr_iterator_next_block(iter, ib, jb, blk_pan)
-
-         row_full = blk0 + ib - 1
-         IF (PRESENT(col_map)) THEN
-            col_full = col_map(jb)
-         ELSE
-            col_full = jb
-         END IF
-
-         IF (my_retain) THEN
-            ! Templated accumulation: blocks outside the reserved pattern are dropped. That is
-            ! the intended truncation, not a lost contribution -- the template is a superset of
-            ! supp(G), and anything outside it meets a zero in the Hadamard product with G.
-            CALL dbcsr_get_block_p(mat_full, row_full, col_full, blk_full, found)
-            IF (found) blk_full(:, :) = blk_full(:, :) + alpha*blk_pan(:, :)
-         ELSE
-            IF (ALLOCATED(scaled)) THEN
-               IF (SIZE(scaled, 1) /= SIZE(blk_pan, 1) .OR. SIZE(scaled, 2) /= SIZE(blk_pan, 2)) &
-                  DEALLOCATE (scaled)
-            END IF
-            IF (.NOT. ALLOCATED(scaled)) ALLOCATE (scaled(SIZE(blk_pan, 1), SIZE(blk_pan, 2)))
-            scaled(:, :) = alpha*blk_pan(:, :)
-            CALL dbcsr_put_block(mat_full, row_full, col_full, scaled, summation=.TRUE.)
-         END IF
-      END DO
-      CALL dbcsr_iterator_stop(iter)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE accumulate_grid_panel
-
 ! **************************************************************************************************
 !> \brief .TRUE. when two DBCSR matrices have identical block structure AND identical data
 !>        distribution, i.e. block (i,j) of one lives on the same rank as block (i,j) of the

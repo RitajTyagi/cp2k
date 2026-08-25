@@ -24,6 +24,7 @@ MODULE post_scf_bandstructure_types
    USE dbt_api,                         ONLY: dbt_destroy,&
                                               dbt_type
    USE input_constants,                 ONLY: G0W0,&
+                                              ri_rs_w_aux,&
                                               rtp_method_bse,&
                                               rtp_method_bse_linearized,&
                                               small_cell_full_kp
@@ -87,6 +88,13 @@ MODULE post_scf_bandstructure_types
       REAL(KIND=dp)                                    :: evgw0_eps_iter = 5.0E-5_dp
       ! index of the running evGW0 cycle
       INTEGER                                          :: evgw0_i_iter = 0
+
+      ! Basis in which the periodic screened interaction W is truncated to the minimum image:
+      ! ri_rs_w_aux  -- atom-pair (P,Q) truncation, the validated default. Needs a cell with
+      !                 a_min/2 > r_G + 2 r_RI because the RI functions carry their own extent.
+      ! ri_rs_w_grid -- grid-point (l,l') truncation, which only needs a_min/2 > r_G and should
+      !                 therefore converge in a smaller cell. Experimental.
+      INTEGER                                          :: w_truncation = ri_rs_w_aux
 
       ! Data types for cutoffs based DBCSR matrices
       REAL(KIND=dp), ALLOCATABLE                       :: chunk_centroids(:, :)

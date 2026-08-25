@@ -40,7 +40,8 @@ MODULE input_cp2k_properties_dft
       gto_cartesian, gto_spherical, int_ldos_none, int_ldos_x, int_ldos_y, int_ldos_z, oe_gllb, &
       oe_lb, oe_none, oe_saop, oe_shift, ot_precond_full_all, ot_precond_full_kinetic, &
       ot_precond_full_single, ot_precond_full_single_inverse, ot_precond_none, &
-      ot_precond_s_inverse, scan_x, scan_xy, scan_xyz, scan_xz, scan_y, scan_yz, scan_z, &
+      ot_precond_s_inverse, ri_rs_w_aux, ri_rs_w_grid, &
+      scan_x, scan_xy, scan_xyz, scan_xz, scan_y, scan_yz, scan_z, &
       tddfpt_dipole_berry, tddfpt_dipole_length, tddfpt_dipole_scf_moment, &
       tddfpt_dipole_velocity, tddfpt_dipole_velocity_old, tddfpt_kernel_full, tddfpt_kernel_none, &
       tddfpt_kernel_stda, no_sf_tddfpt, tddfpt_sf_col, tddfpt_sf_noncol, use_mom_ref_coac, &
@@ -2761,6 +2762,26 @@ CONTAINS
                           usage="CUTOFF_RADIUS_G_W 20.0", &
                           default_r_val=cp_unit_to_cp2k(value=-1.0_dp, unit_str="angstrom"), &
                           type_of_var=real_t, unit_str="angstrom")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="W_TRUNCATION", &
+                          description="Basis in which the screened interaction W of a periodic "// &
+                          "Gamma-only RI-RS GW calculation is truncated to the minimum image. "// &
+                          "AUX truncates W_PQ at atom-pair granularity in the RI auxiliary "// &
+                          "basis; because the auxiliary functions have their own spatial extent "// &
+                          "r_RI, the lattice sum converges only once a_min/2 > r_G + 2 r_RI. "// &
+                          "GRID truncates W_ll' at grid-point granularity, which converges "// &
+                          "already for a_min/2 > r_G and should therefore need a smaller cell, "// &
+                          "at the cost of storing W in the grid basis. GRID is experimental; "// &
+                          "AUX reproduces the analytic reference and is the default. "// &
+                          "Ignored for non-periodic (molecular) systems.", &
+                          usage="W_TRUNCATION GRID", &
+                          enum_c_vals=s2a("AUX", "GRID"), &
+                          enum_i_vals=[ri_rs_w_aux, ri_rs_w_grid], &
+                          enum_desc=s2a("Truncate W_PQ in the RI auxiliary basis (default).", &
+                                        "Truncate W_ll' in the real-space grid basis."), &
+                          default_i_val=ri_rs_w_aux)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 

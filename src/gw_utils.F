@@ -62,7 +62,7 @@ MODULE gw_utils
    USE gw_integrals,                    ONLY: build_3c_integral_block
    USE input_constants,                 ONLY: &
         G0W0, do_potential_truncated, evGW0, large_cell_Gamma, large_cell_Gamma_ri_rs, &
-        non_periodic_ri_rs, ri_rpa_g0w0_crossing_newton, rtp_bse_kernel_ri_ao, &
+        non_periodic_ri_rs, ri_rpa_g0w0_crossing_newton, ri_rs_w_grid, rtp_bse_kernel_ri_ao, &
         rtp_bse_kernel_ri_rs, rtp_method_bse, rtp_method_bse_linearized, small_cell_full_kp, &
         xc_none
    USE input_section_types,             ONLY: section_vals_get,&
@@ -379,6 +379,7 @@ CONTAINS
       CALL section_vals_val_get(gw_sec, "RI_RS%KEEP_SPARSITY_RL", l_val=bs_env%ri_rs%keep_sparsity_rirs)
       CALL section_vals_val_get(gw_sec, "RI_RS%CUTOFF_RADIUS_RL_W", r_val=bs_env%ri_rs%cutoff_radius_v_w)
       CALL section_vals_val_get(gw_sec, "RI_RS%CUTOFF_RADIUS_G_W", r_val=bs_env%ri_rs%cutoff_radius_g_w)
+      CALL section_vals_val_get(gw_sec, "RI_RS%W_TRUNCATION", i_val=bs_env%ri_rs%w_truncation)
       CALL section_vals_val_get(gw_sec, "RI_RS%EVGW0%_SECTION_PARAMETERS_", l_val=do_evgw0)
       CALL section_vals_val_get(gw_sec, "RI_RS%EVGW0%MAX_ITER", i_val=bs_env%ri_rs%evgw0_iter)
       CALL section_vals_val_get(gw_sec, "RI_RS%EVGW0%EPS_ITER", r_val=bs_env%ri_rs%evgw0_eps_iter)
@@ -386,6 +387,16 @@ CONTAINS
       ! Assigning GW flavour
       bs_env%gw_flavour = G0W0
       IF (do_evgw0) bs_env%gw_flavour = evGW0
+
+      ! evGW0 rebuilds G from the quasiparticle energies while W stays frozen, so W has to
+      ! survive the eigenvalue loop. On the grid-truncated path W is stored in the grid basis --
+      ! precisely the object that path exists to keep small -- so the combination is refused
+      ! here rather than silently producing a single-shot G0W0 result.
+      IF (do_evgw0 .AND. bs_env%ri_rs%w_truncation == ri_rs_w_grid) THEN
+         CALL cp_abort(__LOCATION__, &
+                       "&EVGW0 is not supported together with RI_RS W_TRUNCATION GRID. "// &
+                       "Use W_TRUNCATION AUX for eigenvalue self-consistency.")
+      END IF
 
       IF (bs_env%gw_flavour == evGW0) THEN
          CALL cp_warn(__LOCATION__, &

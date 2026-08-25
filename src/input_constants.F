@@ -1150,7 +1150,11 @@ MODULE input_constants
                                                evGW0 = 36, &
                                                evGW = 37, &
                                                non_periodic_ri_rs = 38, &
-                                               large_cell_Gamma_ri_rs = 39
+                                               large_cell_Gamma_ri_rs = 39, &
+                                               ! basis in which the RI-RS screened interaction W
+                                               ! is truncated to the minimum image
+                                               ri_rs_w_aux = 41, &
+                                               ri_rs_w_grid = 42
 
    ! periodic RESP parameters
    INTEGER, PARAMETER, PUBLIC               :: do_resp_x_dir = 0, &
