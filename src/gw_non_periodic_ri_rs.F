@@ -16,6 +16,7 @@ MODULE gw_non_periodic_ri_rs
                                               get_atomic_kind_set
    USE basis_set_types,                 ONLY: gto_basis_set_type
    USE cell_types,                      ONLY: cell_type,&
+                                              get_cell,&
                                               pbc
    USE constants_operator,              ONLY: operator_coulomb
    USE cp_blacs_env,                    ONLY: cp_blacs_env_create,&
@@ -112,11 +113,37 @@ MODULE gw_non_periodic_ri_rs
    ! that hard limit in elements (= HUGE(int_4) = 2^31-1), the same bound DBCSR uses
    ! internally as mp_max_memory_size. Panel sizing keeps every per-rank message below it.
 
-   INTEGER(KIND=int_8), PARAMETER, PRIVATE :: dbcsr_msg_elem_limit = INT(HUGE(0_int_4), int_8)
+   INTEGER(KIND=int_8), PARAMETER, PUBLIC :: dbcsr_msg_elem_limit = INT(HUGE(0_int_4), int_8)
 
    PUBLIC :: gw_calc_non_periodic_ri_rs, ri_rs_grid_assembler, &
              get_basis_offsets, precompute_ri_rs_radii, solve_D_lp_distributed, &
-             atomic_basis_at_grid_point, compute_coeff_Z_lP
+             atomic_basis_at_grid_point, compute_coeff_Z_lP, fill_phi_for_atom, &
+             get_mat_chi_Gamma_tau, compute_Sigma_x, compute_Sigma_c, &
+             compute_Sigma_c_and_QP_energies
+
+   ! Cell-agnostic RI-RS machinery shared with the periodic Gamma-point driver
+   ! (gw_large_cell_Gamma_ri_rs). This module is the lower one in the dependency chain, so
+   ! anything both drivers need lives here rather than being duplicated.
+
+   ! Z_lP solve: work classification, load balancing and the sphere-local linear algebra
+   PUBLIC :: classify_z_lp_atoms, lpt_assign_atoms, build_phi_on_sphere, &
+             build_gram_jacobi_blas, build_jacobi_diag_from_phi, scale_rows_by_diag, &
+             scatter_z_columns, print_sphere_cutoff_table
+
+   ! Grid-panel streaming: planner, panel/neighborhood extraction, geometric templates
+   ! and the two contraction kernels that never materialize a grid x grid matrix.
+   PUBLIC :: plan_grid_panels, resolve_grid_panels, panel_template_elems, &
+             panel_mem_estimate_GB, mask_grid_blocks_near_panel, build_geo_template_panel, &
+             extract_grid_panel, collect_used_col_blocks, extract_masked_blocks, &
+             reserve_blocks_within_radius, create_product_matrix, build_G_ao, &
+             contract_grid_panels, contract_grid_panels_sigma_c, &
+             create_grid_panel_like, accumulate_grid_panel
+
+   ! Reporting and memory probing
+   PUBLIC :: print_matrix_occupation, ri_rs_mem_avail_per_proc_GB, print_ri_rs_memory_estimate
+
+   ! evGW0 self-consistency helpers (cell-agnostic: they only touch eigenvalues)
+   PUBLIC :: init_evGW0, update_eigenvalues_G, reset_and_clean_bs_env, print_evGW0_band_edges
 
 CONTAINS
 
@@ -136,6 +163,12 @@ CONTAINS
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_Sigma_x_Gamma, fm_W_time
 
       CALL timeset(routineN, handle)
+
+      ! Cache the cell so every geometric screening test below measures minimum-image
+      ! distances. On this (molecular) path cell%perd = 0, so pbc() is the identity and the
+      ! tests reduce to plain Euclidean distances -- the cache is what lets the periodic
+      ! driver share the very same screening routines.
+      CALL get_qs_env(qs_env, cell=bs_env%ri_rs%cell)
 
       ! ==============================================================================
       ! 0. Precompute AO and RI radii
@@ -894,12 +927,12 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'atomic_basis_at_grid_point'
 
-      INTEGER :: bs_eff, c_size, dimen_ORB, handle, i, i_blk, ia, iatom, natom, npcol, nprow, &
+      INTEGER :: bs_eff, c_size, dimen_ORB, handle, i, i_blk, ia, iatom, l, natom, npcol, nprow, &
          num_grid_chunks, r_end, r_start, remaining, run, safe_max, total_grid_npts
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: blk_row_start, first_sgf
       INTEGER, DIMENSION(:), POINTER                     :: c_blk_sizes, col_dist, r_blk_sizes, &
                                                             row_dist
-      REAL(KIND=dp)                                      :: r2_threshold
+      REAL(KIND=dp)                                      :: d2, r_pad2, r2_threshold
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: atom_col_buffer
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
@@ -981,20 +1014,29 @@ CONTAINS
          bs_env%ri_rs%atom_centers(1:3, iatom) = particle_set(iatom)%r(1:3)
       END DO
 
-      ! Cache per-chunk centroids for the optional CUTOFF_RADIUS_RL_W block truncation.
+      ! Cache per-chunk centroids for the optional CUTOFF_RADIUS_RL_W block truncation, and the
+      ! padding radius r_pad = max_l |r_l - centroid(block(l))|. Geometric templates test block
+      ! centroids whereas the physical cutoffs (and the a_min/2 minimum-image mask of the
+      ! periodic grid-W path) act per element, so a template radius must be widened by r_pad to
+      ! be a provable superset of the exact per-element test. Grid points never wrap relative to
+      ! their own atom's centroid, so this is a plain Euclidean extent -- no minimum image here.
       IF (bs_env%ri_rs%cutoff_radius_v_w > 0.0_dp) THEN
          IF (ALLOCATED(bs_env%ri_rs%chunk_centroids)) DEALLOCATE (bs_env%ri_rs%chunk_centroids)
          ALLOCATE (bs_env%ri_rs%chunk_centroids(3, num_grid_chunks))
+         r_pad2 = 0.0_dp
          DO i_blk = 1, num_grid_chunks
             r_start = blk_row_start(i_blk)
             r_end = r_start + r_blk_sizes(i_blk) - 1
-            bs_env%ri_rs%chunk_centroids(1, i_blk) = &
-               SUM(ri_rs_grid_points(1, r_start:r_end))/REAL(r_blk_sizes(i_blk), dp)
-            bs_env%ri_rs%chunk_centroids(2, i_blk) = &
-               SUM(ri_rs_grid_points(2, r_start:r_end))/REAL(r_blk_sizes(i_blk), dp)
-            bs_env%ri_rs%chunk_centroids(3, i_blk) = &
-               SUM(ri_rs_grid_points(3, r_start:r_end))/REAL(r_blk_sizes(i_blk), dp)
+            DO i = 1, 3
+               bs_env%ri_rs%chunk_centroids(i, i_blk) = &
+                  SUM(ri_rs_grid_points(i, r_start:r_end))/REAL(r_blk_sizes(i_blk), dp)
+            END DO
+            DO l = r_start, r_end
+               d2 = SUM((ri_rs_grid_points(1:3, l) - bs_env%ri_rs%chunk_centroids(1:3, i_blk))**2)
+               r_pad2 = MAX(r_pad2, d2)
+            END DO
          END DO
+         bs_env%ri_rs%r_pad = SQRT(r_pad2)
       END IF
 
       ! C. Build Custom Mappings using Round-Robin across the 2D process grid
@@ -1102,12 +1144,13 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'fill_phi_for_atom'
 
-      INTEGER                                            :: first_sgf, handle, i_pt, ico, iend_co, &
-                                                            ikind, ipgf, iset, isgf, ishell, &
-                                                            istart_co, l, last_sgf, lx, ly, lz, &
-                                                            n_cart_total, row_idx
-      REAL(KIND=dp)                                      :: alpha, dist_vec(3), exp_val, poly, r2, &
+      INTEGER :: first_sgf, handle, i_pt, ico, iend_co, ikind, ipgf, iset, isgf, ishell, &
+         istart_co, ix, ix_max, ix_min, iy, iy_max, iy_min, iz, iz_max, iz_min, l, last_sgf, lx, &
+         ly, lz, n_cart_total, row_idx
+      REAL(KIND=dp)                                      :: alpha, cell_vector(3), dist_vec(3), &
+                                                            dist_vec_raw(3), exp_val, poly, r2, &
                                                             r_atom(3), weight
+      REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat
       TYPE(gto_basis_set_type), POINTER                  :: orb_basis_set
 
       CALL timeset(routineN, handle)
@@ -1115,55 +1158,83 @@ CONTAINS
       ! Get Atom Info
       ikind = particle_set(iatom)%atomic_kind%kind_number
       CALL get_qs_kind(qs_kind_set(ikind), basis_set=orb_basis_set, basis_type="ORB")
+      CALL get_cell(cell=cell, h=hmat)
+
       IF (.NOT. ASSOCIATED(orb_basis_set)) THEN
          CALL timestop(handle)
          RETURN
       END IF
 
+      ! Periodic images of iatom that can reach the grid. For a molecule cell%perd = 0, the
+      ! loops below collapse to the single (0,0,0) term and dist_vec = r_l - R_A exactly, so
+      ! this is the plain molecular expression -- one routine serves both drivers.
+      IF (cell%perd(1) == 1) THEN; ix_min = -1; ix_max = 1; ELSE; ix_min = 0; ix_max = 0
+      END IF
+      IF (cell%perd(2) == 1) THEN; iy_min = -1; iy_max = 1; ELSE; iy_min = 0; iy_max = 0
+      END IF
+      IF (cell%perd(3) == 1) THEN; iz_min = -1; iz_max = 1; ELSE; iz_min = 0; iz_max = 0
+      END IF
+
       r_atom = particle_set(iatom)%r
 
       !$OMP PARALLEL DO DEFAULT(NONE) &
-      !$OMP SHARED(phi_val, ri_rs_grid, npts, orb_basis_set, r_atom, cell, ncoset, indco, &
-      !$OMP        r2_threshold) &
-      !$OMP PRIVATE(i_pt, dist_vec, r2, iset, n_cart_total, ishell, l, istart_co, iend_co, &
-      !$OMP         first_sgf, last_sgf, ipgf, alpha, exp_val, isgf, ico, row_idx, weight, &
-      !$OMP         lx, ly, lz, poly) &
-      !$OMP SCHEDULE(STATIC)
+      !$OMP SHARED(phi_val, ri_rs_grid, npts, orb_basis_set, r_atom, hmat, &
+      !$OMP        ncoset, indco, cell, ix_min, ix_max, &
+      !$OMP        iy_min, iy_max, iz_min, iz_max, r2_threshold) &
+      !$OMP PRIVATE(i_pt, dist_vec_raw, ix, iy, iz, cell_vector, dist_vec, r2, iset, &
+      !$OMP         n_cart_total, ishell, l, istart_co, iend_co, first_sgf, last_sgf, &
+      !$OMP         ipgf, alpha, exp_val, isgf, ico, row_idx, weight, lx, ly, lz, poly) &
+      !$OMP SCHEDULE(DYNAMIC)
+
       DO i_pt = 1, npts
-         dist_vec = pbc(ri_rs_grid(:, i_pt) - r_atom, cell)
-         r2 = DOT_PRODUCT(dist_vec, dist_vec)
-         IF (r2 > r2_threshold) CYCLE
 
-         DO iset = 1, orb_basis_set%nset
-            n_cart_total = ncoset(orb_basis_set%lmax(iset))
+         dist_vec_raw = ri_rs_grid(:, i_pt) - r_atom
 
-            DO ishell = 1, orb_basis_set%nshell(iset)
-               l = orb_basis_set%l(ishell, iset)
-               istart_co = ncoset(l - 1) + 1
-               iend_co = ncoset(l)
+         DO ix = ix_min, ix_max
+         DO iy = iy_min, iy_max
+         DO iz = iz_min, iz_max
 
-               first_sgf = orb_basis_set%first_sgf(ishell, iset)
-               last_sgf = orb_basis_set%last_sgf(ishell, iset)
+            cell_vector(1:3) = MATMUL(hmat, REAL([ix, iy, iz], dp))
 
-               DO ipgf = 1, orb_basis_set%npgf(iset)
-                  alpha = orb_basis_set%zet(ipgf, iset)
-                  exp_val = EXP(-alpha*r2)
+            dist_vec = dist_vec_raw - cell_vector
 
-                  DO isgf = first_sgf, last_sgf
-                     DO ico = istart_co, iend_co
-                        row_idx = (ipgf - 1)*n_cart_total + ico
-                        weight = orb_basis_set%sphi(row_idx, isgf)
-                        lx = indco(1, ico)
-                        ly = indco(2, ico)
-                        lz = indco(3, ico)
-                        poly = (dist_vec(1)**lx)*(dist_vec(2)**ly)*(dist_vec(3)**lz)
+            r2 = DOT_PRODUCT(dist_vec, dist_vec)
 
-                        phi_val(i_pt, isgf) = phi_val(i_pt, isgf) + (weight*poly*exp_val)
+            IF (r2 > r2_threshold) CYCLE
 
+            DO iset = 1, orb_basis_set%nset
+               n_cart_total = ncoset(orb_basis_set%lmax(iset))
+
+               DO ishell = 1, orb_basis_set%nshell(iset)
+                  l = orb_basis_set%l(ishell, iset)
+                  istart_co = ncoset(l - 1) + 1
+                  iend_co = ncoset(l)
+
+                  first_sgf = orb_basis_set%first_sgf(ishell, iset)
+                  last_sgf = orb_basis_set%last_sgf(ishell, iset)
+
+                  DO ipgf = 1, orb_basis_set%npgf(iset)
+                     alpha = orb_basis_set%zet(ipgf, iset)
+                     exp_val = EXP(-alpha*r2)
+
+                     DO isgf = first_sgf, last_sgf
+                        DO ico = istart_co, iend_co
+                           row_idx = (ipgf - 1)*n_cart_total + ico
+                           weight = orb_basis_set%sphi(row_idx, isgf)
+                           lx = indco(1, ico)
+                           ly = indco(2, ico)
+                           lz = indco(3, ico)
+                           poly = (dist_vec(1)**lx)*(dist_vec(2)**ly)*(dist_vec(3)**lz)
+
+                           phi_val(i_pt, isgf) = phi_val(i_pt, isgf) + (weight*poly*exp_val)
+
+                        END DO
                      END DO
                   END DO
                END DO
             END DO
+         END DO
+         END DO
          END DO
       END DO
       !$OMP END PARALLEL DO
@@ -1701,7 +1772,8 @@ CONTAINS
          cutoff_ri = cutoff_ri_per_atom(P_loop_atom)
          n_local_grid = 0
          DO l = 1, n_grid_total
-            IF (SUM((ri_rs_grid_points(1:3, l) - pos_P(1:3))**2) <= cutoff_ri**2) THEN
+            IF (sphere_dist2(ri_rs_grid_points(1:3, l), pos_P(1:3), bs_env%ri_rs%cell) &
+                <= cutoff_ri**2) THEN
                n_local_grid = n_local_grid + 1
             END IF
          END DO
@@ -1844,7 +1916,7 @@ CONTAINS
       INTEGER                                            :: col_end, col_start, handle, j, k, l, &
                                                             loc_idx, n_grid_total, n_keep, &
                                                             source_atom
-      REAL(KIND=dp)                                      :: d_sP, dist, r2_threshold
+      REAL(KIND=dp)                                      :: cutoff_ri_2, d_sP, r2_threshold
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: w_pt
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: phi_keep, sphere_grid
       REAL(KIND=dp), DIMENSION(3)                        :: pos_P
@@ -1854,18 +1926,20 @@ CONTAINS
       n_grid_total = SIZE(ri_rs_grid_points, 2)
       pos_P(:) = particle_set(atom_P)%r(:)
 
+      cutoff_ri_2 = cutoff_ri**2
+
       n_local_grid = 0
       DO l = 1, n_grid_total
-         dist = SQRT(SUM((ri_rs_grid_points(1:3, l) - pos_P(1:3))**2))
-         IF (dist <= cutoff_ri) n_local_grid = n_local_grid + 1
+         IF (sphere_dist2(ri_rs_grid_points(1:3, l), pos_P(1:3), bs_env%ri_rs%cell) &
+             <= cutoff_ri_2) n_local_grid = n_local_grid + 1
       END DO
 
       ALLOCATE (local_grid_idx(n_local_grid))
 
       n_local_grid = 0
       DO l = 1, n_grid_total
-         dist = SQRT(SUM((ri_rs_grid_points(1:3, l) - pos_P(1:3))**2))
-         IF (dist <= cutoff_ri) THEN
+         IF (sphere_dist2(ri_rs_grid_points(1:3, l), pos_P(1:3), bs_env%ri_rs%cell) &
+             <= cutoff_ri_2) THEN
             n_local_grid = n_local_grid + 1
             local_grid_idx(n_local_grid) = l
          END IF
@@ -1880,7 +1954,7 @@ CONTAINS
       phi_local = 0.0_dp
 
       DO source_atom = 1, SIZE(particle_set)
-         d_sP = NORM2(particle_set(source_atom)%r(:) - pos_P(:))
+         d_sP = SQRT(sphere_dist2(particle_set(source_atom)%r(:), pos_P(:), bs_env%ri_rs%cell))
          IF (d_sP > bs_env%ri_rs%radius_ao_per_atom(source_atom) + cutoff_ri) CYCLE
 
          col_start = bs_env%i_ao_start_from_atom(source_atom)
@@ -2234,56 +2308,103 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_d_lp'
       INTEGER, PARAMETER                                 :: grid_chunk = 1024
 
-      INTEGER                                            :: atom_j, atom_k, c, handle, handle_dgemm, &
-                                                            j, jk_idx, jsize, jstart, k, ksize, &
-                                                            kstart, l, l0, ri
-      LOGICAL                                            :: screened
+      INTEGER :: atom_j, atom_k, c, handle, handle_dgemm, ix_max, ix_min, ix_R, ix_S, iy_max, &
+         iy_min, iy_R, iy_S, iz_max, iz_min, iz_R, iz_S, j, jk_idx, jsize, jstart, k, ksize, &
+         kstart, l, l0, natom, ri
+      INTEGER, DIMENSION(3)                              :: cell_R_vec, cell_S_vec
+      LOGICAL                                            :: any_kept, screened
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: d_lp_prv, int_2d_prv, rho_chunk
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: int_3c_prv
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: int_3c_prv, int_3c_sum
+      TYPE(cell_type), POINTER                           :: cell
       TYPE(gw_3c_ws_type)                                :: ws
 
       CALL timeset(routineN, handle)
 
+      natom = SIZE(bs_env%i_ao_start_from_atom)
+
+      ! Periodic images of the two AO atoms about atom_P at cell (0,0,0). For a molecule
+      ! cell%perd = 0 (or no cell cached), the loops collapse to the single (0,0,0) x (0,0,0)
+      ! triple and int_3c_sum is just that one block -- identical to the plain molecular
+      ! expression, so one routine serves both drivers.
+      cell => bs_env%ri_rs%cell
+      ix_min = 0; ix_max = 0; iy_min = 0; iy_max = 0; iz_min = 0; iz_max = 0
+      IF (ASSOCIATED(cell)) THEN
+         IF (cell%perd(1) == 1) THEN; ix_min = -1; ix_max = 1; END IF
+         IF (cell%perd(2) == 1) THEN; iy_min = -1; iy_max = 1; END IF
+         IF (cell%perd(3) == 1) THEN; iz_min = -1; iz_max = 1; END IF
+      END IF
+
       !$OMP PARALLEL DEFAULT(NONE) &
       !$OMP SHARED(bs_env, ctx, phi_val, d_lp, n_grid_total, n_loc_ri, atom_P, max_ao_size, &
+      !$OMP        natom, ix_min, ix_max, iy_min, iy_max, iz_min, iz_max, &
       !$OMP        atom_j_mepos, atom_j_stride) &
-      !$OMP PRIVATE(atom_j, atom_k, c, handle_dgemm, j, jk_idx, jsize, jstart, k, ksize, kstart, &
-      !$OMP         l, l0, ri, screened, d_lp_prv, int_2d_prv, rho_chunk, int_3c_prv, ws)
+      !$OMP PRIVATE(any_kept, atom_j, atom_k, c, handle_dgemm, j, jk_idx, jsize, jstart, k, &
+      !$OMP         ksize, kstart, l, l0, ri, ix_R, iy_R, iz_R, ix_S, iy_S, iz_S, cell_R_vec, &
+      !$OMP         cell_S_vec, screened, d_lp_prv, int_2d_prv, rho_chunk, int_3c_prv, int_3c_sum, ws)
 
       CALL gw_3c_ws_create(ws, ctx)
       ALLOCATE (int_3c_prv(max_ao_size, max_ao_size, n_loc_ri))
+      ALLOCATE (int_3c_sum(max_ao_size, max_ao_size, n_loc_ri))
       ALLOCATE (int_2d_prv(max_ao_size*max_ao_size, n_loc_ri))
       ALLOCATE (rho_chunk(grid_chunk, max_ao_size*max_ao_size))
       ALLOCATE (d_lp_prv(n_grid_total, n_loc_ri))
       d_lp_prv(:, :) = 0.0_dp
 
-      ! MPI-stride atom_j over the subgroup (atom_j_stride = 1 for the BLAS
-      ! path, > 1 for the ScaLAPACK path). The OMP DO parallelizes the inner
-      ! atom_k while the outer atom_j carries the MPI stride.
+      ! atom_P pinned at cell (0,0,0); enumerate (atom_j, cell_R) x (atom_k, cell_S). The ctx
+      ! integral builder's kind_radius triangle screen sets screened=.TRUE. for the bulk of
+      ! image triples (one or both AO atoms beyond the truncated-Coulomb reach of atom_P),
+      ! so the 27 x 27 = 729 candidate cells collapse to "adjacent cells" in practice.
+      ! MPI-stride atom_j over the subgroup (atom_j_stride = 1 for the BLAS path, > 1 for the
+      ! ScaLAPACK path). COLLAPSE(2) dropped because the outer stride is non-unit under
+      ! ScaLAPACK; the inner atom_k loop carries enough work for DYNAMIC.
       !$OMP DO SCHEDULE(DYNAMIC)
-      DO atom_j = atom_j_mepos + 1, SIZE(bs_env%i_ao_start_from_atom), atom_j_stride
-         DO atom_k = 1, SIZE(bs_env%i_ao_start_from_atom)
+      DO atom_j = atom_j_mepos + 1, natom, atom_j_stride
+         DO atom_k = 1, natom
             jstart = bs_env%i_ao_start_from_atom(atom_j)
             jsize = bs_env%i_ao_end_from_atom(atom_j) - jstart + 1
             kstart = bs_env%i_ao_start_from_atom(atom_k)
             ksize = bs_env%i_ao_end_from_atom(atom_k) - kstart + 1
 
-            int_3c_prv(1:jsize, 1:ksize, 1:n_loc_ri) = 0.0_dp
+            int_3c_sum(1:jsize, 1:ksize, 1:n_loc_ri) = 0.0_dp
+            any_kept = .FALSE.
 
-            ! Compute B_{μν,P} = (μν|P); ctx-internal triangle-inequality screening on
-            ! kind_radius sets `screened=.TRUE.` for negligible triples.
-            CALL build_3c_integral_block_ctx(int_3c_prv(1:jsize, 1:ksize, 1:n_loc_ri), &
-                                             ctx, ws, atom_j=atom_j, atom_k=atom_k, atom_i=atom_P, &
-                                             screened=screened)
+            DO ix_R = ix_min, ix_max
+            DO iy_R = iy_min, iy_max
+            DO iz_R = iz_min, iz_max
+               cell_R_vec = [ix_R, iy_R, iz_R]
+               DO ix_S = ix_min, ix_max
+               DO iy_S = iy_min, iy_max
+               DO iz_S = iz_min, iz_max
+                  cell_S_vec = [ix_S, iy_S, iz_S]
 
-            IF (screened) CYCLE
+                  int_3c_prv(1:jsize, 1:ksize, 1:n_loc_ri) = 0.0_dp
+
+                  CALL build_3c_integral_block_ctx( &
+                     int_3c_prv(1:jsize, 1:ksize, 1:n_loc_ri), ctx, ws, &
+                     atom_j=atom_j, atom_k=atom_k, atom_i=atom_P, &
+                     cell_j=cell_R_vec, cell_k=cell_S_vec, cell_i=[0, 0, 0], &
+                     screened=screened)
+                  IF (screened) CYCLE
+
+                  any_kept = .TRUE.
+                  int_3c_sum(1:jsize, 1:ksize, 1:n_loc_ri) = &
+                     int_3c_sum(1:jsize, 1:ksize, 1:n_loc_ri) + &
+                     int_3c_prv(1:jsize, 1:ksize, 1:n_loc_ri)
+               END DO
+               END DO
+               END DO
+            END DO
+            END DO
+            END DO
+
+            IF (.NOT. any_kept) CYCLE
 
             ! Flatten 3D B_{μν, P} tensor to 2D B_{(μν), P} matrix for BLAS
             DO ri = 1, n_loc_ri
                DO k = 1, ksize
                   DO j = 1, jsize
                      jk_idx = (k - 1)*jsize + j
-                     int_2d_prv(jk_idx, ri) = int_3c_prv(j, k, ri)
+                     int_2d_prv(jk_idx, ri) = int_3c_sum(j, k, ri)
                   END DO
                END DO
             END DO
@@ -2317,7 +2438,7 @@ CONTAINS
                                          d_lp_prv(1:n_grid_total, 1:n_loc_ri)
       !$OMP END CRITICAL (compute_d_lp_reduce)
 
-      DEALLOCATE (int_3c_prv, int_2d_prv, rho_chunk, d_lp_prv)
+      DEALLOCATE (int_3c_prv, int_3c_sum, int_2d_prv, rho_chunk, d_lp_prv)
       CALL gw_3c_ws_release(ws)
 
       !$OMP END PARALLEL
@@ -2548,7 +2669,7 @@ CONTAINS
                                       keep_sparsity=bs_env%ri_rs%keep_sparsity_rirs, &
                                       centroids=bs_env%ri_rs%chunk_centroids, &
                                       cutoff=bs_env%ri_rs%cutoff_radius_v_w, &
-                                      grid_occupation=grid_occ)
+                                      grid_occupation=grid_occ, cell=bs_env%ri_rs%cell)
 
             CALL dbcsr_release(matrix_G_occ_ao)
             CALL dbcsr_release(matrix_G_vir_ao)
@@ -2638,31 +2759,120 @@ CONTAINS
 !> \param cutoff ...
 !> \param used ...
 ! **************************************************************************************************
-   SUBROUTINE mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, used)
+   FUNCTION screen_dist2(a, b, cell) RESULT(d2)
+
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: a, b
+      TYPE(cell_type), OPTIONAL, POINTER                 :: cell
+      REAL(KIND=dp)                                      :: d2
+
+      REAL(KIND=dp), DIMENSION(3)                        :: d
+
+      d(:) = a(:) - b(:)
+      IF (PRESENT(cell)) THEN
+         IF (ASSOCIATED(cell)) d(:) = pbc(d, cell)
+      END IF
+      d2 = d(1)*d(1) + d(2)*d(2) + d(3)*d(3)
+
+   END FUNCTION screen_dist2
+
+! **************************************************************************************************
+!> \brief Squared distance between two points, minimized over lattice images by the EXACT 27-image
+!>        search (pbc3) rather than the scaled-coordinate ANINT wrap of screen_dist2.
+!>
+!>        Used where the distance defines a physical domain rather than a screening bound: the
+!>        RI-RS fitting sphere of atom P. For orthorhombic cells the two agree exactly; for
+!>        triclinic cells pbc3 is the true minimum, and using it here preserves the sphere the
+!>        periodic Z_lP solve has always built. Screening tests must keep using screen_dist2 so
+!>        that they stay consistent with the NINT(h_inv r) convention of the grid MIC masks.
+!> \param a ...
+!> \param b ...
+!> \param cell optional; Euclidean when absent or unassociated
+!> \return ...
+! **************************************************************************************************
+   FUNCTION sphere_dist2(a, b, cell) RESULT(d2)
+
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: a, b
+      TYPE(cell_type), OPTIONAL, POINTER                 :: cell
+      REAL(KIND=dp)                                      :: d2
+
+      REAL(KIND=dp), DIMENSION(3)                        :: d
+
+      d(:) = a(:) - b(:)
+      IF (PRESENT(cell)) THEN
+         IF (ASSOCIATED(cell)) d(:) = pbc(a, b, cell)
+      END IF
+      d2 = d(1)*d(1) + d(2)*d(2) + d(3)*d(3)
+
+   END FUNCTION sphere_dist2
+
+! **************************************************************************************************
+!> \brief Marks the grid blocks whose centroid lies within cutoff of the bounding box of the
+!>        panel [blk0, blk1]'s chunk centroids.
+!>
+!>        Under PBC the Cartesian bounding box is meaningless modulo the lattice, so the box
+!>        distance is minimized over lattice images. The invariant this routine must satisfy is
+!>        that `used` is a SUPERSET of the pairs the exact per-pair test (panel_template_elems /
+!>        build_geo_template_panel) subsequently keeps: for any panel block ib in the box and any
+!>        image R, dist(c - R, box) <= |r_ib - r_c + R|, so the image-minimized box distance is a
+!>        lower bound on the true minimum-image pair distance. Over-inclusion merely widens the
+!>        neighborhood slice; under-inclusion would silently delete real contributions.
+!> \param centroids ...
+!> \param blk0 ...
+!> \param blk1 ...
+!> \param cutoff ...
+!> \param used ...
+!> \param cell optional; when associated the distance is minimized over lattice images
+! **************************************************************************************************
+   SUBROUTINE mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, used, cell)
 
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: centroids
       INTEGER, INTENT(IN)                                :: blk0, blk1
       REAL(KIND=dp), INTENT(IN)                          :: cutoff
       LOGICAL, ALLOCATABLE, DIMENSION(:), INTENT(OUT)    :: used
+      TYPE(cell_type), OPTIONAL, POINTER                 :: cell
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'mask_grid_blocks_near_panel'
 
-      INTEGER                                            :: c, handle, k
-      REAL(KIND=dp)                                      :: cutoff2, d2, dx
-      REAL(KIND=dp), DIMENSION(3)                        :: hi, lo
+      INTEGER                                            :: c, handle, i1, i2, i3, k, n1, n2, n3
+      LOGICAL                                            :: do_pbc
+      REAL(KIND=dp)                                      :: cutoff2, d2, d2_img, dx
+      REAL(KIND=dp), DIMENSION(3)                        :: c_img, hi, lo
 
       CALL timeset(routineN, handle)
+
+      do_pbc = .FALSE.
+      IF (PRESENT(cell)) THEN
+         IF (ASSOCIATED(cell)) do_pbc = .TRUE.
+      END IF
 
       cutoff2 = cutoff**2
       lo(:) = MINVAL(centroids(:, blk0:blk1), DIM=2)
       hi(:) = MAXVAL(centroids(:, blk0:blk1), DIM=2)
 
+      n1 = 0; n2 = 0; n3 = 0
+      IF (do_pbc) THEN
+         IF (cell%perd(1) /= 0) n1 = 1
+         IF (cell%perd(2) /= 0) n2 = 1
+         IF (cell%perd(3) /= 0) n3 = 1
+      END IF
+
       ALLOCATE (used(SIZE(centroids, 2)))
       DO c = 1, SIZE(centroids, 2)
-         d2 = 0.0_dp
-         DO k = 1, 3
-            dx = MAX(0.0_dp, lo(k) - centroids(k, c), centroids(k, c) - hi(k))
-            d2 = d2 + dx*dx
+         d2 = HUGE(0.0_dp)
+         DO i3 = -n3, n3
+         DO i2 = -n2, n2
+         DO i1 = -n1, n1
+            c_img(:) = centroids(:, c)
+            IF (do_pbc) c_img(:) = c_img(:) + cell%hmat(:, 1)*REAL(i1, dp) &
+                                   + cell%hmat(:, 2)*REAL(i2, dp) + cell%hmat(:, 3)*REAL(i3, dp)
+            d2_img = 0.0_dp
+            DO k = 1, 3
+               dx = MAX(0.0_dp, lo(k) - c_img(k), c_img(k) - hi(k))
+               d2_img = d2_img + dx*dx
+            END DO
+            d2 = MIN(d2, d2_img)
+         END DO
+         END DO
          END DO
          used(c) = (d2 <= cutoff2)
       END DO
@@ -2683,7 +2893,7 @@ CONTAINS
 !> \param cutoff ...
 !> \param nze_tmpl ...
 ! **************************************************************************************************
-   SUBROUTINE panel_template_elems(r_blk_sizes, centroids, used, blk0, blk1, cutoff, nze_tmpl)
+   SUBROUTINE panel_template_elems(r_blk_sizes, centroids, used, blk0, blk1, cutoff, nze_tmpl, cell)
 
       INTEGER, DIMENSION(:), INTENT(IN)                  :: r_blk_sizes
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: centroids
@@ -2691,6 +2901,7 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: blk0, blk1
       REAL(KIND=dp), INTENT(IN)                          :: cutoff
       INTEGER(KIND=int_8), INTENT(OUT)                   :: nze_tmpl
+      TYPE(cell_type), OPTIONAL, POINTER                 :: cell
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'panel_template_elems'
 
@@ -2714,10 +2925,10 @@ CONTAINS
       cutoff2 = cutoff**2
       nze_tmpl = 0_int_8
       !$OMP PARALLEL DO DEFAULT(NONE) SHARED(blk0, blk1, n_used, used_idx, centroids, cutoff2, &
-      !$OMP r_blk_sizes) PRIVATE(ib, c) REDUCTION(+:nze_tmpl)
+      !$OMP r_blk_sizes, cell) PRIVATE(ib, c) REDUCTION(+:nze_tmpl)
       DO ib = blk0, blk1
          DO c = 1, n_used
-            IF (SUM((centroids(:, ib) - centroids(:, used_idx(c)))**2) <= cutoff2) THEN
+            IF (screen_dist2(centroids(:, ib), centroids(:, used_idx(c)), cell) <= cutoff2) THEN
                nze_tmpl = nze_tmpl + INT(r_blk_sizes(ib), int_8)*INT(r_blk_sizes(used_idx(c)), int_8)
             END IF
          END DO
@@ -2782,7 +2993,7 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE plan_grid_panels(r_blk_sizes, panel_size, min_dim, pan_first, pan_last, &
                                centroids, cutoff, n_RI, n_ao, n_procs, mem_budget_GB, &
-                               honor_exact, unsafe)
+                               honor_exact, unsafe, cell)
 
       INTEGER, DIMENSION(:), INTENT(IN)                  :: r_blk_sizes
       INTEGER, INTENT(IN)                                :: panel_size, min_dim
@@ -2794,6 +3005,7 @@ CONTAINS
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: mem_budget_GB
       LOGICAL, INTENT(IN), OPTIONAL                      :: honor_exact
       LOGICAL, INTENT(OUT), OPTIONAL                     :: unsafe
+      TYPE(cell_type), OPTIONAL, POINTER                 :: cell
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'plan_grid_panels'
 
@@ -2838,9 +3050,10 @@ CONTAINS
                IF (rows_acc >= TARGET) EXIT
             END DO
             IF (.NOT. use_cutoff .OR. blk1 == blk0) EXIT
-            CALL mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, used)
+            CALL mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, used, cell)
             width = SUM(r_blk_sizes, MASK=used)
-            CALL panel_template_elems(r_blk_sizes, centroids, used, blk0, blk1, cutoff, nze_tmpl)
+            CALL panel_template_elems(r_blk_sizes, centroids, used, blk0, blk1, cutoff, &
+                                      nze_tmpl, cell)
             f_near = REAL(width, dp)/REAL(MAX(n_grid_total, 1), dp)
             side = INT(REAL(rows_acc, dp)*f_near*REAL(MAX(n_RI, n_ao), dp), int_8)
             msg = MAX(nze_tmpl, side)/INT(MAX(min_dim, 1), int_8)
@@ -2964,7 +3177,8 @@ CONTAINS
                                cutoff=bs_env%ri_rs%cutoff_radius_v_w, &
                                n_RI=bs_env%n_RI, n_ao=bs_env%n_ao, &
                                n_procs=bs_env%para_env%num_pe, mem_budget_GB=mem_budget_GB, &
-                               honor_exact=honor_exact, unsafe=panels_unsafe)
+                               honor_exact=honor_exact, unsafe=panels_unsafe, &
+                               cell=bs_env%ri_rs%cell)
       ELSE
          CALL plan_grid_panels(r_blk_sizes, panel_size, min_dim, pan_first, pan_last)
       END IF
@@ -3088,11 +3302,12 @@ CONTAINS
          IF (use_cutoff) THEN
             CALL mask_grid_blocks_near_panel(bs_env%ri_rs%chunk_centroids, pan_first(ipan), &
                                              pan_last(ipan), bs_env%ri_rs%cutoff_radius_v_w, &
-                                             grid_used)
+                                             grid_used, bs_env%ri_rs%cell)
             pan_width = SUM(r_blk_sizes, MASK=grid_used)
             CALL panel_template_elems(r_blk_sizes, bs_env%ri_rs%chunk_centroids, &
                                       grid_used, pan_first(ipan), pan_last(ipan), &
-                                      bs_env%ri_rs%cutoff_radius_v_w, nze_tmpl)
+                                      bs_env%ri_rs%cutoff_radius_v_w, nze_tmpl, &
+                                      bs_env%ri_rs%cell)
             CALL panel_mem_estimate_GB(nze_tmpl, pan_rows, pan_width, n_grid_total, &
                                        n_RI, bs_env%n_ao, n_procs, mem_pan_GB)
          ELSE
@@ -3227,13 +3442,15 @@ CONTAINS
 !> \param A_template ...
 !> \param col_map ...
 ! **************************************************************************************************
-   SUBROUTINE build_geo_template_panel(L_pan, L_full, centroids, cutoff, blk0, A_template, col_map)
+   SUBROUTINE build_geo_template_panel(L_pan, L_full, centroids, cutoff, blk0, A_template, &
+                                       col_map, cell)
       TYPE(dbcsr_type), INTENT(IN)                       :: L_pan, L_full
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: centroids
       REAL(KIND=dp), INTENT(IN)                          :: cutoff
       INTEGER, INTENT(IN)                                :: blk0
       TYPE(dbcsr_type), INTENT(OUT)                      :: A_template
       INTEGER, DIMENSION(:), INTENT(IN), OPTIONAL        :: col_map
+      TYPE(cell_type), OPTIONAL, POINTER                 :: cell
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_geo_template_panel'
 
@@ -3269,9 +3486,7 @@ CONTAINS
             IF (MOD(c - 1, npcols) /= my_pcol) CYCLE
             cg = c
             IF (PRESENT(col_map)) cg = col_map(c)
-            IF ((centroids(1, blk0 + r - 1) - centroids(1, cg))**2 + &
-                (centroids(2, blk0 + r - 1) - centroids(2, cg))**2 + &
-                (centroids(3, blk0 + r - 1) - centroids(3, cg))**2 <= cutoff2) THEN
+            IF (screen_dist2(centroids(:, blk0 + r - 1), centroids(:, cg), cell) <= cutoff2) THEN
                cs = grid_blk_sizes(c)
                CALL dbcsr_put_block(A_template, r, c, zero_blk(1:rs, 1:cs))
             END IF
@@ -3342,6 +3557,202 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE extract_grid_panel
+
+! **************************************************************************************************
+!> \brief Creates an EMPTY grid panel matrix that is block-for-block co-resident with the panel
+!>        [blk0, blk1] of a full grid x grid parent: its row distribution is the parent's row
+!>        distribution restricted to those blocks, and its column distribution is the parent's
+!>        (optionally compressed to the columns flagged in col_used).
+!>
+!>        This matters for correctness, not just for speed. hadamard_product and
+!>        accumulate_grid_panel resolve their second operand with dbcsr_get_block_p, which is a
+!>        LOCAL lookup: a block that lives on another rank comes back found=.FALSE. and is
+!>        silently treated as zero. Panels produced by extract_grid_panel inherit the parent
+!>        row-dist (row_dist_full(blk0:blk1)) whereas create_product_matrix round-robins
+!>        MOD(i-1,nprows); the two agree only when MOD(blk0-1,nprows) == 0. Building every panel
+!>        of a given grid x grid parent through this routine (or through extract_grid_panel)
+!>        keeps them mutually local and makes that failure mode impossible.
+!> \param mat_full   the full grid x grid parent whose layout is inherited
+!> \param blk0       first grid row block of the panel
+!> \param blk1       last grid row block of the panel
+!> \param mat_out    created empty, not finalized
+!> \param col_used   optional mask over the parent's column blocks (neighborhood restriction)
+!> \param col_map    optional map compressed column index -> parent column block index
+! **************************************************************************************************
+   SUBROUTINE create_grid_panel_like(mat_full, blk0, blk1, mat_out, col_used, col_map)
+
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_full
+      INTEGER, INTENT(IN)                                :: blk0, blk1
+      TYPE(dbcsr_type), INTENT(OUT)                      :: mat_out
+      LOGICAL, DIMENSION(:), INTENT(IN), OPTIONAL        :: col_used
+      INTEGER, ALLOCATABLE, DIMENSION(:), INTENT(OUT), &
+         OPTIONAL                                        :: col_map
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'create_grid_panel_like'
+
+      INTEGER                                            :: handle, jb, n_col_sub, npb, r
+      INTEGER, DIMENSION(:), POINTER                     :: col_blk_full, col_blk_use, &
+                                                            col_dist_full, col_dist_use, &
+                                                            row_blk_full, row_blk_pan, &
+                                                            row_dist_full, row_dist_pan
+      LOGICAL                                            :: own_cols
+      TYPE(dbcsr_distribution_type)                      :: dist_full, dist_pan
+
+      CALL timeset(routineN, handle)
+
+      CALL dbcsr_get_info(mat_full, distribution=dist_full, &
+                          row_blk_size=row_blk_full, col_blk_size=col_blk_full)
+      CALL dbcsr_distribution_get(dist_full, row_dist=row_dist_full, col_dist=col_dist_full)
+
+      npb = blk1 - blk0 + 1
+      ALLOCATE (row_dist_pan(npb), row_blk_pan(npb))
+      row_dist_pan(:) = row_dist_full(blk0:blk1)
+      row_blk_pan(:) = row_blk_full(blk0:blk1)
+
+      own_cols = PRESENT(col_used)
+      IF (own_cols) THEN
+         n_col_sub = COUNT(col_used)
+         CPASSERT(n_col_sub > 0)
+         ALLOCATE (col_blk_use(n_col_sub), col_dist_use(n_col_sub))
+         IF (PRESENT(col_map)) ALLOCATE (col_map(n_col_sub))
+         r = 0
+         DO jb = 1, SIZE(col_blk_full)
+            IF (.NOT. col_used(jb)) CYCLE
+            r = r + 1
+            col_blk_use(r) = col_blk_full(jb)
+            col_dist_use(r) = col_dist_full(jb)
+            IF (PRESENT(col_map)) col_map(r) = jb
+         END DO
+      ELSE
+         col_blk_use => col_blk_full
+         col_dist_use => col_dist_full
+         IF (PRESENT(col_map)) THEN
+            ALLOCATE (col_map(SIZE(col_blk_full)))
+            DO jb = 1, SIZE(col_blk_full)
+               col_map(jb) = jb
+            END DO
+         END IF
+      END IF
+
+      CALL dbcsr_distribution_new(dist_pan, template=dist_full, &
+                                  row_dist=row_dist_pan, col_dist=col_dist_use)
+      CALL dbcsr_create(mat_out, name="grid_panel_like", dist=dist_pan, &
+                        matrix_type=dbcsr_type_no_symmetry, &
+                        row_blk_size=row_blk_pan, col_blk_size=col_blk_use)
+      CALL dbcsr_distribution_release(dist_pan)
+
+      DEALLOCATE (row_dist_pan, row_blk_pan)
+      ! col_blk_use/col_dist_use alias mat_full's internals unless we built them here
+      IF (own_cols) DEALLOCATE (col_blk_use, col_dist_use)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE create_grid_panel_like
+
+! **************************************************************************************************
+!> \brief Scatters a grid panel back into its full grid x grid parent:
+!>          mat_full(blk0+ib-1, col_map(jb)) += alpha * mat_pan(ib, jb)
+!>        The inverse of extract_grid_panel / create_grid_panel_like. Purely local (zero
+!>        communication) because the panel carries the parent's distribution, restricted to the
+!>        panel rows -- see the note in create_grid_panel_like.
+!> \param mat_pan          panel to scatter (must have been built co-resident with mat_full)
+!> \param blk0             first grid row block of the panel within mat_full
+!> \param mat_full         accumulator
+!> \param alpha            scale factor applied to the panel contribution
+!> \param col_map          optional compressed-column -> parent-column map; identity if absent
+!> \param retain_sparsity  .TRUE.: only add into blocks mat_full already reserved, drop the rest
+!>                         (mat_full must be finalized; this is the templated-W accumulation).
+!>                         .FALSE. (default): insert blocks as needed with summation; the caller
+!>                         must dbcsr_finalize(mat_full) once all panels have been scattered.
+! **************************************************************************************************
+   SUBROUTINE accumulate_grid_panel(mat_pan, blk0, mat_full, alpha, col_map, retain_sparsity)
+
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_pan, mat_full
+      INTEGER, INTENT(IN)                                :: blk0
+      REAL(KIND=dp), INTENT(IN)                          :: alpha
+      INTEGER, DIMENSION(:), INTENT(IN), OPTIONAL        :: col_map
+      LOGICAL, INTENT(IN), OPTIONAL                      :: retain_sparsity
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'accumulate_grid_panel'
+
+      INTEGER                                            :: col_full, handle, ib, jb, row_full
+      LOGICAL                                            :: found, my_retain
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: scaled
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: blk_full, blk_pan
+      TYPE(dbcsr_iterator_type)                          :: iter
+
+      CALL timeset(routineN, handle)
+
+      my_retain = .FALSE.
+      IF (PRESENT(retain_sparsity)) my_retain = retain_sparsity
+
+      CALL dbcsr_iterator_start(iter, mat_pan)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
+         CALL dbcsr_iterator_next_block(iter, ib, jb, blk_pan)
+
+         row_full = blk0 + ib - 1
+         IF (PRESENT(col_map)) THEN
+            col_full = col_map(jb)
+         ELSE
+            col_full = jb
+         END IF
+
+         IF (my_retain) THEN
+            ! Templated accumulation: blocks outside the reserved pattern are dropped. That is
+            ! the intended truncation, not a lost contribution -- the template is a superset of
+            ! supp(G), and anything outside it meets a zero in the Hadamard product with G.
+            CALL dbcsr_get_block_p(mat_full, row_full, col_full, blk_full, found)
+            IF (found) blk_full(:, :) = blk_full(:, :) + alpha*blk_pan(:, :)
+         ELSE
+            IF (ALLOCATED(scaled)) THEN
+               IF (SIZE(scaled, 1) /= SIZE(blk_pan, 1) .OR. SIZE(scaled, 2) /= SIZE(blk_pan, 2)) &
+                  DEALLOCATE (scaled)
+            END IF
+            IF (.NOT. ALLOCATED(scaled)) ALLOCATE (scaled(SIZE(blk_pan, 1), SIZE(blk_pan, 2)))
+            scaled(:, :) = alpha*blk_pan(:, :)
+            CALL dbcsr_put_block(mat_full, row_full, col_full, scaled, summation=.TRUE.)
+         END IF
+      END DO
+      CALL dbcsr_iterator_stop(iter)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE accumulate_grid_panel
+
+! **************************************************************************************************
+!> \brief .TRUE. when two DBCSR matrices have identical block structure AND identical data
+!>        distribution, i.e. block (i,j) of one lives on the same rank as block (i,j) of the
+!>        other. This is the precondition for any routine that pairs their blocks through the
+!>        local-only dbcsr_get_block_p lookup (hadamard_product, accumulate_grid_panel).
+!> \param m1 ...
+!> \param m2 ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION same_dbcsr_layout(m1, m2) RESULT(same)
+
+      TYPE(dbcsr_type), INTENT(IN)                       :: m1, m2
+      LOGICAL                                            :: same
+
+      INTEGER, DIMENSION(:), POINTER                     :: col_blk_1, col_blk_2, col_dist_1, &
+                                                            col_dist_2, row_blk_1, row_blk_2, &
+                                                            row_dist_1, row_dist_2
+      TYPE(dbcsr_distribution_type)                      :: dist_1, dist_2
+
+      CALL dbcsr_get_info(m1, distribution=dist_1, row_blk_size=row_blk_1, col_blk_size=col_blk_1)
+      CALL dbcsr_get_info(m2, distribution=dist_2, row_blk_size=row_blk_2, col_blk_size=col_blk_2)
+
+      same = SIZE(row_blk_1) == SIZE(row_blk_2) .AND. SIZE(col_blk_1) == SIZE(col_blk_2)
+      IF (.NOT. same) RETURN
+
+      same = ALL(row_blk_1 == row_blk_2) .AND. ALL(col_blk_1 == col_blk_2)
+      IF (.NOT. same) RETURN
+
+      CALL dbcsr_distribution_get(dist_1, row_dist=row_dist_1, col_dist=col_dist_1)
+      CALL dbcsr_distribution_get(dist_2, row_dist=row_dist_2, col_dist=col_dist_2)
+
+      same = ALL(row_dist_1 == row_dist_2) .AND. ALL(col_dist_1 == col_dist_2)
+
+   END FUNCTION same_dbcsr_layout
 
 ! **************************************************************************************************
 !> \brief Marks which column blocks of a DBCSR matrix carry at least one non-zero block anywhere
@@ -3491,11 +3902,12 @@ CONTAINS
 !> \param centers ...
 !> \param radius ...
 ! **************************************************************************************************
-   SUBROUTINE reserve_blocks_within_radius(matrix, centers, radius)
+   SUBROUTINE reserve_blocks_within_radius(matrix, centers, radius, cell)
 
       TYPE(dbcsr_type), INTENT(INOUT)                    :: matrix
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: centers
       REAL(KIND=dp), INTENT(IN)                          :: radius
+      TYPE(cell_type), OPTIONAL, POINTER                 :: cell
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'reserve_blocks_within_radius'
 
@@ -3523,8 +3935,7 @@ CONTAINS
          IF (row_dist(i) /= my_prow) CYCLE
          DO j = 1, nblkcols
             IF (col_dist(j) /= my_pcol) CYCLE
-            IF ((centers(1, i) - centers(1, j))**2 + (centers(2, i) - centers(2, j))**2 + &
-                (centers(3, i) - centers(3, j))**2 <= radius2) THEN
+            IF (screen_dist2(centers(:, i), centers(:, j), cell) <= radius2) THEN
                CALL dbcsr_put_block(matrix, i, j, zero_blk(1:row_blk(i), 1:col_blk(j)))
             END IF
          END DO
@@ -3646,7 +4057,7 @@ CONTAINS
       IF (bs_env%ri_rs%cutoff_radius_g_w > 0.0_dp .AND. &
           ALLOCATED(bs_env%ri_rs%atom_centers)) THEN
          CALL reserve_blocks_within_radius(matrix_G_ao, bs_env%ri_rs%atom_centers, &
-                                           bs_env%ri_rs%cutoff_radius_g_w)
+                                           bs_env%ri_rs%cutoff_radius_g_w, bs_env%ri_rs%cell)
          CALL copy_fm_to_dbcsr(fm_G, matrix_G_ao, keep_sparsity=.TRUE.)
       ELSE
          CALL copy_fm_to_dbcsr(fm_G, matrix_G_ao, keep_sparsity=.FALSE.)
@@ -3692,7 +4103,7 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE contract_grid_panels(L_A, M_A, L_B, M_B, L_out, mat_out, scale, eps, para_env, &
                                    pan_first, pan_last, lb_eq_la, lout_eq_la, zero_out, &
-                                   keep_sparsity, centroids, cutoff, grid_occupation)
+                                   keep_sparsity, centroids, cutoff, grid_occupation, cell)
 
       TYPE(dbcsr_type), INTENT(INOUT), TARGET            :: L_A
       TYPE(dbcsr_type), INTENT(INOUT)                    :: M_A
@@ -3709,6 +4120,7 @@ CONTAINS
          OPTIONAL                                        :: centroids
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: cutoff
       REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: grid_occupation
+      TYPE(cell_type), OPTIONAL, POINTER                 :: cell
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'contract_grid_panels'
 
@@ -3767,7 +4179,7 @@ CONTAINS
          ! so the system-wide phi/Z right operands are cut down to this neighborhood slice
          ! (local extraction, zero communication; exact w.r.t. the geo template).
          IF (use_cutoff) THEN
-            CALL mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, grid_used)
+            CALL mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, grid_used, cell)
             CALL extract_masked_blocks(L_A, grid_used, LA_near, compress_rows=.TRUE., blk_map=gmap)
             IF (.NOT. lb_eq_la) CALL extract_masked_blocks(L_B, grid_used, LB_near, compress_rows=.TRUE.)
             IF (.NOT. lout_eq_la) CALL extract_masked_blocks(L_out, grid_used, Lout_near, compress_rows=.TRUE.)
@@ -3800,7 +4212,7 @@ CONTAINS
          CALL dbcsr_multiply('N', 'N', 1.0_dp, LA_panC, MA_sub, 0.0_dp, tmpA, filter_eps=eps)
          CALL dbcsr_release(MA_sub)
          IF (use_cutoff) THEN
-            CALL build_geo_template_panel(LA_pan, LA_near, centroids, cutoff, blk0, A_pan, &
+            CALL build_geo_template_panel(LA_pan, LA_near, centroids, cutoff, blk0, A_pan, cell=cell, &
                                           col_map=gmap)
          ELSE
             CALL create_product_matrix(tmpA, RB_A, 'N', 'T', A_pan)
@@ -3908,7 +4320,8 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE contract_grid_panels_sigma_c(mat_phi, mat_Z, mat_G_occ_ao, mat_G_vir_ao, &
                                            mat_W_aux, mat_Sigma_neg, mat_Sigma_pos, eps, para_env, &
-                                           pan_first, pan_last, keep_sparsity, centroids, cutoff)
+                                           pan_first, pan_last, keep_sparsity, centroids, cutoff, &
+                                           cell)
 
       TYPE(dbcsr_type), INTENT(INOUT), TARGET            :: mat_phi, mat_Z
       TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_G_occ_ao, mat_G_vir_ao, mat_W_aux, &
@@ -3920,6 +4333,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN), &
          OPTIONAL                                        :: centroids
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: cutoff
+      TYPE(cell_type), OPTIONAL, POINTER                 :: cell
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'contract_grid_panels_sigma_c'
 
@@ -3963,7 +4377,7 @@ CONTAINS
          ! Neighborhood slices of phi/Z (grid rows within cutoff of the panel): they replace
          ! the system-wide right operands in every multiply (local extraction, zero comm).
          IF (use_cutoff) THEN
-            CALL mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, grid_used)
+            CALL mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, grid_used, cell)
             CALL extract_masked_blocks(mat_phi, grid_used, phi_near, compress_rows=.TRUE., blk_map=gmap)
             CALL extract_masked_blocks(mat_Z, grid_used, Z_near, compress_rows=.TRUE.)
             RB_phi => phi_near
@@ -3986,7 +4400,7 @@ CONTAINS
          CALL dbcsr_multiply('N', 'N', 1.0_dp, phi_panC, G_occ_sub, 0.0_dp, tmpA, filter_eps=eps)
          IF (use_cutoff) THEN
             CALL build_geo_template_panel(phi_pan, phi_near, centroids, cutoff, blk0, A_occ, &
-                                          col_map=gmap)
+                                          col_map=gmap, cell=cell)
          ELSE
             CALL create_product_matrix(tmpA, RB_phi, 'N', 'T', A_occ)
          END IF
@@ -4000,7 +4414,7 @@ CONTAINS
          CALL dbcsr_multiply('N', 'N', 1.0_dp, phi_panC, G_vir_sub, 0.0_dp, tmpA, filter_eps=eps)
          IF (use_cutoff) THEN
             CALL build_geo_template_panel(phi_pan, phi_near, centroids, cutoff, blk0, A_vir, &
-                                          col_map=gmap)
+                                          col_map=gmap, cell=cell)
          ELSE
             CALL create_product_matrix(tmpA, RB_phi, 'N', 'T', A_vir)
          END IF
@@ -4086,6 +4500,12 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
+      ! B is resolved below with dbcsr_get_block_p, which only ever finds blocks that live on
+      ! THIS rank. If A and B were laid out differently, every remote block of B would come back
+      ! found=.FALSE. and be silently replaced by zero -- no abort, no warning, just a wrong
+      ! answer that drifts with the rank count. Assert co-residency instead of trusting callers.
+      CPASSERT(same_dbcsr_layout(matrix_A, matrix_B))
+
       CALL dbcsr_copy(matrix_C, matrix_A)
 
       CALL dbcsr_iterator_start(iter, matrix_C)
@@ -4097,7 +4517,7 @@ CONTAINS
          IF (found) THEN
             blk_C(:, :) = fac*blk_C(:, :)*blk_B(:, :)
          ELSE
-            ! If B is sparse here, the product is zero
+            ! B genuinely has no block here (it is sparse), so the product is zero
             blk_C(:, :) = 0.0_dp
          END IF
       END DO
@@ -4516,7 +4936,7 @@ CONTAINS
       IF (bs_env%ri_rs%cutoff_radius_g_w > 0.0_dp .AND. &
           ALLOCATED(bs_env%ri_rs%atom_centers)) THEN
          CALL reserve_blocks_within_radius(matrix_V_aux, bs_env%ri_rs%atom_centers, &
-                                           bs_env%ri_rs%cutoff_radius_g_w)
+                                           bs_env%ri_rs%cutoff_radius_g_w, bs_env%ri_rs%cell)
          CALL copy_fm_to_dbcsr(fm_Vtr_Gamma(1, 1), matrix_V_aux, keep_sparsity=.TRUE.)
       ELSE
          CALL copy_fm_to_dbcsr(fm_Vtr_Gamma(1, 1), matrix_V_aux, keep_sparsity=.FALSE.)
@@ -4542,7 +4962,7 @@ CONTAINS
                                    lb_eq_la=.FALSE., lout_eq_la=.TRUE., zero_out=.TRUE., &
                                    keep_sparsity=bs_env%ri_rs%keep_sparsity_rirs, &
                                    centroids=bs_env%ri_rs%chunk_centroids, &
-                                   cutoff=bs_env%ri_rs%cutoff_radius_v_w)
+                                   cutoff=bs_env%ri_rs%cutoff_radius_v_w, cell=bs_env%ri_rs%cell)
          CALL dbcsr_scale(mat_Sigma_x_Gamma, -1.0_dp)
 
          CALL dbcsr_release(matrix_D_ao)
@@ -4635,7 +5055,7 @@ CONTAINS
          IF (bs_env%ri_rs%cutoff_radius_g_w > 0.0_dp .AND. &
              ALLOCATED(bs_env%ri_rs%atom_centers)) THEN
             CALL reserve_blocks_within_radius(matrix_W_aux, bs_env%ri_rs%atom_centers, &
-                                              bs_env%ri_rs%cutoff_radius_g_w)
+                                              bs_env%ri_rs%cutoff_radius_g_w, bs_env%ri_rs%cell)
             CALL copy_fm_to_dbcsr(fm_W_time(i_t), matrix_W_aux, keep_sparsity=.TRUE.)
          ELSE
             CALL copy_fm_to_dbcsr(fm_W_time(i_t), matrix_W_aux, keep_sparsity=.FALSE.)
@@ -4661,7 +5081,8 @@ CONTAINS
                                               pan_first=pan_first, pan_last=pan_last, &
                                               keep_sparsity=bs_env%ri_rs%keep_sparsity_rirs, &
                                               centroids=bs_env%ri_rs%chunk_centroids, &
-                                              cutoff=bs_env%ri_rs%cutoff_radius_v_w)
+                                              cutoff=bs_env%ri_rs%cutoff_radius_v_w, &
+                                              cell=bs_env%ri_rs%cell)
             CALL dbcsr_scale(mat_Sigma_neg_tau(i_t, ispin)%matrix, -1.0_dp)
 
             CALL dbcsr_release(matrix_G_occ_ao)

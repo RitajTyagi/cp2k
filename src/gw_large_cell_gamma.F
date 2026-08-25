@@ -103,7 +103,10 @@ MODULE gw_large_cell_gamma
              fill_fm_Sigma_c_Gamma_time, delete_unnecessary_files, &
              multiply_fm_W_MIC_time_with_Minv_Gamma, get_W_MIC, &
              create_fm_W_MIC_time, Fourier_transform_w_to_t, &
-             compute_fm_chi_Gamma_freq, compute_QP_energies, fm_write
+             compute_fm_chi_Gamma_freq, compute_QP_energies, fm_write, &
+             ! k-resolved building blocks of W, reused by the grid-basis W truncation
+             ! in gw_large_cell_Gamma_ri_rs (compute_W_MIC_grid)
+             compute_V_k_by_lattice_sum, compute_MinvVsqrt_Vsqrt, compute_cfm_W_ikp_freq_j
 
 CONTAINS
 

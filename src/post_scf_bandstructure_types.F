@@ -12,6 +12,7 @@
 ! **************************************************************************************************
 MODULE post_scf_bandstructure_types
    USE basis_set_types,                 ONLY: gto_basis_set_p_type
+   USE cell_types,                      ONLY: cell_type
    USE cp_cfm_types,                    ONLY: cp_cfm_release,&
                                               cp_cfm_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_p_type,&
@@ -92,6 +93,14 @@ MODULE post_scf_bandstructure_types
       REAL(KIND=dp), ALLOCATABLE                       :: atom_centers(:, :)
       INTEGER, ALLOCATABLE                             :: grid_atom_boundaries(:)
       INTEGER, ALLOCATABLE                             :: pan_first(:), pan_last(:)
+      ! Largest distance from any grid point to the centroid of its own row block. Centroid-based
+      ! geometric templates act per block whereas the physical cutoffs act per element, so a
+      ! template radius must be padded by r_pad to be a superset of the exact per-element test.
+      REAL(KIND=dp)                                    :: r_pad = 0.0_dp
+      ! Simulation cell, borrowed from qs_env (never allocated or released here). All geometric
+      ! screening measures minimum-image distances through it: for a molecule cell%perd = 0, so
+      ! pbc() is the identity and the tests reduce to plain Euclidean distances.
+      TYPE(cell_type), POINTER                         :: cell => NULL()
 
       ! Data types for building grid points
       TYPE(rirs_grid_type), ALLOCATABLE                :: grid_cache(:)
@@ -574,6 +583,8 @@ CONTAINS
       IF (ALLOCATED(bs_env%ri_rs%grid_atom_boundaries)) DEALLOCATE (bs_env%ri_rs%grid_atom_boundaries)
       IF (ALLOCATED(bs_env%ri_rs%pan_first)) DEALLOCATE (bs_env%ri_rs%pan_first)
       IF (ALLOCATED(bs_env%ri_rs%pan_last)) DEALLOCATE (bs_env%ri_rs%pan_last)
+      ! borrowed from qs_env: drop the reference, never release the target
+      NULLIFY (bs_env%ri_rs%cell)
 
       DEALLOCATE (bs_env)
 
