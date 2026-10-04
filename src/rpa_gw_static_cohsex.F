@@ -37,6 +37,18 @@
 !>        COHSEX DIAGONAL prints ϵ^DG only; COHSEX QP_UPDATE also diagonalizes H^QP, prints ϵ^CN
 !>        and the canonical MOs.
 !>
+!>        Single-pole self-energy (SINGLEPOLE, 1p-XC): W^c(ω) is modelled by one pole at ω_0
+!>        (SINGLEPOLE_LORENT) with broadening η (SINGLEPOLE_ETA); the real part of
+!>          Σ^c_mn(ϵ_m) = ω_0/2 Σ_p W^c_mp,pn(0) / [ϵ_p - ϵ_m - (ω_0 + 2iη) sgn(ϵ_F - ϵ_p)]
+!>        is
+!>          Σ^c_mn(ϵ_m) = 1/2 Σ_p f_mp W^c_mp,pn(0)
+!>          f_mp        = ω_0 D_mp / (D_mp^2 + (2η)^2),   f_mp = 0 if |D_mp| < 2η
+!>          D_mp        = ϵ_p - ϵ_m - ω_0   (p occupied),   ϵ_p - ϵ_m + ω_0   (p virtual)
+!>        ω_0 -> ∞ gives f_mp -> sgn(ϵ_p - ϵ_F), i.e. static COHSEX (f_mp = s_p). Σ^c_mn(ϵ_m) is not
+!>        symmetric; the symmetrization of H^QP below uses 1/2 [Σ^c_mn(ϵ_m) + Σ^c_nm(ϵ_n)].
+!>        Everything else (W^c(0), Σ^x, v^xc, H^QP, QP_UPDATE) is shared with static COHSEX;
+!>        the single-pole Σ^c is never scaled (α_IP = α_EA = 1) and always uses QP_UPDATE.
+!>
 !> \par History
 !>      09.2026 created [Ritaj Tyagi]
 ! **************************************************************************************************
@@ -159,8 +171,9 @@ CONTAINS
       CHARACTER(LEN=40)                                  :: cohsex_label
       INTEGER                                            :: handle, ispin, m, n, n_mo_win, no, &
                                                             nspins, nv, p, unit_debug, win_start
-      LOGICAL                                            :: qp_update
-      REAL(KIND=dp)                                      :: shift_occ, shift_virt
+      LOGICAL                                            :: qp_update, singlepole
+      REAL(KIND=dp)                                      :: d_mp, eta, omega0, scale_occ, &
+                                                            scale_virt, shift_occ, shift_virt
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: e_can, e_diag, e_qp, scale_vec
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: h_qp, sigma_c, sigma_x, &
                                                             sigma_x_minus_vxc, u_qp, vxc
@@ -174,11 +187,25 @@ CONTAINS
       ! COHSEX QP_UPDATE: diagonalize H^QP (canonical energies and MOs); DIAGONAL: ϵ^DG only
       qp_update = (mp2_env%ri_g0w0%cohsex_flavor == cohsex_qp_update)
 
+      ! single-pole Σ^c (SINGLEPOLE) instead of static COHSEX: pole ω_0 and broadening η (Hartree)
+      singlepole = mp2_env%ri_g0w0%do_singlepole
+      omega0 = mp2_env%ri_g0w0%singlepole_omega0
+      eta = mp2_env%ri_g0w0%singlepole_eta
+      ! scaling α_IP, α_EA of Σ^c in H^QP: COHSEX only, the single-pole Σ^c is not scaled
+      scale_occ = mp2_env%ri_g0w0%cohsex_scale_occ
+      scale_virt = mp2_env%ri_g0w0%cohsex_scale_virt
+      IF (singlepole) THEN
+         scale_occ = 1.0_dp
+         scale_virt = 1.0_dp
+      END IF
+
       ! static COHSEX; with QP_UPDATE the quasiparticle update; scaled self-energy if requested
-      CALL cite_reference(Hedin1965)
-      CALL cite_reference(Hybertsen1986)
+      IF (.NOT. singlepole) THEN
+         CALL cite_reference(Hedin1965)
+         CALL cite_reference(Hybertsen1986)
+      END IF
       IF (qp_update) CALL cite_reference(Tyagi2024)
-      IF (mp2_env%ri_g0w0%cohsex_scale_occ /= 1.0_dp .OR. mp2_env%ri_g0w0%cohsex_scale_virt /= 1.0_dp) THEN
+      IF (scale_occ /= 1.0_dp .OR. scale_virt /= 1.0_dp) THEN
          CALL cite_reference(Tyagi2026)
       END IF
       CALL cp_fm_get_info(mo_coeff(1), para_env=para_env)
@@ -204,9 +231,15 @@ CONTAINS
          win_start = homo(ispin) - no + 1
 
          ! ==============================================================================
-         ! 2. Screened 3-center integrals, weighted with the COHSEX occupation factor
-         !      (W^c B)^P_mp = Σ_Q W^c_PQ(0) B^Q_mp  s_p,   s_p = 1/2 sgn(ϵ_p - ϵ_F)
-         !      s_p = -1/2 for p occupied,  s_p = +1/2 for p virtual (COH)
+         ! 2. Screened 3-center integrals, weighted with the factor s_mp of W^c_mp,pn(0) in Σ^c
+         !      (W^c B)^P_mp = Σ_Q W^c_PQ(0) B^Q_mp  s_mp
+         !    static COHSEX (independent of m):
+         !      s_mp = 1/2 sgn(ϵ_p - ϵ_F) = -1/2 for p occupied,  +1/2 for p virtual (COH)
+         !    single-pole (depends on the MO m in the window, m = 1 is MO win_start):
+         !      s_mp = 1/2 f_mp,  f_mp = ω_0 D_mp / (D_mp^2 + (2η)^2),  f_mp = 0 if |D_mp| < 2η
+         !      D_mp = ϵ_p - ϵ_m - ω_0  for p occupied   (sgn(ϵ_F - ϵ_p) = +1)
+         !      D_mp = ϵ_p - ϵ_m + ω_0  for p virtual    (sgn(ϵ_F - ϵ_p) = -1)
+         !    The column index of B^P_mp is (m-1)*nmo + p, so s_mp scales one column each.
          ! ==============================================================================
          CALL parallel_gemm(transa="N", transb="N", m=dimen_RI, n=n_mo_win*nmo, k=dimen_RI, &
                             alpha=1.0_dp, matrix_a=fm_mat_Q, matrix_b=fm_mat_S_gw(ispin), &
@@ -214,7 +247,18 @@ CONTAINS
          ALLOCATE (scale_vec(n_mo_win*nmo))
          DO m = 1, n_mo_win
             DO p = 1, nmo
-               IF (p <= homo(ispin)) THEN
+               IF (singlepole) THEN
+                  IF (p <= homo(ispin)) THEN
+                     d_mp = Eigenval(p, ispin) - Eigenval(win_start + m - 1, ispin) - omega0
+                  ELSE
+                     d_mp = Eigenval(p, ispin) - Eigenval(win_start + m - 1, ispin) + omega0
+                  END IF
+                  IF (d_mp**2 < (2.0_dp*eta)**2) THEN
+                     scale_vec((m - 1)*nmo + p) = 0.0_dp
+                  ELSE
+                     scale_vec((m - 1)*nmo + p) = 0.5_dp*omega0*d_mp/(d_mp**2 + (2.0_dp*eta)**2)
+                  END IF
+               ELSE IF (p <= homo(ispin)) THEN
                   scale_vec((m - 1)*nmo + p) = -0.5_dp
                ELSE
                   scale_vec((m - 1)*nmo + p) = 0.5_dp
@@ -253,8 +297,9 @@ CONTAINS
 
          ! ==============================================================================
          ! 4. Correlation self-energy
-         !      Σ^c_mn = Σ_p s_p Σ_PQ B^P_mp W^c_PQ(0) B^Q_pn
+         !      Σ^c_mn = Σ_p s_mp Σ_PQ B^P_mp W^c_PQ(0) B^Q_pn
          !             = Σ_(p,P) (W^c B)'_(p,P),m B'_(p,P),n
+         !    single-pole: s_mp carries the first index m, i.e. Σ^c_mn = Σ^c_mn(ϵ_m)
          ! ==============================================================================
          CALL parallel_gemm(transa="T", transb="N", m=n_mo_win, n=n_mo_win, k=nmo*dimen_RI, &
                             alpha=1.0_dp, matrix_a=fm_WB_re, matrix_b=fm_B_re, &
@@ -297,15 +342,16 @@ CONTAINS
          !      H^QP_ij = ϵ_i δ_ij + Σ^x_ij - v^xc_ij + α_IP Σ^c_ij   (occ-occ)
          !      H^QP_ab = ϵ_a δ_ab + Σ^x_ab - v^xc_ab + α_EA Σ^c_ab   (virt-virt)
          !      H^QP_ia = 0                                              (occ-virt)
-         !    symmetrized, H^QP = (H^QP + H^QP^T)/2
+         !    symmetrized, H^QP = (H^QP + H^QP^T)/2; for the single-pole Σ^c_mn(ϵ_m) this is
+         !      1/2 [Σ^c_mn(ϵ_m) + Σ^c_nm(ϵ_n)],   and α_IP = α_EA = 1
          !      ϵ_n^DG  = H^QP_nn                                        (diagonal static COHSEX)
          ! ==============================================================================
          ALLOCATE (h_qp(n_mo_win, n_mo_win))
          h_qp(:, :) = 0.0_dp
          h_qp(1:no, 1:no) = sigma_x(1:no, 1:no) - vxc(1:no, 1:no) + &
-                            mp2_env%ri_g0w0%cohsex_scale_occ*sigma_c(1:no, 1:no)
+                            scale_occ*sigma_c(1:no, 1:no)
          h_qp(no + 1:, no + 1:) = sigma_x(no + 1:, no + 1:) - vxc(no + 1:, no + 1:) + &
-                                  mp2_env%ri_g0w0%cohsex_scale_virt*sigma_c(no + 1:, no + 1:)
+                                  scale_virt*sigma_c(no + 1:, no + 1:)
          h_qp(:, :) = 0.5_dp*(h_qp(:, :) + TRANSPOSE(h_qp(:, :)))
          DO n = 1, n_mo_win
             h_qp(n, n) = h_qp(n, n) + Eigenval(win_start + n - 1, ispin)
@@ -384,11 +430,20 @@ CONTAINS
             IF (nspins == 2 .AND. ispin == 1) spin_label = "Alpha "
             IF (nspins == 2 .AND. ispin == 2) spin_label = "Beta "
             WRITE (unit_nr, "(/,T3,A)") REPEAT("-", 77)
-            ! "static COHSEX" for closed shell, "Alpha static COHSEX" / "Beta static COHSEX" otherwise
-            cohsex_label = TRIM(ADJUSTL(TRIM(spin_label)//" static COHSEX"))
+            ! "static COHSEX" / "single-pole" for closed shell, prefixed by "Alpha" / "Beta" otherwise
+            IF (singlepole) THEN
+               cohsex_label = TRIM(ADJUSTL(TRIM(spin_label)//" single-pole"))
+            ELSE
+               cohsex_label = TRIM(ADJUSTL(TRIM(spin_label)//" static COHSEX"))
+            END IF
             WRITE (unit_nr, "(T3,A)") TRIM(cohsex_label)//" quasiparticle energies"
-            WRITE (unit_nr, "(T3,A,F6.3,A,F6.3)") "COHSEX_SCALE_OCC =", mp2_env%ri_g0w0%cohsex_scale_occ, &
-               ",  COHSEX_SCALE_VIRT =", mp2_env%ri_g0w0%cohsex_scale_virt
+            IF (singlepole) THEN
+               WRITE (unit_nr, "(T3,A,F8.3,A,F8.4,A)") "SINGLEPOLE_LORENT =", omega0*evolt, &
+                  " eV,  SINGLEPOLE_ETA =", eta, " Hartree"
+            ELSE
+               WRITE (unit_nr, "(T3,A,F6.3,A,F6.3)") "COHSEX_SCALE_OCC =", scale_occ, &
+                  ",  COHSEX_SCALE_VIRT =", scale_virt
+            END IF
             WRITE (unit_nr, "(T3,A)") REPEAT("-", 77)
             IF (qp_update) THEN
                WRITE (unit_nr, "(T3,A)") "DG: diagonal of H^QP,  CN: canonical, eigenvalues of the "// &

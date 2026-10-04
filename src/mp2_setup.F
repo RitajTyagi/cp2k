@@ -22,9 +22,9 @@ MODULE mp2_setup
                                               cp_print_key_unit_nr
    USE cp_parser_methods,               ONLY: read_float_object
    USE input_constants,                 ONLY: &
-        cohsex_off, do_eri_mme, do_potential_short, evGW, evGW0, mp2_method_direct, &
-        mp2_method_gpw, mp2_method_none, mp2_ri_optimize_basis, ri_mp2_laplace, ri_mp2_method_gpw, &
-        ri_rpa_method_gpw
+        cohsex_off, cohsex_qp_update, do_eri_mme, do_potential_short, evGW, evGW0, &
+        mp2_method_direct, mp2_method_gpw, mp2_method_none, mp2_ri_optimize_basis, ri_mp2_laplace, &
+        ri_mp2_method_gpw, ri_rpa_method_gpw
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
@@ -173,6 +173,29 @@ CONTAINS
                                 r_val=mp2_env%ri_g0w0%cohsex_scale_occ)
       CALL section_vals_val_get(mp2_section, "RI_RPA%GW%COHSEX_SCALE_VIRT", &
                                 r_val=mp2_env%ri_g0w0%cohsex_scale_virt)
+      ! single-pole Σ^c: same static path as COHSEX QP_UPDATE (W^c(0), Σ^x, v^xc, H^QP and its
+      ! diagonalization), only the factor of W^c_mp,pn(0) in Σ^c differs; never scaled
+      CALL section_vals_val_get(mp2_section, "RI_RPA%GW%SINGLEPOLE", &
+                                l_val=mp2_env%ri_g0w0%do_singlepole)
+      CALL section_vals_val_get(mp2_section, "RI_RPA%GW%SINGLEPOLE_LORENT", &
+                                r_val=mp2_env%ri_g0w0%singlepole_omega0)
+      CALL section_vals_val_get(mp2_section, "RI_RPA%GW%SINGLEPOLE_ETA", &
+                                r_val=mp2_env%ri_g0w0%singlepole_eta)
+      IF (mp2_env%ri_g0w0%do_singlepole) THEN
+         IF (mp2_env%ri_g0w0%do_static_cohsex) THEN
+            CPABORT("SINGLEPOLE and COHSEX cannot be combined.")
+         END IF
+         IF (mp2_env%ri_g0w0%cohsex_scale_occ /= 1.0_dp .OR. mp2_env%ri_g0w0%cohsex_scale_virt /= 1.0_dp) &
+            CPABORT("COHSEX_SCALE_OCC/VIRT apply to COHSEX only, not to SINGLEPOLE.")
+         IF (mp2_env%ri_g0w0%singlepole_omega0 <= 0.0_dp) THEN
+            CPABORT("SINGLEPOLE_LORENT must be positive.")
+         END IF
+         IF (mp2_env%ri_g0w0%singlepole_eta < 0.0_dp) THEN
+            CPABORT("SINGLEPOLE_ETA must not be negative.")
+         END IF
+         mp2_env%ri_g0w0%do_static_cohsex = .TRUE.
+         mp2_env%ri_g0w0%cohsex_flavor = cohsex_qp_update
+      END IF
 
       NULLIFY (r_vals)
       CALL section_vals_val_get(mp2_section, "RI_RPA%GW%IC_CORR_LIST", &

@@ -1241,6 +1241,7 @@ CONTAINS
                              "(the scaling of W^c in the BSE).")
             END IF
             IF (do_ri_sos_laplace_mp2) CPABORT("COHSEX with SOS-MP2 is not implemented.")
+            IF (do_bse .AND. mp2_env%ri_g0w0%do_singlepole) CPABORT("BSE after SINGLEPOLE is not implemented.")
             ! static COHSEX is one-shot @DFT: Σ^COHSEX is static, no quasiparticle self-consistency
             iter_evGW = 1
             iter_sc_GW0 = 1

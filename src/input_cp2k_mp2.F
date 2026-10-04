@@ -787,6 +787,42 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="SINGLEPOLE", &
+                          description="Single-pole approximation to the correlation self-energy (1p-XC). "// &
+                          "The static correlation part of the screened Coulomb interaction "// &
+                          "$W^\text{c}(\omega=0)$ is combined with a single pole at $\omega_0$ "// &
+                          "(SINGLEPOLE_LORENT) of width $\eta$ (SINGLEPOLE_ETA): "// &
+                          "$\Sigma^\text{c}_{mn}(\varepsilon_m) = \frac{1}{2}\sum_p f_{mp}\, "// &
+                          "W^\text{c}_{mp,pn}(\omega=0)$ with $f_{mp} = \omega_0 D_{mp}/(D_{mp}^2 + (2\eta)^2)$, "// &
+                          "$D_{mp} = \varepsilon_p - \varepsilon_m - \omega_0\,\text{sgn}(\varepsilon_\text{F} - "// &
+                          "\varepsilon_p)$ and $f_{mp} = 0$ for $|D_{mp}| < 2\eta$. "// &
+                          "For $\omega_0 \to \infty$, $f_{mp} \to \text{sgn}(\varepsilon_p - \varepsilon_\text{F})$ "// &
+                          "and static COHSEX is recovered. As for COHSEX QP_UPDATE, the occupied-occupied "// &
+                          "and virtual-virtual blocks of the symmetrized $H^\text{QP}$ are diagonalized and "// &
+                          "both the diagonal and the canonical energies are printed. "// &
+                          "Cannot be combined with COHSEX, COHSEX_SCALE_OCC/VIRT or BSE.", &
+                          usage="SINGLEPOLE", &
+                          citations=[Tyagi2024], &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="SINGLEPOLE_LORENT", &
+                          description="Pole position $\omega_0$ of the single-pole self-energy (SINGLEPOLE).", &
+                          usage="SINGLEPOLE_LORENT [eV] 21.0", &
+                          default_r_val=cp_unit_to_cp2k(value=21.0_dp, unit_str="eV"), &
+                          unit_str="eV")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="SINGLEPOLE_ETA", &
+                          description="Broadening $\eta$ of the single-pole self-energy (SINGLEPOLE). "// &
+                          "Terms with $|D_{mp}| < 2\eta$ are neglected.", &
+                          usage="SINGLEPOLE_ETA [hartree] 0.05", &
+                          default_r_val=0.05_dp, unit_str="hartree")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="CORR_MOS_OCC", &
                           variants=["CORR_OCC"], &
                           description="Number of occupied MOs whose energies are corrected in GW. "// &

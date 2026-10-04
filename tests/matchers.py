@@ -267,6 +267,10 @@ registry["E_static_COHSEX_gap_DG"] = GenericMatcher(
 registry["E_static_COHSEX_gap_CN"] = GenericMatcher(
     r"static COHSEX HOMO-LUMO gap, canonical (eV)", col=7
 )
+# single-pole (SINGLEPOLE) HOMO-LUMO gap of molecule in the O(N^4) GW code, canonical (CN)
+registry["E_singlepole_gap_CN"] = GenericMatcher(
+    r"single-pole HOMO-LUMO gap, canonical (eV)", col=6
+)
 
 registry["IC_gap"] = GenericMatcher(r"IC HOMO-LUMO gap (eV)", col=5)
 

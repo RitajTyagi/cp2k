@@ -248,6 +248,10 @@ MODULE mp2_types
       INTEGER                                            :: cohsex_flavor = cohsex_off
       REAL(KIND=dp)                                      :: cohsex_scale_occ = 1.0_dp, &
                                                             cohsex_scale_virt = 1.0_dp
+      ! single-pole Σ^c (SINGLEPOLE): pole position ω_0 and broadening η, both in Hartree
+      LOGICAL                                            :: do_singlepole = .FALSE.
+      REAL(KIND=dp)                                      :: singlepole_omega0 = 0.0_dp, &
+                                                            singlepole_eta = 0.0_dp
       REAL(KIND=dp)                                      :: broadening_print_loc_bandgap = 0.0_dp, &
                                                             energy_window_print_loc_bandgap = 0.0_dp, &
                                                             ldos_thresh_print_loc_bandgap = 0.0_dp, &
