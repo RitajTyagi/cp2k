@@ -30,6 +30,8 @@
                                           {matcher="E_RIRS_evGW0_LUMO", tol=1e-03, ref=10.718},
                                           {matcher="E_evGW0_direct_gap", tol=1e-03, ref=21.416}]
 
+"09_RIRS_G0W0_PBE_periodic_H2O.inp"      = [{matcher="E_G0W0_direct_gap", tol=1e-02, ref=23.329}]
+
 # AUTO_RI contracts a large QZ reference basis and preserves the GW result.
 "auto-ri-size-H2O.inp" = [{matcher="Auto_RI_Size", tol=1e-12, ref=18},
                            {matcher="E_G0W0_direct_gap", tol=1e-3, ref=22.667}]
