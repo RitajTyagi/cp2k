@@ -40,13 +40,14 @@ MODULE rt_bse_ri_rs
                                               cp_fm_type
    USE gw_ri_rs_compute_Z_lP,           ONLY: compute_Z_lP
    USE gw_ri_rs_grid_setup_main,        ONLY: setup_ri_rs_grid
-   USE gw_ri_rs_large_cell_Gamma,       ONLY: release_dbcsr_topology_and_matrices,&
-                                              setup_square_topology
+
    USE gw_ri_rs_non_periodic,           ONLY: atomic_basis_at_grid_point,&
                                               reserve_blocks_within_radius
    USE gw_ri_rs_utils,                  ONLY: precompute_ri_rs_radii
    USE gw_utils_dbcsr,                  ONLY: dbcsr_contract_ABA,&
-                                              hadamard_product_inplace
+                                              hadamard_product_inplace,&
+                                              release_dbcsr_topology_and_matrices,&
+                                              setup_square_topology
    USE gw_utils_fm,                     ONLY: fm_contract_ABA
    USE kinds,                           ONLY: dp
    USE machine,                         ONLY: m_walltime

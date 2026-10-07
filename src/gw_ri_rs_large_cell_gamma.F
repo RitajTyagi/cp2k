@@ -51,6 +51,8 @@ MODULE gw_ri_rs_large_cell_Gamma
                                               gw_3c_ws_release,&
                                               gw_3c_ws_type
    USE gw_utils_dbcsr,                  ONLY: dbcsr_contract_ABA,&
+                                              release_dbcsr_topology_and_matrices,&
+                                              setup_square_topology,&
                                               hadamard_product
    USE gw_utils_fm,                     ONLY: fm_contract_ABA
    USE input_section_types,             ONLY: section_vals_type
@@ -72,9 +74,7 @@ MODULE gw_ri_rs_large_cell_Gamma
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_ri_rs_large_cell_Gamma'
 
-   PUBLIC :: gw_calc_ri_rs_large_cell_Gamma, &
-             release_dbcsr_topology_and_matrices, &
-             setup_square_topology
+   PUBLIC :: gw_calc_ri_rs_large_cell_Gamma
 
 CONTAINS
 
@@ -1350,93 +1350,4 @@ CONTAINS
 !> \param square_dist ...
 !> \param blk_sizes ...
 !> \param mapped_dist ...
-! **************************************************************************************************
-
-   SUBROUTINE setup_square_topology(matrix_template, dim_type, square_dist, blk_sizes, mapped_dist)
-
-      TYPE(dbcsr_type), INTENT(IN)                       :: matrix_template
-      CHARACTER(LEN=*), INTENT(IN)                       :: dim_type
-      TYPE(dbcsr_distribution_type), INTENT(OUT)         :: square_dist
-      INTEGER, DIMENSION(:), INTENT(OUT), POINTER        :: blk_sizes, mapped_dist
-
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'setup_square_topology'
-
-      INTEGER                                            :: handle, i, np, npcols, nprows
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk, col_dist, row_blk, row_dist
-      TYPE(dbcsr_distribution_type)                      :: dist_template
-
-      CALL timeset(routineN, handle)
-
-      CALL dbcsr_get_info(matrix_template, distribution=dist_template, &
-                          row_blk_size=row_blk, col_blk_size=col_blk)
-      CALL dbcsr_distribution_get(dist_template, row_dist=row_dist, col_dist=col_dist, &
-                                  nprows=nprows, npcols=npcols)
-
-      IF (TRIM(dim_type) == 'ROW') THEN
-         ! Creates ROW x ROW (e.g., Grid x Grid from mat_phi_mu_l)
-         blk_sizes => row_blk
-         np = npcols
-         ALLOCATE (mapped_dist(SIZE(blk_sizes)))
-         DO i = 1, SIZE(blk_sizes)
-            mapped_dist(i) = MOD(i - 1, np)
-         END DO
-         CALL dbcsr_distribution_new(square_dist, template=dist_template, &
-                                     row_dist=row_dist, col_dist=mapped_dist)
-
-      ELSE IF (TRIM(dim_type) == 'COL') THEN
-         ! Creates COL x COL (e.g., Aux x Aux from mat_Z_lP)
-         blk_sizes => col_blk
-         np = nprows
-         ALLOCATE (mapped_dist(SIZE(blk_sizes)))
-         DO i = 1, SIZE(blk_sizes)
-            mapped_dist(i) = MOD(i - 1, np)
-         END DO
-         CALL dbcsr_distribution_new(square_dist, template=dist_template, &
-                                     row_dist=mapped_dist, col_dist=col_dist)
-      END IF
-
-      CALL timestop(handle)
-
-   END SUBROUTINE setup_square_topology
-
-! **************************************************************************************************
-!> \brief DBCSR matrices deallocation
-!> \param dist ...
-!> \param mapped_dist    ...
-!> \param m1 ...
-!> \param m2 ...
-!> \param m3 ...
-!> \param m4 ...
-! **************************************************************************************************
-
-   SUBROUTINE release_dbcsr_topology_and_matrices(dist, mapped_dist, m1, m2, m3, m4)
-
-      TYPE(dbcsr_distribution_type), INTENT(INOUT), &
-         OPTIONAL                                        :: dist
-      INTEGER, DIMENSION(:), INTENT(INOUT), OPTIONAL, &
-         POINTER                                         :: mapped_dist
-      TYPE(dbcsr_type), INTENT(INOUT), OPTIONAL          :: m1, m2, m3, m4
-
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'release_dbcsr_topology_and_matrices'
-
-      INTEGER                                            :: handle
-
-      CALL timeset(routineN, handle)
-
-      IF (PRESENT(dist)) CALL dbcsr_distribution_release(dist)
-      IF (PRESENT(mapped_dist)) THEN
-         IF (ASSOCIATED(mapped_dist)) THEN
-            DEALLOCATE (mapped_dist)
-            NULLIFY (mapped_dist)
-         END IF
-      END IF
-      IF (PRESENT(m1)) CALL dbcsr_release(m1)
-      IF (PRESENT(m2)) CALL dbcsr_release(m2)
-      IF (PRESENT(m3)) CALL dbcsr_release(m3)
-      IF (PRESENT(m4)) CALL dbcsr_release(m4)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE release_dbcsr_topology_and_matrices
-
 END MODULE gw_ri_rs_large_cell_Gamma

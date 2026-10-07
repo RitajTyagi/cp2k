@@ -249,6 +249,7 @@ list(
   gw_ri_rs_grid_initialization.F
   gw_ri_rs_grid_optimization.F
   gw_ri_rs_grid_setup_main.F
+  gw_ri_rs_panels.F
   gw_ri_rs_utils.F
   post_scf_bandstructure_types.F
   post_scf_bandstructure_utils.F
