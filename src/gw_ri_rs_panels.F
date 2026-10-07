@@ -31,8 +31,10 @@ MODULE gw_ri_rs_panels
         dbcsr_iterator_next_block, dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, &
         dbcsr_multiply, dbcsr_put_block, dbcsr_release, dbcsr_set, dbcsr_type, &
         dbcsr_type_no_symmetry
+   USE cell_types,                      ONLY: cell_type
    USE cp_dbcsr_operations,             ONLY: copy_fm_to_dbcsr
    USE cp_fm_types,                     ONLY: cp_fm_type
+   USE gw_ri_rs_utils,                  ONLY: min_image_dist2
    USE gw_tensor_large_cell_Gamma,      ONLY: G_occ_vir
    USE gw_utils_dbcsr,                  ONLY: hadamard_product,&
                                               release_dbcsr_topology_and_matrices,&
@@ -68,18 +70,19 @@ CONTAINS
 !> \param cutoff ...
 !> \param used ...
 ! **************************************************************************************************
-   SUBROUTINE mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, used)
+   SUBROUTINE mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, used, cell)
 
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: centroids
       INTEGER, INTENT(IN)                                :: blk0, blk1
       REAL(KIND=dp), INTENT(IN)                          :: cutoff
       LOGICAL, ALLOCATABLE, DIMENSION(:), INTENT(OUT)    :: used
+      TYPE(cell_type), POINTER                           :: cell
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'mask_grid_blocks_near_panel'
 
-      INTEGER                                            :: c, handle, k
-      REAL(KIND=dp)                                      :: cutoff2, d2, dx
-      REAL(KIND=dp), DIMENSION(3)                        :: hi, lo
+      INTEGER                                            :: c, handle, k, n1, n2, n3, s1, s2, s3
+      REAL(KIND=dp)                                      :: cutoff2, d2, d2_image, dx
+      REAL(KIND=dp), DIMENSION(3)                        :: center_image, hi, lo
 
       CALL timeset(routineN, handle)
 
@@ -87,12 +90,32 @@ CONTAINS
       lo(:) = MINVAL(centroids(:, blk0:blk1), DIM=2)
       hi(:) = MAXVAL(centroids(:, blk0:blk1), DIM=2)
 
+      ! A Cartesian bounding box has no meaning modulo the lattice, so the box distance is
+      ! minimized over the neighbouring lattice images instead of being taken as it stands. The
+      ! invariant this routine has to satisfy is that `used` is a SUPERSET of the pairs the exact
+      ! per-pair test (panel_template_elems, build_geo_template_panel) subsequently keeps: for a
+      ! panel block ib inside the box and any image R, dist(c - R, box) <= |r_ib - r_c + R|, so
+      ! the image-minimized box distance is a lower bound on the true pair distance.
+      ! Over-inclusion only widens the neighbourhood slice; under-inclusion would silently drop
+      ! real contributions. For a molecule cell%perd = 0 and the loops collapse to one term.
+      n1 = cell%perd(1); n2 = cell%perd(2); n3 = cell%perd(3)
+
       ALLOCATE (used(SIZE(centroids, 2)))
       DO c = 1, SIZE(centroids, 2)
-         d2 = 0.0_dp
-         DO k = 1, 3
-            dx = MAX(0.0_dp, lo(k) - centroids(k, c), centroids(k, c) - hi(k))
-            d2 = d2 + dx*dx
+         d2 = HUGE(0.0_dp)
+         DO s3 = -n3, n3
+            DO s2 = -n2, n2
+               DO s1 = -n1, n1
+                  center_image(:) = centroids(:, c) + cell%hmat(:, 1)*REAL(s1, dp) &
+                                    + cell%hmat(:, 2)*REAL(s2, dp) + cell%hmat(:, 3)*REAL(s3, dp)
+                  d2_image = 0.0_dp
+                  DO k = 1, 3
+                     dx = MAX(0.0_dp, lo(k) - center_image(k), center_image(k) - hi(k))
+                     d2_image = d2_image + dx*dx
+                  END DO
+                  d2 = MIN(d2, d2_image)
+               END DO
+            END DO
          END DO
          used(c) = (d2 <= cutoff2)
       END DO
@@ -113,7 +136,8 @@ CONTAINS
 !> \param cutoff ...
 !> \param nze_tmpl ...
 ! **************************************************************************************************
-   SUBROUTINE panel_template_elems(r_blk_sizes, centroids, used, blk0, blk1, cutoff, nze_tmpl)
+   SUBROUTINE panel_template_elems(r_blk_sizes, centroids, used, blk0, blk1, cutoff, &
+                                   nze_tmpl, cell)
 
       INTEGER, DIMENSION(:), INTENT(IN)                  :: r_blk_sizes
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: centroids
@@ -121,6 +145,7 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: blk0, blk1
       REAL(KIND=dp), INTENT(IN)                          :: cutoff
       INTEGER(KIND=int_8), INTENT(OUT)                   :: nze_tmpl
+      TYPE(cell_type), POINTER                           :: cell
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'panel_template_elems'
 
@@ -144,10 +169,11 @@ CONTAINS
       cutoff2 = cutoff**2
       nze_tmpl = 0_int_8
       !$OMP PARALLEL DO DEFAULT(NONE) SHARED(blk0, blk1, n_used, used_idx, centroids, cutoff2, &
-      !$OMP r_blk_sizes) PRIVATE(ib, c) REDUCTION(+:nze_tmpl)
+      !$OMP r_blk_sizes, cell) PRIVATE(ib, c) REDUCTION(+:nze_tmpl)
       DO ib = blk0, blk1
          DO c = 1, n_used
-            IF (SUM((centroids(:, ib) - centroids(:, used_idx(c)))**2) <= cutoff2) THEN
+            IF (min_image_dist2(centroids(:, ib), centroids(:, used_idx(c)), cell) &
+                <= cutoff2) THEN
                nze_tmpl = nze_tmpl + INT(r_blk_sizes(ib), int_8)*INT(r_blk_sizes(used_idx(c)), int_8)
             END IF
          END DO
@@ -258,9 +284,11 @@ CONTAINS
                IF (rows_acc >= TARGET) EXIT
             END DO
             IF (.NOT. use_cutoff .OR. blk1 == blk0) EXIT
-            CALL mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, used)
+            CALL mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, used, &
+                                             bs_env%ri_rs%cell)
             width = SUM(r_blk_sizes, MASK=used)
-            CALL panel_template_elems(r_blk_sizes, centroids, used, blk0, blk1, cutoff, nze_tmpl)
+            CALL panel_template_elems(r_blk_sizes, centroids, used, blk0, blk1, cutoff, &
+                                      nze_tmpl, bs_env%ri_rs%cell)
             f_near = REAL(width, dp)/REAL(MAX(n_grid_total, 1), dp)
             side = INT(REAL(rows_acc, dp)*f_near*REAL(MAX(n_RI, n_ao), dp), int_8)
             msg = MAX(nze_tmpl, side)/INT(MAX(min_dim, 1), int_8)
@@ -428,11 +456,12 @@ CONTAINS
          IF (use_cutoff) THEN
             CALL mask_grid_blocks_near_panel(bs_env%ri_rs%chunk_centroids, pan_first(ipan), &
                                              pan_last(ipan), bs_env%ri_rs%cutoff_radius_v_w, &
-                                             grid_used)
+                                             grid_used, bs_env%ri_rs%cell)
             pan_width = SUM(r_blk_sizes, MASK=grid_used)
             CALL panel_template_elems(r_blk_sizes, bs_env%ri_rs%chunk_centroids, &
                                       grid_used, pan_first(ipan), pan_last(ipan), &
-                                      bs_env%ri_rs%cutoff_radius_v_w, nze_tmpl)
+                                      bs_env%ri_rs%cutoff_radius_v_w, nze_tmpl, &
+                                      bs_env%ri_rs%cell)
             CALL panel_mem_estimate_GB(nze_tmpl, pan_rows, pan_width, n_grid_total, &
                                        n_RI, bs_env%n_ao, n_procs, mem_pan_GB)
          ELSE
@@ -467,7 +496,8 @@ CONTAINS
          pos_P(:) = particle_set(iatom)%r(:)
          n_local_grid = 0
          DO l = 1, n_grid_total
-            IF (SUM((bs_env%ri_rs%grid_points(1:3, l) - pos_P(1:3))**2) <= cutoff_ri**2) THEN
+            IF (min_image_dist2(bs_env%ri_rs%grid_points(1:3, l), pos_P(1:3), &
+                                bs_env%ri_rs%cell) <= cutoff_ri**2) THEN
                n_local_grid = n_local_grid + 1
             END IF
          END DO
@@ -558,12 +588,14 @@ CONTAINS
 !> \param A_template ...
 !> \param col_map ...
 ! **************************************************************************************************
-   SUBROUTINE build_geo_template_panel(L_pan, L_full, centroids, cutoff, blk0, A_template, col_map)
+   SUBROUTINE build_geo_template_panel(L_pan, L_full, centroids, cutoff, blk0, A_template, &
+                                       cell, col_map)
       TYPE(dbcsr_type), INTENT(IN)                       :: L_pan, L_full
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: centroids
       REAL(KIND=dp), INTENT(IN)                          :: cutoff
       INTEGER, INTENT(IN)                                :: blk0
       TYPE(dbcsr_type), INTENT(OUT)                      :: A_template
+      TYPE(cell_type), POINTER                           :: cell
       INTEGER, DIMENSION(:), INTENT(IN), OPTIONAL        :: col_map
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_geo_template_panel'
@@ -600,9 +632,8 @@ CONTAINS
             IF (MOD(c - 1, npcols) /= my_pcol) CYCLE
             cg = c
             IF (PRESENT(col_map)) cg = col_map(c)
-            IF ((centroids(1, blk0 + r - 1) - centroids(1, cg))**2 + &
-                (centroids(2, blk0 + r - 1) - centroids(2, cg))**2 + &
-                (centroids(3, blk0 + r - 1) - centroids(3, cg))**2 <= cutoff2) THEN
+            IF (min_image_dist2(centroids(:, blk0 + r - 1), centroids(:, cg), cell) &
+                <= cutoff2) THEN
                cs = grid_blk_sizes(c)
                CALL dbcsr_put_block(A_template, r, c, zero_blk(1:rs, 1:cs))
             END IF
@@ -823,11 +854,12 @@ CONTAINS
 !> \param centers block positions, one column per block row/column of matrix
 !> \param radius truncation radius, same units as centers (bohr)
 ! **************************************************************************************************
-   SUBROUTINE reserve_blocks_within_radius(matrix, centers, radius)
+   SUBROUTINE reserve_blocks_within_radius(matrix, centers, radius, cell)
 
       TYPE(dbcsr_type), INTENT(INOUT)                    :: matrix
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: centers
       REAL(KIND=dp), INTENT(IN)                          :: radius
+      TYPE(cell_type), POINTER                           :: cell
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'reserve_blocks_within_radius'
 
@@ -855,8 +887,7 @@ CONTAINS
          IF (row_dist(i) /= my_prow) CYCLE
          DO j = 1, nblkcols
             IF (col_dist(j) /= my_pcol) CYCLE
-            IF ((centers(1, i) - centers(1, j))**2 + (centers(2, i) - centers(2, j))**2 + &
-                (centers(3, i) - centers(3, j))**2 <= radius2) THEN
+            IF (min_image_dist2(centers(:, i), centers(:, j), cell) <= radius2) THEN
                CALL dbcsr_put_block(matrix, i, j, zero_blk(1:row_blk(i), 1:col_blk(j)))
             END IF
          END DO
@@ -1013,7 +1044,7 @@ CONTAINS
 !> \param grid_occupation ...
 ! **************************************************************************************************
    SUBROUTINE contract_grid_panels(L_A, M_A, L_B, M_B, L_out, mat_out, scale, eps, para_env, &
-                                   pan_first, pan_last, lb_eq_la, lout_eq_la, zero_out, &
+                                   cell, pan_first, pan_last, lb_eq_la, lout_eq_la, zero_out, &
                                    centroids, cutoff, grid_occupation)
 
       TYPE(dbcsr_type), INTENT(INOUT), TARGET            :: L_A
@@ -1024,6 +1055,7 @@ CONTAINS
       TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_out
       REAL(KIND=dp), INTENT(IN)                          :: scale, eps
       TYPE(mp_para_env_type), INTENT(IN), POINTER        :: para_env
+      TYPE(cell_type), POINTER                           :: cell
       INTEGER, DIMENSION(:), INTENT(IN)                  :: pan_first, pan_last
       LOGICAL, INTENT(IN)                                :: lb_eq_la, lout_eq_la, zero_out
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN), &
@@ -1086,7 +1118,7 @@ CONTAINS
          ! so the system-wide phi/Z right operands are cut down to this neighborhood slice
          ! (local extraction, zero communication; exact w.r.t. the geo template).
          IF (use_cutoff) THEN
-            CALL mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, grid_used)
+            CALL mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, grid_used, cell)
             CALL extract_masked_blocks(L_A, grid_used, LA_near, compress_rows=.TRUE., blk_map=gmap)
             IF (.NOT. lb_eq_la) CALL extract_masked_blocks(L_B, grid_used, LB_near, compress_rows=.TRUE.)
             IF (.NOT. lout_eq_la) CALL extract_masked_blocks(L_out, grid_used, Lout_near, compress_rows=.TRUE.)
@@ -1119,7 +1151,7 @@ CONTAINS
          CALL dbcsr_multiply('N', 'N', 1.0_dp, LA_panC, MA_sub, 0.0_dp, tmpA, filter_eps=eps)
          CALL dbcsr_release(MA_sub)
          IF (use_cutoff) THEN
-            CALL build_geo_template_panel(LA_pan, LA_near, centroids, cutoff, blk0, A_pan, &
+            CALL build_geo_template_panel(LA_pan, LA_near, centroids, cutoff, blk0, A_pan, cell, &
                                           col_map=gmap)
          ELSE
             CALL create_product_matrix(tmpA, RB_A, 'N', 'T', A_pan)
@@ -1223,13 +1255,14 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE contract_grid_panels_sigma_c(mat_phi, mat_Z, mat_G_occ_ao, mat_G_vir_ao, &
                                            mat_W_aux, mat_Sigma_neg, mat_Sigma_pos, eps, para_env, &
-                                           pan_first, pan_last, centroids, cutoff)
+                                           cell, pan_first, pan_last, centroids, cutoff)
 
       TYPE(dbcsr_type), INTENT(INOUT), TARGET            :: mat_phi, mat_Z
       TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_G_occ_ao, mat_G_vir_ao, mat_W_aux, &
                                                             mat_Sigma_neg, mat_Sigma_pos
       REAL(KIND=dp), INTENT(IN)                          :: eps
       TYPE(mp_para_env_type), INTENT(IN), POINTER        :: para_env
+      TYPE(cell_type), POINTER                           :: cell
       INTEGER, DIMENSION(:), INTENT(IN)                  :: pan_first, pan_last
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN), &
          OPTIONAL                                        :: centroids
@@ -1275,7 +1308,7 @@ CONTAINS
          ! Neighborhood slices of phi/Z (grid rows within cutoff of the panel): they replace
          ! the system-wide right operands in every multiply (local extraction, zero comm).
          IF (use_cutoff) THEN
-            CALL mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, grid_used)
+            CALL mask_grid_blocks_near_panel(centroids, blk0, blk1, cutoff, grid_used, cell)
             CALL extract_masked_blocks(mat_phi, grid_used, phi_near, compress_rows=.TRUE., blk_map=gmap)
             CALL extract_masked_blocks(mat_Z, grid_used, Z_near, compress_rows=.TRUE.)
             RB_phi => phi_near
@@ -1297,7 +1330,7 @@ CONTAINS
          CALL create_product_matrix(phi_panC, G_occ_sub, 'N', 'N', tmpA)
          CALL dbcsr_multiply('N', 'N', 1.0_dp, phi_panC, G_occ_sub, 0.0_dp, tmpA, filter_eps=eps)
          IF (use_cutoff) THEN
-            CALL build_geo_template_panel(phi_pan, phi_near, centroids, cutoff, blk0, A_occ, &
+            CALL build_geo_template_panel(phi_pan, phi_near, centroids, cutoff, blk0, A_occ, cell, &
                                           col_map=gmap)
          ELSE
             CALL create_product_matrix(tmpA, RB_phi, 'N', 'T', A_occ)
@@ -1311,7 +1344,7 @@ CONTAINS
          CALL create_product_matrix(phi_panC, G_vir_sub, 'N', 'N', tmpA)
          CALL dbcsr_multiply('N', 'N', 1.0_dp, phi_panC, G_vir_sub, 0.0_dp, tmpA, filter_eps=eps)
          IF (use_cutoff) THEN
-            CALL build_geo_template_panel(phi_pan, phi_near, centroids, cutoff, blk0, A_vir, &
+            CALL build_geo_template_panel(phi_pan, phi_near, centroids, cutoff, blk0, A_vir, cell, &
                                           col_map=gmap)
          ELSE
             CALL create_product_matrix(tmpA, RB_phi, 'N', 'T', A_vir)
@@ -1390,9 +1423,9 @@ CONTAINS
 
       n_ao_used = 0
       DO ri_atom = 1, bs_env%n_atom
-         IF (NORM2(bs_env%ri_rs%particle_set(ri_atom)%r(:) - &
-                   bs_env%ri_rs%particle_set(atom_P)%r(:)) > &
-             bs_env%ri_rs%radius_ao_per_atom(ri_atom) + cutoff_ri) CYCLE
+         IF (min_image_dist2(bs_env%ri_rs%particle_set(ri_atom)%r(:), &
+                             bs_env%ri_rs%particle_set(atom_P)%r(:), bs_env%ri_rs%cell) > &
+             (bs_env%ri_rs%radius_ao_per_atom(ri_atom) + cutoff_ri)**2) CYCLE
          n_ao_used = n_ao_used + bs_env%i_ao_end_from_atom(ri_atom) - &
                      bs_env%i_ao_start_from_atom(ri_atom) + 1
       END DO

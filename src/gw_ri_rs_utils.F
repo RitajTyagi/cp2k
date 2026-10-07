@@ -27,7 +27,7 @@ MODULE gw_ri_rs_utils
    PRIVATE
 
    PUBLIC :: evaluate_ao_basis_on_points, evaluate_ao_on_points, filter_grid_to_voronoi, &
-             get_rirs_cluster_atoms, precompute_ri_rs_radii
+             get_rirs_cluster_atoms, min_image_dist2, precompute_ri_rs_radii
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_ri_rs_utils'
 
@@ -354,5 +354,31 @@ CONTAINS
       END DO
       !$OMP END PARALLEL DO
    END SUBROUTINE evaluate_ao_basis_on_points
+
+! **************************************************************************************************
+!> \brief Squared distance between two points, minimized over lattice images.
+!>
+!>        Every geometric screening test in the RI-RS code has to use this rather than the plain
+!>        Euclidean distance. For any pair d_euclid >= d_MIC, so a Euclidean cutoff test
+!>        UNDER-includes under periodic boundary conditions: it silently discards pairs that wrap
+!>        a cell face and are genuinely inside the cutoff, with no diagnostic. For a molecule
+!>        cell%perd = 0, pbc() is the identity and this reduces to the Euclidean distance, so the
+!>        same screening serves both drivers.
+!> \param a First point.
+!> \param b Second point.
+!> \param cell Simulation cell.
+!> \return Squared minimum-image distance.
+! **************************************************************************************************
+   FUNCTION min_image_dist2(a, b, cell) RESULT(dist2)
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: a, b
+      TYPE(cell_type), POINTER                           :: cell
+      REAL(KIND=dp)                                      :: dist2
+
+      REAL(KIND=dp), DIMENSION(3)                        :: displacement
+
+      displacement = pbc(a - b, cell)
+      dist2 = DOT_PRODUCT(displacement, displacement)
+
+   END FUNCTION min_image_dist2
 
 END MODULE gw_ri_rs_utils

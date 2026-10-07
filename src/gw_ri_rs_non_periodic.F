@@ -722,7 +722,7 @@ CONTAINS
                                       L_B=mat_phi_mu_l, M_B=matrix_G_vir_ao, &
                                       L_out=mat_Z_lP, mat_out=mat_chi_Gamma_tau(i_t)%matrix, &
                                       scale=bs_env%spin_degeneracy, eps=bs_env%eps_filter, &
-                                      para_env=bs_env%para_env, &
+                                      para_env=bs_env%para_env, cell=bs_env%ri_rs%cell, &
                                       pan_first=pan_first, pan_last=pan_last, &
                                       lb_eq_la=.TRUE., lout_eq_la=.FALSE., &
                                       zero_out=(ispin == 1), &
@@ -1081,7 +1081,7 @@ CONTAINS
                                    L_B=mat_Z_lP, M_B=matrix_V_aux, &
                                    L_out=mat_phi_mu_l, mat_out=mat_Sigma_x_Gamma, &
                                    scale=1.0_dp, eps=bs_env%eps_filter, &
-                                   para_env=bs_env%para_env, &
+                                   para_env=bs_env%para_env, cell=bs_env%ri_rs%cell, &
                                    pan_first=pan_first, pan_last=pan_last, &
                                    lb_eq_la=.FALSE., lout_eq_la=.TRUE., zero_out=.TRUE., &
                                    centroids=bs_env%ri_rs%chunk_centroids, &
@@ -1193,7 +1193,7 @@ CONTAINS
                                               mat_Sigma_neg=mat_Sigma_neg_tau(i_t, ispin)%matrix, &
                                               mat_Sigma_pos=mat_Sigma_pos_tau(i_t, ispin)%matrix, &
                                               eps=bs_env%eps_filter, &
-                                              para_env=bs_env%para_env, &
+                                              para_env=bs_env%para_env, cell=bs_env%ri_rs%cell, &
                                               pan_first=pan_first, pan_last=pan_last, &
                                               centroids=bs_env%ri_rs%chunk_centroids, &
                                               cutoff=bs_env%ri_rs%cutoff_radius_v_w)

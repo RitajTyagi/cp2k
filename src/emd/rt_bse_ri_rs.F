@@ -273,7 +273,7 @@ CONTAINS
       IF (use_cutoff_w0) THEN
          CALL reserve_blocks_within_radius(bs_env%ri_rs%mat_W0_grid_rtbse, &
                                            bs_env%ri_rs%chunk_centroids, &
-                                           bs_env%ri_rs%cutoff_radius_w0)
+                                           bs_env%ri_rs%cutoff_radius_w0, bs_env%ri_rs%cell)
          ! TODO: eps_filter is INERT here -- DBCSR skips multrec_filtering whenever
          ! keep_sparsity is set (dbcsr_mm_multrec.F: "IF (use_eps .AND. .NOT. keep_sparsity)").
          ! So a radius wider than the cell equals the uncut build only while eps_filter prunes
