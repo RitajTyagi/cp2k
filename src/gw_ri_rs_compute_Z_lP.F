@@ -39,7 +39,8 @@ MODULE gw_ri_rs_compute_Z_lP
                                               scale_rows_by_diag,&
                                               solve_D_lp_distributed,&
                                               store_Z_lP_columns
-   USE gw_ri_rs_utils,                  ONLY: evaluate_ao_on_points
+   USE gw_ri_rs_utils,                  ONLY: evaluate_ao_on_points,&
+                                              exact_min_image_dist2
    USE gw_utils_compute_integrals,      ONLY: build_3c_integral_block_ctx,&
                                               gw_3c_ctx_create,&
                                               gw_3c_ctx_release,&
@@ -2687,7 +2688,7 @@ CONTAINS
 
       INTEGER                                            :: col_end, col_start, handle, j, k, l, &
                                                             loc_idx, n_grid_total, n_keep, ri_atom
-      REAL(KIND=dp)                                      :: d_sP, dist, r2_threshold
+      REAL(KIND=dp)                                      :: r2_threshold
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: w_pt
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: phi_keep, sphere_grid
       REAL(KIND=dp), DIMENSION(3)                        :: pos_P
@@ -2708,16 +2709,16 @@ CONTAINS
 
       n_local_grid = 0
       DO l = 1, n_grid_total
-         dist = NORM2(ri_rs_grid_points(1:3, l) - pos_P(1:3))
-         IF (dist <= cutoff_ri) n_local_grid = n_local_grid + 1
+         IF (exact_min_image_dist2(ri_rs_grid_points(1:3, l), pos_P(1:3), bs_env%ri_rs%cell) &
+             <= cutoff_ri**2) n_local_grid = n_local_grid + 1
       END DO
 
       ALLOCATE (local_grid_idx(n_local_grid))
 
       n_local_grid = 0
       DO l = 1, n_grid_total
-         dist = NORM2(ri_rs_grid_points(1:3, l) - pos_P(1:3))
-         IF (dist <= cutoff_ri) THEN
+         IF (exact_min_image_dist2(ri_rs_grid_points(1:3, l), pos_P(1:3), bs_env%ri_rs%cell) &
+             <= cutoff_ri**2) THEN
             n_local_grid = n_local_grid + 1
             local_grid_idx(n_local_grid) = l
          END IF
@@ -2733,8 +2734,8 @@ CONTAINS
       ao_col_map(:) = 0
       n_ao_used = 0
       DO ri_atom = 1, bs_env%n_atom
-         d_sP = NORM2(particle_set(ri_atom)%r(:) - pos_P(:))
-         IF (d_sP > bs_env%ri_rs%radius_ao_per_atom(ri_atom) + cutoff_ri) CYCLE
+         IF (exact_min_image_dist2(particle_set(ri_atom)%r(:), pos_P(:), bs_env%ri_rs%cell) > &
+             (bs_env%ri_rs%radius_ao_per_atom(ri_atom) + cutoff_ri)**2) CYCLE
 
          DO j = bs_env%i_ao_start_from_atom(ri_atom), bs_env%i_ao_end_from_atom(ri_atom)
             n_ao_used = n_ao_used + 1
@@ -2746,8 +2747,8 @@ CONTAINS
       phi_local = 0.0_dp
 
       DO ri_atom = 1, bs_env%n_atom
-         d_sP = NORM2(particle_set(ri_atom)%r(:) - pos_P(:))
-         IF (d_sP > bs_env%ri_rs%radius_ao_per_atom(ri_atom) + cutoff_ri) CYCLE
+         IF (exact_min_image_dist2(particle_set(ri_atom)%r(:), pos_P(:), bs_env%ri_rs%cell) > &
+             (bs_env%ri_rs%radius_ao_per_atom(ri_atom) + cutoff_ri)**2) CYCLE
 
          col_start = ao_col_map(bs_env%i_ao_start_from_atom(ri_atom))
          col_end = ao_col_map(bs_env%i_ao_end_from_atom(ri_atom))
@@ -2761,7 +2762,8 @@ CONTAINS
 
          CALL evaluate_ao_on_points(phi_local(:, col_start:col_end), sphere_grid, &
                                     ri_atom, particle_set, qs_kind_set, cell, &
-                                    cutoff_squared=r2_threshold)
+                                    cutoff_squared=r2_threshold, &
+                                    sum_periodic_images=.TRUE.)
       END DO
 
       DEALLOCATE (sphere_grid)

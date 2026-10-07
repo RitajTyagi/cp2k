@@ -90,7 +90,10 @@ MODULE gw_ri_rs_non_periodic
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_ri_rs_non_periodic'
 
    PUBLIC :: gw_calc_ri_rs_non_periodic, atomic_basis_at_grid_point, &
-             reserve_blocks_within_radius
+             reserve_blocks_within_radius, &
+             ! shared with the periodic Gamma-point driver
+             get_mat_chi_Gamma_tau, compute_Sigma_x, compute_Sigma_c, &
+             init_evGW0, update_eigenvalues_G, reset_and_clean_bs_env, print_evGW0_band_edges
 
 CONTAINS
 
@@ -633,8 +636,11 @@ CONTAINS
          END IF
          ikind = particle_set(iatom)%atomic_kind%kind_number
          ao_basis => bs_env%basis_set_AO(ikind)%gto_basis_set
+         ! sum_periodic_images is a no-op for a molecule (cell%perd = 0) and Bloch-sums the AO
+         ! for the periodic Gamma-point driver, which shares this routine.
          CALL evaluate_ao_basis_on_points(atom_col_buffer, ri_rs_grid_points, ao_basis, &
-                                          particle_set(iatom)%r, cell, cutoff_squared=r2_threshold)
+                                          particle_set(iatom)%r, cell, cutoff_squared=r2_threshold, &
+                                          sum_periodic_images=.TRUE.)
 
          ! Slice the dense column into the atom-aligned grid row-blocks and insert into DBCSR
          DO i_blk = 1, num_grid_chunks

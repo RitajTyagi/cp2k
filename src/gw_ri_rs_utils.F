@@ -27,7 +27,8 @@ MODULE gw_ri_rs_utils
    PRIVATE
 
    PUBLIC :: evaluate_ao_basis_on_points, evaluate_ao_on_points, filter_grid_to_voronoi, &
-             get_rirs_cluster_atoms, min_image_dist2, precompute_ri_rs_radii
+             exact_min_image_dist2, get_rirs_cluster_atoms, min_image_dist2, &
+             precompute_ri_rs_radii
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_ri_rs_utils'
 
@@ -411,5 +412,32 @@ CONTAINS
       dist2 = DOT_PRODUCT(displacement, displacement)
 
    END FUNCTION min_image_dist2
+
+! **************************************************************************************************
+!> \brief Squared distance between two points, minimized over lattice images by the exact image
+!>        search rather than the scaled-coordinate wrap used by min_image_dist2.
+!>
+!>        Use this where the distance defines a physical domain rather than a screening bound --
+!>        the RI-RS fitting sphere of an atom P, and the pruning of the AO atoms that reach into
+!>        it. For an orthorhombic cell the two agree exactly; for a triclinic cell this one is
+!>        the true minimum, and it is what the periodic Z_lP solve has always used. The screening
+!>        tests stay on the cheaper min_image_dist2, which they can afford to evaluate in
+!>        O(n_blocks^2) loops.
+!> \param a First point.
+!> \param b Second point.
+!> \param cell Simulation cell.
+!> \return Squared exact minimum-image distance.
+! **************************************************************************************************
+   FUNCTION exact_min_image_dist2(a, b, cell) RESULT(dist2)
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: a, b
+      TYPE(cell_type), POINTER                           :: cell
+      REAL(KIND=dp)                                      :: dist2
+
+      REAL(KIND=dp), DIMENSION(3)                        :: displacement
+
+      displacement = pbc(a, b, cell)
+      dist2 = DOT_PRODUCT(displacement, displacement)
+
+   END FUNCTION exact_min_image_dist2
 
 END MODULE gw_ri_rs_utils
