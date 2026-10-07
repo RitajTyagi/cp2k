@@ -97,3 +97,76 @@ Validation at every step:
 - timing: RI-RS vs `gw_tensor_large_cell_gamma` on a periodic system
 
 Heavier runs (supercell convergence) go to noctua.
+
+---
+
+# Progress
+
+## Done (branch `rirs_periodic_gamma`, pushed to `origin`)
+
+| commit | what |
+|---|---|
+| `e33df85948` | `gw_ri_rs_panels` extraction; topology helpers unified into `gw_utils_dbcsr` |
+| `86d94220bd` | minimum-image panel screening (`min_image_dist2`) |
+| `47b851677e` | periodic Gamma-point regtest (none existed) |
+| `94a543d27b` | opt-in periodic image sums in the shared front end |
+| `be274bcfc4` | exact minimum image + Bloch-summed phi in the Z_lP sphere |
+| `f98648e643` | periodic driver runs on the shared optimized code |
+
+Net against upstream: **+1856 / -2785 lines**, i.e. 929 lines smaller while adding capability.
+
+| file | upstream | now |
+|---|---|---|
+| `gw_ri_rs_large_cell_gamma.F` | 1442 | **235** |
+| `gw_ri_rs_non_periodic.F` | 2793 | 1410 |
+| `gw_ri_rs_panels.F` | – | 1437 |
+| `gw_utils_dbcsr.F` | 155 | 246 |
+
+The periodic path now has panel streaming (no grid x grid matrix is ever materialized), atom-aligned
+grid blocking, the optimized Z_lP solve, the cutoff keywords, the memory estimate and evGW0. Only
+`get_W_MIC` is still periodic-specific.
+
+## Verification
+
+All 9 regtests pass at every step; the 8 molecular ones are bit-identical throughout.
+
+| test | value |
+|---|---|
+| 01..08 molecular | 23.847 / 24.168 / 21.699 / 23.324 / 23.517 / 23.724 / 23.674 / 21.416 |
+| 09 periodic RI-RS | 23.329 |
+| 09 system, tensor code | 23.312 |
+
+So the RI-RS approximation error on the periodic path is 0.017 eV.
+
+Note: on clean upstream, test 01 gives 23.847 where `TEST_FILES.toml` says 23.846. That 1 meV is
+pre-existing upstream, not from this work.
+
+## Efficiency benchmark: silicon
+
+`si_benchmark/` holds `si{n}_{rirs,tensor}.inp`: bulk Si, diamond structure, conventional cubic cell
+(8 atoms, a = 5.431 A), supercell set by `MULTIPLE_UNIT_CELL` in **both** `&CELL` and `&TOPOLOGY`.
+
+    n=1:   8 atoms,  5.43 A    n=3: 216 atoms, 16.29 A
+    n=2:  64 atoms, 10.86 A    n=4: 512 atoms, 21.72 A
+
+**n=1 is rejected by CP2K itself**: the Cholesky decomposition of the k-point overlap matrix fails
+because the minimum-image reconstruction of S(k) is not positive definite for a 5.43 A cell. That is
+the Gamma-only validity condition, and it means the smallest usable Si cell is n=2. Reaching the
+~20 A where the tensor code converges needs n=4, i.e. 512 atoms -- a production job, which is
+precisely the regime the RI-RS linear scaling is meant for.
+
+Run on the noctua login node (too heavy for the laptop), in
+`/scratch/hpc-prf-metdyn/metdyn07_Ritaj/claude_periodic_test/`.
+
+### noctua setup notes
+
+The branch could not be checked out in `implementation/github/cp2k-dev`: upstream now tracks
+`tests/QS/regtest-cohsex/`, which collides with untracked WIP files of the same name there. Rather
+than move those, the benchmark uses a **separate git worktree** so that checkout and its build stay
+untouched:
+
+    git worktree add /scratch/.../claude_periodic_test/cp2k-rirs rirs_periodic_gamma
+
+That needs its own configure, and the first attempt silently produced a binary **without libint**,
+which aborts at the start of any GW run. The working configure adds
+`-DCP2K_USE_LIBINT2=ON` plus `-DLibint2_DIR=<spack libint-2.11.2>/lib/cmake/libint2`.
