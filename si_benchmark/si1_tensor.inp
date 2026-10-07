@@ -43,6 +43,13 @@
   &END DFT
   &PROPERTIES
     &BANDSTRUCTURE
+      # Gamma-only supercell: the HOMO/LUMO/gap to converge against cell size are the
+      # Gamma-point values, and asking for other DOS k-points would require reconstructing
+      # S(k) from S(Gamma) by the minimum image, which is not positive definite at these
+      # cell sizes (check_positive_definite_overlap_mat aborts).
+      &DOS
+        KPOINTS 1 1 1
+      &END DOS
       &GW
         FREQ_MAX_FIT 27.211
         KPOINTS_W 2 2 2

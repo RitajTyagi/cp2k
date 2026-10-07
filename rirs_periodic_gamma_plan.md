@@ -149,11 +149,16 @@ pre-existing upstream, not from this work.
     n=1:   8 atoms,  5.43 A    n=3: 216 atoms, 16.29 A
     n=2:  64 atoms, 10.86 A    n=4: 512 atoms, 21.72 A
 
-**n=1 is rejected by CP2K itself**: the Cholesky decomposition of the k-point overlap matrix fails
-because the minimum-image reconstruction of S(k) is not positive definite for a 5.43 A cell. That is
-the Gamma-only validity condition, and it means the smallest usable Si cell is n=2. Reaching the
-~20 A where the tensor code converges needs n=4, i.e. 512 atoms -- a production job, which is
-precisely the regime the RI-RS linear scaling is meant for.
+**The DOS k-mesh has to be Gamma only.** `check_positive_definite_overlap_mat`
+(`post_scf_bandstructure_utils.F:1002`) loops over `kpoints_DOS` and reconstructs S(k) from
+S(Gamma) by the minimum image; that reconstruction is not positive definite for these cell sizes,
+and the run aborts with "the cell of the calculation is too small" -- at n=1 (5.43 A) and still at
+n=2 (10.86 A), for the tensor code as much as for RI-RS. Setting `&DOS KPOINTS 1 1 1` removes the
+reconstruction entirely, and it is also the physically consistent choice: in a Gamma-only supercell
+scheme the HOMO/LUMO/gap to converge against cell size ARE the Gamma-point values.
+
+Reaching the ~20 A where the tensor code is said to converge needs n=4, i.e. 512 atoms -- a
+production job, which is precisely the regime the RI-RS linear scaling is meant for.
 
 Run on the noctua login node (too heavy for the laptop), in
 `/scratch/hpc-prf-metdyn/metdyn07_Ritaj/claude_periodic_test/`.
