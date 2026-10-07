@@ -225,7 +225,7 @@ CONTAINS
 !> \param cutoff_squared Optional squared AO cutoff radius.
 ! **************************************************************************************************
    SUBROUTINE evaluate_ao_on_points(phi, grid_points, iatom, particle_set, qs_kind_set, cell, &
-                                    dphi, cutoff_squared)
+                                    dphi, cutoff_squared, sum_periodic_images)
       REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: phi
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: grid_points
       INTEGER, INTENT(IN)                                :: iatom
@@ -235,6 +235,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT), &
          OPTIONAL                                        :: dphi
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: cutoff_squared
+      LOGICAL, INTENT(IN), OPTIONAL                      :: sum_periodic_images
 
       CHARACTER(len=*), PARAMETER :: routineN = 'evaluate_ao_on_points'
 
@@ -256,8 +257,8 @@ CONTAINS
          CALL timestop(handle)
          RETURN
       END IF
-      CALL evaluate_ao_basis_on_points(phi, grid_points, basis, &
-                                       particle_set(iatom)%r, cell, dphi, cutoff_squared)
+      CALL evaluate_ao_basis_on_points(phi, grid_points, basis, particle_set(iatom)%r, cell, &
+                                       dphi, cutoff_squared, sum_periodic_images)
       CALL timestop(handle)
    END SUBROUTINE evaluate_ao_on_points
 
@@ -272,7 +273,7 @@ CONTAINS
 !> \param cutoff_squared Optional squared AO cutoff radius.
 ! **************************************************************************************************
    SUBROUTINE evaluate_ao_basis_on_points(phi, grid_points, basis, source_position, cell, &
-                                          dphi, cutoff_squared)
+                                          dphi, cutoff_squared, sum_periodic_images)
       REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: phi
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: grid_points
       TYPE(gto_basis_set_type), POINTER                  :: basis
@@ -281,14 +282,16 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT), &
          OPTIONAL                                        :: dphi
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: cutoff_squared
+      LOGICAL, INTENT(IN), OPTIONAL                      :: sum_periodic_images
 
       INTEGER                                            :: first_sgf, ialpha, ico, iend_co, ipgf, &
                                                             ipoint, irow, iset, isgf, ishell, &
                                                             istart_co, l, last_sgf, lx, ly, lz, &
-                                                            n_cart_total
+                                                            n_cart_total, s1, s2, s3, n1, n2, n3
+      LOGICAL                                            :: do_images
       REAL(KIND=dp)                                      :: exponent, exponential, polynomial, &
                                                             polynomial_derivative(3), radius2, &
-                                                            relative(3), weight
+                                                            relative(3), displacement(3), weight
 
       CPASSERT(ASSOCIATED(basis))
       CPASSERT(SIZE(grid_points, 1) == 3)
@@ -299,13 +302,38 @@ CONTAINS
          CPASSERT(SIZE(dphi, 3) == SIZE(phi, 2))
       END IF
 
+      ! With sum_periodic_images the basis is Bloch-summed over the neighbouring cells, which is
+      ! what the periodic Gamma-point driver needs: an AO centred near a cell face reaches grid
+      ! points across it, and the single minimum image keeps only the nearest of those
+      ! contributions. For a molecule cell%perd = 0 and the loops collapse to the single
+      ! (0,0,0) term, so the two modes coincide there. It is opt-in rather than the default
+      ! because the grid setup and grid optimization evaluate deliberately isolated atoms.
+      do_images = .FALSE.
+      IF (PRESENT(sum_periodic_images)) do_images = sum_periodic_images
+      n1 = 0; n2 = 0; n3 = 0
+      IF (do_images) THEN
+         n1 = cell%perd(1); n2 = cell%perd(2); n3 = cell%perd(3)
+      END IF
+
       !$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
-      !$OMP SHARED(phi, dphi, grid_points, cell, basis, source_position, cutoff_squared, ncoset, indco) &
-      !$OMP PRIVATE(ipoint, relative, radius2, iset, n_cart_total, ishell, l, istart_co, &
-      !$OMP         iend_co, first_sgf, last_sgf, ipgf, exponent, exponential, isgf, ico, &
-      !$OMP         irow, weight, lx, ly, lz, polynomial, polynomial_derivative, ialpha)
+      !$OMP SHARED(phi, dphi, grid_points, cell, basis, source_position, cutoff_squared, ncoset, &
+      !$OMP        indco, do_images, n1, n2, n3) &
+      !$OMP PRIVATE(ipoint, relative, displacement, radius2, iset, n_cart_total, ishell, l, &
+      !$OMP         istart_co, iend_co, first_sgf, last_sgf, ipgf, exponent, exponential, isgf, &
+      !$OMP         ico, irow, weight, lx, ly, lz, polynomial, polynomial_derivative, ialpha, &
+      !$OMP         s1, s2, s3)
       DO ipoint = 1, SIZE(grid_points, 2)
-         relative = pbc(grid_points(:, ipoint) - source_position, cell)
+       IF (do_images) THEN
+         displacement = grid_points(:, ipoint) - source_position
+       ELSE
+         displacement = pbc(grid_points(:, ipoint) - source_position, cell)
+       END IF
+       DO s3 = -n3, n3
+       DO s2 = -n2, n2
+       DO s1 = -n1, n1
+         relative = displacement
+         IF (do_images) relative = relative - cell%hmat(:, 1)*REAL(s1, dp) &
+                                   - cell%hmat(:, 2)*REAL(s2, dp) - cell%hmat(:, 3)*REAL(s3, dp)
          radius2 = DOT_PRODUCT(relative, relative)
          IF (PRESENT(cutoff_squared)) THEN
             IF (radius2 > cutoff_squared) CYCLE
@@ -351,6 +379,9 @@ CONTAINS
                END DO
             END DO
          END DO
+       END DO
+       END DO
+       END DO
       END DO
       !$OMP END PARALLEL DO
    END SUBROUTINE evaluate_ao_basis_on_points

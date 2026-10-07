@@ -622,29 +622,42 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_d_lp'
       INTEGER, PARAMETER                                 :: grid_chunk = 1024
 
-      INTEGER                                            :: atom_j, atom_k, c, handle, handle_dgemm, &
-                                                            j, jk_idx, jsize, jstart, k, ksize, &
-                                                            kstart, l, l0, n_grid_pair, point, ri
+      INTEGER :: atom_j, atom_k, c, handle, handle_dgemm, j, jk_idx, jsize, jstart, k, ksize, &
+         kstart, l, l0, n_grid_pair, nj1, nj2, nj3, point, ri, sj1, sj2, sj3, sk1, sk2, sk3
       INTEGER, ALLOCATABLE                               :: grid_index(:)
-      LOGICAL                                            :: screened
+      INTEGER, DIMENSION(3)                              :: cell_j_vec, cell_k_vec
+      LOGICAL                                            :: any_kept, screened
       LOGICAL, ALLOCATABLE                               :: skip_grid_point(:, :)
       REAL(KIND=dp)                                      :: pair_factor
       REAL(KIND=dp), ALLOCATABLE                         :: grid_result(:, :)
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: d_lp_prv, int_2d_prv, rho_chunk
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: int_3c_prv
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: int_3c_prv, int_3c_sum
       TYPE(gw_3c_ws_type)                                :: ws
 
       CALL timeset(routineN, handle)
 
+      ! Periodic images of the two AO atoms about the RI atom P, which is pinned at cell (0,0,0).
+      ! For a molecule cell%perd = 0 and the loops below collapse to the single (0,0,0)x(0,0,0)
+      ! triple, which is exactly the plain molecular expression, so one routine serves both
+      ! drivers. The triangle-inequality screen inside build_3c_integral_block_ctx rejects the
+      ! bulk of the image triples, so the 27 x 27 candidates collapse to adjacent cells in
+      ! practice.
+      nj1 = bs_env%ri_rs%cell%perd(1)
+      nj2 = bs_env%ri_rs%cell%perd(2)
+      nj3 = bs_env%ri_rs%cell%perd(3)
+
       !$OMP PARALLEL DEFAULT(NONE) &
       !$OMP SHARED(skip_grid_point, bs_env, ctx, phi_val, ao_col_map, d_lp, n_grid_total, n_loc_ri, atom_P, max_ao_size, &
       !$OMP        atom_j_mepos, atom_j_stride) &
-      !$OMP PRIVATE(grid_index, grid_result, n_grid_pair, point, pair_factor, &
+      !$OMP SHARED(nj1, nj2, nj3) &
+      !$OMP PRIVATE(grid_index, grid_result, n_grid_pair, point, pair_factor, any_kept, &
       !$OMP         atom_j, atom_k, c, handle_dgemm, j, jk_idx, jsize, jstart, k, ksize, kstart, &
-      !$OMP         l, l0, ri, screened, d_lp_prv, int_2d_prv, rho_chunk, int_3c_prv, ws)
+      !$OMP         l, l0, ri, screened, d_lp_prv, int_2d_prv, rho_chunk, int_3c_prv, ws, &
+      !$OMP         int_3c_sum, cell_j_vec, cell_k_vec, sj1, sj2, sj3, sk1, sk2, sk3)
 
       CALL gw_3c_ws_create(ws, ctx)
       ALLOCATE (int_3c_prv(max_ao_size, max_ao_size, n_loc_ri))
+      ALLOCATE (int_3c_sum(max_ao_size, max_ao_size, n_loc_ri))
       ALLOCATE (int_2d_prv(max_ao_size*max_ao_size, n_loc_ri))
       ALLOCATE (rho_chunk(grid_chunk, max_ao_size*max_ao_size))
       ALLOCATE (d_lp_prv(n_grid_total, n_loc_ri))
@@ -678,22 +691,47 @@ CONTAINS
             pair_factor = 1.0_dp
             IF (atom_j /= atom_k) pair_factor = 2.0_dp
 
-            int_3c_prv(1:jsize, 1:ksize, 1:n_loc_ri) = 0.0_dp
+            int_3c_sum(1:jsize, 1:ksize, 1:n_loc_ri) = 0.0_dp
+            any_kept = .FALSE.
 
-            ! Compute B_{μν,P} = (μν|P); ctx-internal triangle-inequality screening on
+            ! Compute B_{μν,P} = Σ_RS (μ^R ν^S|P); ctx-internal triangle-inequality screening on
             ! kind_radius sets `screened=.TRUE.` for negligible triples.
-            CALL build_3c_integral_block_ctx(int_3c_prv(1:jsize, 1:ksize, 1:n_loc_ri), &
-                                             ctx, ws, atom_j=atom_j, atom_k=atom_k, atom_i=atom_P, &
-                                             screened=screened)
+            DO sj3 = -nj3, nj3
+            DO sj2 = -nj2, nj2
+            DO sj1 = -nj1, nj1
+               cell_j_vec = [sj1, sj2, sj3]
+               DO sk3 = -nj3, nj3
+               DO sk2 = -nj2, nj2
+               DO sk1 = -nj1, nj1
+                  cell_k_vec = [sk1, sk2, sk3]
 
-            IF (screened) CYCLE
+                  int_3c_prv(1:jsize, 1:ksize, 1:n_loc_ri) = 0.0_dp
+                  CALL build_3c_integral_block_ctx(int_3c_prv(1:jsize, 1:ksize, 1:n_loc_ri), &
+                                                   ctx, ws, atom_j=atom_j, atom_k=atom_k, &
+                                                   atom_i=atom_P, cell_j=cell_j_vec, &
+                                                   cell_k=cell_k_vec, cell_i=[0, 0, 0], &
+                                                   screened=screened)
+                  IF (screened) CYCLE
+
+                  any_kept = .TRUE.
+                  int_3c_sum(1:jsize, 1:ksize, 1:n_loc_ri) = &
+                     int_3c_sum(1:jsize, 1:ksize, 1:n_loc_ri) + &
+                     int_3c_prv(1:jsize, 1:ksize, 1:n_loc_ri)
+               END DO
+               END DO
+               END DO
+            END DO
+            END DO
+            END DO
+
+            IF (.NOT. any_kept) CYCLE
 
             ! Flatten 3D B_{μν, P} tensor to 2D B_{(μν), P} matrix for BLAS
             DO ri = 1, n_loc_ri
                DO k = 1, ksize
                   DO j = 1, jsize
                      jk_idx = (k - 1)*jsize + j
-                     int_2d_prv(jk_idx, ri) = int_3c_prv(j, k, ri)
+                     int_2d_prv(jk_idx, ri) = int_3c_sum(j, k, ri)
                   END DO
                END DO
             END DO
@@ -734,7 +772,7 @@ CONTAINS
                                          d_lp_prv(1:n_grid_total, 1:n_loc_ri)
       !$OMP END CRITICAL (compute_d_lp_reduce)
 
-      DEALLOCATE (int_3c_prv, int_2d_prv, rho_chunk, d_lp_prv, grid_index, grid_result)
+      DEALLOCATE (int_3c_prv, int_3c_sum, int_2d_prv, rho_chunk, d_lp_prv, grid_index, grid_result)
       CALL gw_3c_ws_release(ws)
 
       !$OMP SINGLE
