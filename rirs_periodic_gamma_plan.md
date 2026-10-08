@@ -175,3 +175,88 @@ untouched:
 That needs its own configure, and the first attempt silently produced a binary **without libint**,
 which aborts at the start of any GW run. The working configure adds
 `-DCP2K_USE_LIBINT2=ON` plus `-DLibint2_DIR=<spack libint-2.11.2>/lib/cmake/libint2`.
+
+## Per-state comparison on bulk Si: what works and what does not
+
+`si1_ri33_{rirs,tensor}.inp`, 8 atoms, a = 5.431 A, DZVP-MOLOPT-GTH / RI_33, DOS k = Gamma.
+Both runs print `bandstructure_SCF_and_G0W0`, so every stage can be compared state by state.
+
+### Timings (8 ranks, noctua login node)
+
+| run | wall | chi per tau | W per k batch |
+|---|---|---|---|
+| RI-RS  |  404 s | 100.0 s (10 points) | 40.4 s |
+| tensor | 5067 s | 175.8 s             | 39.7 s |
+
+At 64 atoms the chi gap is much wider: RI-RS 55 s vs tensor 1478 s per time point, i.e. 27x. The
+RI-RS speedup is real, but at these sizes `get_W_MIC` -- which is **shared** with the tensor code
+and scales as n_RI^3 -- already costs more than everything RI-RS accelerates (10750 s per k batch
+at 64 atoms with RI_TZ). Goal 1 is met; the next bottleneck is not in the RI-RS code.
+
+### Sigma^x is fine, Sigma^c is not
+
+eps_nk^DFT and v_nk^xc are exactly degenerate in both codes, so the SCF and the grid are consistent.
+
+* **Sigma^x**: RI-RS agrees with tensor to ~0.1 eV and breaks the symmetry degeneracy by only
+  0.03-0.08 eV. That is the RI-RS grid fit error -- the grid is not symmetry adapted, so some
+  splitting is expected at that level.
+* **Sigma^c**: RI-RS is uniformly **2-8x too negative** (mean ~3.8x) and breaks degeneracy by
+  **1-3 eV**.
+
+      eps^DFT  mult |  spread Sigma^x        |  spread Sigma^c
+                    | tensor   RI-RS         | tensor   RI-RS
+       -2.266    6  |  0.000   0.045         |  0.039   2.151
+        2.670    6  |  0.000   0.068         |  0.020   1.157
+        6.342    6  |  0.000   0.080         |  0.060   3.133
+       15.843    6  |  0.000   0.328         |  0.029   1.873
+       17.703    6  |  0.000   0.031         |  0.058   1.644
+
+### This is pre-existing, not from this port
+
+The same input run with the *other* periodic RI-RS implementation (the 1442-line
+`gw_large_cell_gamma_ri_rs.F` in `implementation/github/cp2k-dev`) gives **the same numbers to
+1 meV**: the only differences in the whole file are five high-lying virtuals between 43 and 96 eV,
+each 0.001 eV. So
+
+1. the Sigma^c defect is a property of the periodic RI-RS Gamma formulation, not of this branch, and
+2. the agreement is an independent validation of the port -- two separately written drivers, one of
+   them 235 lines on top of the shared molecular code, land on the same answer.
+
+### Why Sigma^c and not Sigma^x: the cell is far outside the MIC window
+
+The run prints, for this cell,
+
+    r_AO = 8.696 A      r_RI = 4.757 A      a_min/2 = 2.72 A
+
+The AUX-path requirement is `a_min/2 >~ r_G + 2 r_RI`, violated here by about a factor 6. Every RI-RS
+grid operator is built from Bloch-summed phi on a grid confined to one cell, so
+
+    Sigma^c_lambda,sigma = sum_{l,l'} [sum_R1 phi] [sum_R2 G] [sum_R3 W] [sum_R4 phi]
+
+while the Gamma-point expression needs a *single* image sum tying the four factors together. The
+product of Bloch sums is not the Bloch sum of products, and with r_AO/a = 1.6 many images are in
+range, so each grid pair collects image contributions multiplicatively. That is consistent with both
+observations: a systematic overcount of a few, and state-dependent scatter.
+
+Sigma^x escapes it because its second grid operator is the **truncated** Coulomb metric
+(`CUTOFF_RADIUS_RI`, 3.0 A by default) rather than W: short-ranged enough that essentially one image
+contributes, so `Z V Z^T` stays clean.
+
+This also explains why the periodic H2O regtest agrees with the tensor code to 0.017 eV in a 6 A box
+despite formally violating the same condition: a molecule in vacuum has negligible density in the
+wrapped tails, so only R = 0 contributes whatever the formal radii say.
+
+### Consequence for goal 2
+
+The evidence does not support the hope that RI-RS converges at *smaller* supercells. The grid-space
+Sigma^c contraction needs `a_min/2` above the range of both G and W, which is a **stronger** cell
+requirement than the tensor code's, not a weaker one. Making RI-RS work at small cells means keeping
+explicit R dependence in the grid operators and contracting `sum_R G^R o W^R` instead of multiplying
+Bloch sums -- a change to the formulation, well beyond porting the molecular optimizations.
+
+Two things would settle it, both too heavy for a login node:
+
+* n=2 (64 atoms, a = 10.86 A, `a_min/2` = 5.43 A): if the mechanism above is right, the Sigma^c
+  overcount factor should fall and the degeneracy spread shrink. Cost is dominated by
+  `get_W_MIC` at n_RI = 2112 (n_RI^3), order hours.
+* n=4 (512 atoms, 21.72 A), the cell where the tensor code is said to converge.
