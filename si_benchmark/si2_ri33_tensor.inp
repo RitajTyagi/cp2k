@@ -1,0 +1,91 @@
+# Bulk silicon, conventional cubic cell (8 atoms, a = 5.431 Angstrom), diamond structure.
+# Supercell size via MULTIPLE_UNIT_CELL, which must appear in BOTH &CELL and &TOPOLOGY.
+#   n=1:   8 atoms,  5.43 A      n=3: 216 atoms, 16.29 A
+#   n=2:  64 atoms, 10.86 A      n=4: 512 atoms, 21.72 A
+#
+# Basis: DZVP-MOLOPT-GTH (13 AO/atom) with the matching optimized RI_33 auxiliary basis
+# (33 RI/atom, RI/AO = 2.5 -- the standard ratio, and what AUTO_RI targets by default).
+# The earlier variant used RI_TZ at 76 RI/atom, i.e. RI/AO = 5.8, which made the dielectric
+# stage (epsilon and W as n_RI^2 complex matrices at every k and omega) dominate everything.
+&GLOBAL
+  PRINT_LEVEL MEDIUM
+  PROJECT si2_ri33_tensor
+  RUN_TYPE ENERGY
+  &TIMINGS
+    THRESHOLD 0.001
+  &END TIMINGS
+&END GLOBAL
+
+&FORCE_EVAL
+  METHOD Quickstep
+  &DFT
+    BASIS_SET_FILE_NAME BASIS_MOLOPT
+    BASIS_SET_FILE_NAME BASIS_RI_MOLOPT
+    POTENTIAL_FILE_NAME GTH_POTENTIALS
+    SORT_BASIS EXP
+    &MGRID
+      CUTOFF 300
+      REL_CUTOFF 40
+    &END MGRID
+    &QS
+      EPS_DEFAULT 1.0E-12
+      METHOD GPW
+    &END QS
+    &SCF
+      ADDED_MOS -1
+      EPS_SCF 1.0E-6
+      MAX_SCF 100
+      SCF_GUESS ATOMIC
+      &MIXING T
+        ALPHA 0.4
+        METHOD BROYDEN_MIXING
+      &END MIXING
+    &END SCF
+    &XC
+      &XC_FUNCTIONAL PBE
+      &END XC_FUNCTIONAL
+    &END XC
+  &END DFT
+  &PROPERTIES
+    &BANDSTRUCTURE
+      # Gamma-only supercell: the HOMO/LUMO/gap to converge against cell size are the
+      # Gamma-point values. Asking for other DOS k-points would require reconstructing
+      # S(k) from S(Gamma) by the minimum image, which is not positive definite at these
+      # cell sizes (check_positive_definite_overlap_mat aborts, for both implementations).
+      &DOS
+        KPOINTS 1 1 1
+      &END DOS
+      &GW
+        FREQ_MAX_FIT 27.211
+        KPOINTS_W 2 2 2
+        NUM_TIME_FREQ_POINTS 10
+      &END GW
+    &END BANDSTRUCTURE
+  &END PROPERTIES
+  &SUBSYS
+    &CELL
+      ABC [angstrom] 5.431 5.431 5.431
+      MULTIPLE_UNIT_CELL 2 2 2
+      PERIODIC XYZ
+    &END CELL
+    &COORD
+      SCALED .TRUE.
+      Si   0.00000  0.00000  0.00000
+      Si   0.25000  0.25000  0.25000
+      Si   0.50000  0.50000  0.00000
+      Si   0.75000  0.75000  0.25000
+      Si   0.50000  0.00000  0.50000
+      Si   0.75000  0.25000  0.75000
+      Si   0.00000  0.50000  0.50000
+      Si   0.25000  0.75000  0.75000
+    &END COORD
+    &KIND Si
+      BASIS_SET ORB DZVP-MOLOPT-GTH-q4
+      BASIS_SET RI_AUX RI_33_4_4_2_1_0_0_0_5.5e-04
+      POTENTIAL GTH-PBE-q4
+    &END KIND
+    &TOPOLOGY
+      MULTIPLE_UNIT_CELL 2 2 2
+    &END TOPOLOGY
+  &END SUBSYS
+&END FORCE_EVAL
