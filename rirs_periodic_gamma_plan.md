@@ -260,3 +260,64 @@ Two things would settle it, both too heavy for a login node:
   overcount factor should fall and the degeneracy spread shrink. Cost is dominated by
   `get_W_MIC` at n_RI = 2112 (n_RI^3), order hours.
 * n=4 (512 atoms, 21.72 A), the cell where the tensor code is said to converge.
+
+## n=2 settles it: the 8-atom result was a domain-of-validity artefact, not a bug
+
+`si2_ri33_rirs.inp`, 64 atoms, a = 10.86 A, so `a_min/2` doubles from 2.72 to 5.43 A. Everything
+else identical (RI_33, `KPOINTS_W 2 2 2`, `&DOS KPOINTS 1 1 1`, 10 time points). One node,
+16 MPI x 8 OMP: **1062 s**.
+
+| quantity | n=1 (a_min/2 = 2.72 A) | n=2 (a_min/2 = 5.43 A) |
+|---|---|---|
+| Sigma^x spread over degenerate sets | 0.03 - 0.33 eV | **0.000 eV** |
+| Sigma^c spread over degenerate sets | 1.2 - 3.1 eV | **0.006 - 0.018 eV** |
+
+Sigma^x is now *exactly* degenerate and the Sigma^c spread has fallen by a factor of order 100-200.
+Doubling the minimum image distance removed the symmetry breaking almost entirely, which is what
+the "product of Bloch sums is not the Bloch sum of products" explanation predicts and what a genuine
+bug would not do. The periodic RI-RS Gamma path is behaving correctly; the 8-atom cell was simply
+outside the method's window, with r_AO = 8.70 A against `a_min/2` = 2.72 A.
+
+The earlier conclusion drawn from n=1 alone -- that RI-RS needs *larger* cells than the tensor code
+-- does not survive this. What n=1 showed was a cell six times too small for the AUX condition, not
+a property of the formulation.
+
+### Still open at n=2
+
+Sigma^c comes out **positive**, about +2.7 to +3.3 eV on the occupied states, where the tensor code
+at n=1 gave -0.4 to -1.5 eV. The degeneracy is clean, so this is a magnitude question, not a
+symmetry one, and it needs the tensor reference at the same cell to judge. Absolute gaps at these
+cell sizes are meaningless anyway (Si G0W0: 3.68 eV at n=1 RI-RS, 5.75 eV at n=1 tensor, 3.60 eV at
+n=2 RI-RS, against ~1.2 eV converged), because a Gamma-only supercell with `KPOINTS_W 2 2 2`
+converges slowly -- which is exactly the convergence this sweep is meant to map.
+
+`si2_ri33_tensor` needs more than one hour: chi alone is 296 s per time point. It is chained over
+six 1 h passes using `SCF_GUESS RESTART`, which resumes from the chi matrices written by the
+previous pass; each pass exits immediately once `DONE.txt` exists.
+
+### W cost: the n_RI^3 estimate was far too pessimistic
+
+n=2 RI-RS completed in 1062 s where a naive n_RI^3 extrapolation from n=1 predicted ~13 h on a node.
+`get_W_MIC` is not cubic-dominated in this range. The hBN sweep below is sized on measurement
+rather than on that extrapolation.
+
+## 2D hBN supercell sweep
+
+`claude_periodic_test/hbn/`, built from the existing `hbn-rirs/gw/hbn.inp`:
+aug-SZV-MOLOPT-GTH-tier-2 (13 AO/atom), RI 26 (B) / 45 (N) = 35.5 RI/atom, `PERIODIC XY` with MT
+Poisson, `CUTOFF_RADIUS_RI 5`, `REGULARIZATION_RI 0.001`, 10 time points, `&DOS KPOINTS 1 1 1`.
+n = 5, 6, 7, 8, 10, 12, 14, each with RI-RS and tensor, as a job array capped at two concurrent.
+
+2D is a much better probe than bulk: `a_min/2` grows linearly in n while the atom count grows as
+n^2, so the minimum-image margin improves far faster per unit cost. n=8 already reaches the ~20 A
+where the tensor code is said to converge.
+
+| n | atoms | in-plane a | a_min/2 | n_RI |
+|---|---|---|---|---|
+|  5 |  50 | 12.5 A |  6.3 A |  1775 |
+|  8 | 128 | 20.0 A | 10.0 A |  4544 |
+| 10 | 200 | 25.0 A | 12.5 A |  7100 |
+| 14 | 392 | 35.1 A | 17.5 A | 13916 |
+
+`EXTENDED_FFT_LENGTHS` had to be dropped from the old input -- the keyword no longer exists in
+current CP2K and aborts the parser.
