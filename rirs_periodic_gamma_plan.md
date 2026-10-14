@@ -321,3 +321,53 @@ where the tensor code is said to converge.
 
 `EXTENDED_FFT_LENGTHS` had to be dropped from the old input -- the keyword no longer exists in
 current CP2K and aborts the parser.
+
+## hBN results: the 2D Coulomb treatment is where RI-RS and tensor part
+
+### RI-RS convergence curve (2D, CUTOFF_RADIUS_RI 5, one node, 8 MPI x 16 OMP)
+
+| n | atoms | in-plane a | a_min/2 | G0W0 gap | wall |
+|---|---|---|---|---|---|
+|  5 |  50 | 12.51 A |  6.26 A | 11.848 eV |   327 s |
+|  6 |  72 | 15.01 A |  7.51 A |  9.737 eV |   693 s |
+|  7 |  98 | 17.52 A |  8.76 A |  9.659 eV |  1519 s |
+|  8 | 128 | 20.02 A | 10.01 A |  9.428 eV |  3437 s |
+| 10 | 200 | 25.02 A | 12.51 A |  8.632 eV |  6050 s |
+| 12 | 288 | 30.03 A | 15.01 A |  7.544 eV | 20280 s |
+
+The Gamma-only supercell gap is **still falling at 30 A**, so 2D hBN is not converged even there --
+a harder case than the ~20 A quoted for bulk. RI-RS put 288 atoms within 5.6 h on a single node.
+
+### Which of the three differences causes the Sigma^c discrepancy
+
+hBN differs from Si in three ways at once, so each was isolated at n=5 with both codes:
+
+| variant | mean abs dSigma^c | mean abs dSigma^x | gap RI-RS | gap tensor |
+|---|---|---|---|---|
+| baseline: 2D, `CUTOFF_RADIUS_RI 5` | 3.784 eV | 0.006 eV | 11.848 | 11.425 |
+| 2D, `CUTOFF_RADIUS_RI 3`           | 3.517 eV | 0.007 eV |  9.686 |  9.581 |
+| **3D stack (`PERIODIC XYZ`), RI 5**| **0.585 eV** | 0.005 eV | 11.890 | 12.466 |
+
+* **z-wrapping under `PERIODIC XY` -- ruled out.** `pbc1` and `pbc3` in `subsys/cell_types.F` both
+  multiply each component by `cell%perd`, so nothing wraps along the vacuum axis.
+* **`CUTOFF_RADIUS_RI` -- ruled out.** Dropping 5 -> 3 A moves the absolute gap by over 2 eV in
+  *both* codes but leaves the disagreement at 3.5 eV. It is an accuracy knob, not the cause.
+* **The 2D Coulomb / k-extrapolation treatment -- confirmed.** Making the same cell `PERIODIC XYZ`,
+  changing nothing else, collapses the Sigma^c discrepancy by a factor of 6.5. The aug- basis is
+  identical across all three variants, so it is not the basis either.
+
+Sigma^x agrees to 0.005-0.007 eV in every variant, which keeps the Z_lP fit and phi out of the
+frame: the discrepancy travels through chi -> W. In 2D the Coulomb kernel V(k) ~ 1/|k| diverges at
+Gamma and is handled by the extrapolation weights `wkp_s_p` / `wkp_no_extra` selected on
+`bs_env%l_RI` in `MIC_contribution_from_ikp`. Those weights are applied to a chi that the two codes
+build differently, and the 1/|k| divergence amplifies whatever difference exists at the Gamma term.
+That is the next thing to look at.
+
+### Restart granularity: a trap worth recording
+
+The GW restart is staged SCF (wfn) -> chi (per-tau matrices) -> **W^MIC (all or nothing)** -> Sigma^c.
+`W^MIC` is written only once every k-batch has completed, so a job killed in the middle of W discards
+the whole stage and the next pass repeats it from batch 1. Chained one-hour passes therefore make no
+progress at all on any case whose W stage exceeds the walltime -- two consecutive `p3d_rirs` passes
+stopped at the identical batch 15/35. Si n=2 tensor only resumed cleanly because it died *after* W,
+during Sigma^c. Size the walltime to fit the entire W stage.
