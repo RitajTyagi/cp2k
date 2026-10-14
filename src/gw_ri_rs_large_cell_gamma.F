@@ -129,7 +129,7 @@ CONTAINS
       !      χ_ll'(iτ)       = G^occ_ll'(i|τ|) ∘ G^vir_ll'(i|τ|)
       !      χ_PQ(iτ)        = Σ_ll' Z_lP χ_ll'(iτ) Z_l'Q
       ! ==============================================================================
-      CALL get_mat_chi_Gamma_tau(bs_env, bs_env%mat_chi_Gamma_tau, &
+      CALL get_mat_chi_Gamma_tau(bs_env, qs_env, bs_env%mat_chi_Gamma_tau, &
                                  bs_env%ri_rs%mat_phi_mu_l, bs_env%ri_rs%mat_Z_lP)
 
       ! ==============================================================================

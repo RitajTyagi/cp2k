@@ -173,7 +173,7 @@ CONTAINS
       !      χ_ll'(iτ)       = G^occ_ll'(i|τ|) ∘ G^vir_ll'(i|τ|) (element-wise)
       !      χ_PQ(iτ)        = Σ_ll' Z_lP χ_ll'(iτ) Z_l'Q
       ! ==============================================================================
-      CALL get_mat_chi_Gamma_tau(bs_env, bs_env%mat_chi_Gamma_tau, &
+      CALL get_mat_chi_Gamma_tau(bs_env, qs_env, bs_env%mat_chi_Gamma_tau, &
                                  bs_env%ri_rs%mat_phi_mu_l, bs_env%ri_rs%mat_Z_lP)
 
       ! ==============================================================================
@@ -681,9 +681,10 @@ CONTAINS
 !> \param mat_phi_mu_l AO values ϕ_μ(r_l) on the RI-RS grid
 !> \param mat_Z_lP RI-RS fitting matrix Z_lP
 ! **************************************************************************************************
-   SUBROUTINE get_mat_chi_Gamma_tau(bs_env, mat_chi_Gamma_tau, mat_phi_mu_l, mat_Z_lP)
+   SUBROUTINE get_mat_chi_Gamma_tau(bs_env, qs_env, mat_chi_Gamma_tau, mat_phi_mu_l, mat_Z_lP)
 
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: mat_chi_Gamma_tau
       TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_phi_mu_l, mat_Z_lP
 
@@ -741,6 +742,12 @@ CONTAINS
             CALL dbcsr_release(matrix_G_vir_ao)
 
          END DO ! ispin
+
+         ! Write χ_PQ(iτ,k=0) exactly as the tensor path does, so that a run killed later
+         ! (typically inside W) resumes from the χ already on disk instead of recomputing it,
+         ! and so that the two implementations can be compared at this stage directly.
+         CALL fm_write(bs_env%fm_RI_RI, i_t, bs_env%chi_name, qs_env, &
+                       matrix=mat_chi_Gamma_tau(i_t)%matrix)
 
          ! Sparsity reports
          IF (i_t == 1) THEN
