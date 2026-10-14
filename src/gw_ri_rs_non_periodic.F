@@ -45,7 +45,8 @@ MODULE gw_ri_rs_non_periodic
                                               reserve_blocks_within_radius,&
                                               resolve_grid_panels
    USE gw_ri_rs_utils,                  ONLY: evaluate_ao_basis_on_points,&
-                                              precompute_ri_rs_radii
+                                              precompute_ri_rs_radii,&
+                                              ri_rs_bloch_sum_phi
    USE gw_tensor_large_cell_Gamma,      ONLY: Fourier_transform_w_to_t,&
                                               compute_fm_chi_Gamma_freq,&
                                               create_fm_W_MIC_time,&
@@ -640,7 +641,7 @@ CONTAINS
          ! for the periodic Gamma-point driver, which shares this routine.
          CALL evaluate_ao_basis_on_points(atom_col_buffer, ri_rs_grid_points, ao_basis, &
                                           particle_set(iatom)%r, cell, cutoff_squared=r2_threshold, &
-                                          sum_periodic_images=.TRUE.)
+                                          sum_periodic_images=ri_rs_bloch_sum_phi())
 
          ! Slice the dense column into the atom-aligned grid row-blocks and insert into DBCSR
          DO i_blk = 1, num_grid_chunks

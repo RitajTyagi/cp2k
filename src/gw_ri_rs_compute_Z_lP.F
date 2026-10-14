@@ -40,7 +40,8 @@ MODULE gw_ri_rs_compute_Z_lP
                                               solve_D_lp_distributed,&
                                               store_Z_lP_columns
    USE gw_ri_rs_utils,                  ONLY: evaluate_ao_on_points,&
-                                              exact_min_image_dist2
+                                              exact_min_image_dist2,&
+                                              ri_rs_bloch_sum_phi
    USE gw_utils_compute_integrals,      ONLY: build_3c_integral_block_ctx,&
                                               gw_3c_ctx_create,&
                                               gw_3c_ctx_release,&
@@ -2545,13 +2546,22 @@ CONTAINS
       ! Per-atom sphere size: n_local_grid(P) = number of l with |r_l - R_P| <= cutoff_ri(P).
       ! It sets both the memory footprint (D_local is n_local_grid^2) and the solve
       ! cost (~n_local_grid^3), so it drives classification and the LPT load balancing.
+      !
+      ! The distance has to be the SAME minimum-image distance that the production sphere
+      ! selection uses (collect_sphere_grid_points below), not the Euclidean one: under PBC
+      ! d_MIC <= d_euclid, so a Euclidean test admits fewer points than the sphere actually
+      ! holds. That underestimates n_local_grid, hence peak_bytes, and atoms that need the
+      ! distributed solve get classified "small" and run out of memory in the single-rank
+      ! LAPACK path. For a molecule cell%perd = 0 and this reduces to the Euclidean distance,
+      ! so the molecular classification is unchanged.
       ALLOCATE (n_local_grid_atom(natom), small_list(natom), big_list(natom))
       DO P_loop_atom = 1, natom
          pos_P(:) = particle_set(P_loop_atom)%r(:)
          cutoff_ri = cutoff_ri_per_atom(P_loop_atom)
          n_local_grid = 0
          DO l = 1, n_grid_total
-            IF (SUM((ri_rs_grid_points(1:3, l) - pos_P(1:3))**2) <= cutoff_ri**2) THEN
+            IF (exact_min_image_dist2(ri_rs_grid_points(1:3, l), pos_P(1:3), &
+                                      bs_env%ri_rs%cell) <= cutoff_ri**2) THEN
                n_local_grid = n_local_grid + 1
             END IF
          END DO
@@ -2763,7 +2773,7 @@ CONTAINS
          CALL evaluate_ao_on_points(phi_local(:, col_start:col_end), sphere_grid, &
                                     ri_atom, particle_set, qs_kind_set, cell, &
                                     cutoff_squared=r2_threshold, &
-                                    sum_periodic_images=.TRUE.)
+                                    sum_periodic_images=ri_rs_bloch_sum_phi())
       END DO
 
       DEALLOCATE (sphere_grid)

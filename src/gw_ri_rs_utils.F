@@ -28,7 +28,7 @@ MODULE gw_ri_rs_utils
 
    PUBLIC :: evaluate_ao_basis_on_points, evaluate_ao_on_points, filter_grid_to_voronoi, &
              exact_min_image_dist2, get_rirs_cluster_atoms, min_image_dist2, &
-             precompute_ri_rs_radii
+             precompute_ri_rs_radii, ri_rs_bloch_sum_phi
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_ri_rs_utils'
 
@@ -439,5 +439,29 @@ CONTAINS
       dist2 = DOT_PRODUCT(displacement, displacement)
 
    END FUNCTION exact_min_image_dist2
+
+! **************************************************************************************************
+!> \brief Whether the AO on the RI-RS grid is Bloch-summed over the periodic images of its centre.
+!>
+!>        TEMPORARY DIAGNOSTIC SWITCH. The Gamma-point k-reconstruction in fm_gamma_to_kp assigns
+!>        ONE minimum-image phase per atom pair, chi_PQ(k) = e^(i k R_MIC) chi_PQ(Gamma), which is
+!>        consistent only if each block holds a single image. Bloch-summing phi instead makes
+!>        chi_PQ(Gamma) = sum_R chi_PQ^R, so every image but the nearest carries the wrong phase.
+!>        Setting GW_RIRS_PHI_MIC=1 evaluates phi at the minimum-image displacement only, matching
+!>        the convention of every other operator in the large-cell-Gamma code, so the two can be
+!>        compared directly. Unset (the default) keeps the Bloch sum and changes nothing.
+!> \return .TRUE. to Bloch-sum phi, .FALSE. for the minimum image only
+! **************************************************************************************************
+   FUNCTION ri_rs_bloch_sum_phi() RESULT(bloch_sum)
+      LOGICAL                                            :: bloch_sum
+
+      CHARACTER(LEN=8)                                   :: env_value
+      INTEGER                                            :: env_status
+
+      env_value = ''
+      CALL GET_ENVIRONMENT_VARIABLE("GW_RIRS_PHI_MIC", env_value, status=env_status)
+      bloch_sum = .NOT. (env_status == 0 .AND. TRIM(env_value) == '1')
+
+   END FUNCTION ri_rs_bloch_sum_phi
 
 END MODULE gw_ri_rs_utils
