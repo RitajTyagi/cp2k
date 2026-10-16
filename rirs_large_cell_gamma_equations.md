@@ -263,3 +263,82 @@ The open questions before committing to it are the ones to settle on paper first
    locality bound differs from the AO-product bound the tensor code screens on;
 3. whether the Hadamard product `G^R ∘ (Z W^R Z^T)` can reuse the existing panel machinery unchanged,
    given both operands now carry the same `R`.
+
+---
+
+## 7. Grid-resolved MIC (notes Sec. 7-8): measured feasibility
+
+### 7.1 How crude is the atom-pair MIC?
+
+The grids were reproduced exactly from `data/ri_rs_grid/*.ion` (336 pts/atom for B and N -> 16 800
+for hBN n=5; 436 for Si -> 27 904 for Si n=2, both matching the runs). For sampled `(P,Q)` blocks the
+combined lattice vector of Eqs.~(101)/(104),
+
+$$\boldsymbol{\mathcal R}(\ell,\ell',P,Q)=\mathbf R_{\mathrm{MIC}}(\ell,\ell')
++\mathbf R_{\mathrm{MI}}(\ell',Q)-\mathbf R_{\mathrm{MI}}(\ell,P),$$
+
+was histogrammed over grid pairs inside the `a_min/2` window:
+
+| system | `a_min/2` | `cutoff_ri` | distinct `R` per `(P,Q)` block | weight in `R = 0` |
+|---|---|---|---|---|
+| hBN n=5 | 5.42 A | 11.21 A | median **8** (max 9) | **0.385** |
+| Si n=2 | 5.43 A | 7.76 A | median **19** (max 26) | **0.230** |
+
+The current code forces *all* of that weight onto a single phase per `(P,Q)` block. At these cells
+only 23-38 % of the contribution actually belongs to `R = 0`, so 62-77 % is mis-phased at every
+`k != 0`. That is a quantitative measure of how much accuracy the grid-resolved MIC can recover, and
+it is large.
+
+Consistency check: at n=5 the measured count is 8, which is also `(14/5)^2 = 7.8`, the number of
+images needed to cover the n=14 volume. So `n_R ~ M` holds empirically.
+
+### 7.2 Memory: large sparse cell vs small cell plus `R`
+
+Per-rank at **8 MPI ranks on a 256 GB node (32 GB/rank)**, hBN, from measured components
+(`Z_lP` solve peak and panel peak are printed by the code; `W(i tau)`, `eps`, `W(k)` are dense `cp_fm`,
+block-cyclic distributed):
+
+| cell | atoms | `n_RI` | `Z_lP` solve | `W(i tau)` set | `eps, W(k)` | panels | **total/rank** |
+|---|---|---|---|---|---|---|---|
+| n=5 | 50 | 1 775 | 2.3 GB | 0.03 | 0.01 | 0.5 | **2.8 GB** |
+| n=8 | 128 | 4 544 | 14.8 GB | 0.21 | 0.08 | 1.2 | **16.2 GB** |
+| n=10 | 200 | 7 100 | 18.8 GB | 0.50 | 0.20 | 1.8 | **21.3 GB** |
+| n=12 | 288 | 10 224 | 18.8 GB | 1.05 | 0.42 | 2.6 | **22.9 GB** |
+| n=14 | 392 | 13 916 | 18.8 GB | 1.94 | 0.77 | 7.0 | **28.5 GB** |
+
+Same physical volume as n=14, reached instead with a small cell plus `n_R` images:
+
+| cell | atoms | `n_RI` | `n_R` | `chi^R + W^R` | `Z_lP` solve | **total/rank** |
+|---|---|---|---|---|---|---|
+| n=5 | 50 | 1 775 | 8 | 0.28 GB | 2.3 GB | **2.5 GB** |
+| n=7 | 98 | 3 479 | 4 | 0.53 GB | 8.7 GB | **9.2 GB** |
+| n=10 | 200 | 7 100 | 2 | 1.11 GB | 18.8 GB | **19.9 GB** |
+| n=14 | 392 | 13 916 | 1 | 2.13 GB | 18.8 GB | **21.0 GB** |
+
+**Small cell plus `R` wins by about 11x** (2.5 GB vs 28.5 GB per rank for the same physics), and the
+reason is specific:
+
+* The dominant term is the **`Z_lP` Gram matrix** `D_local`, which is `N_l(cell)^2` and is *not*
+  distributed (it is one atom's solve; the classifier only splits it over a ScaLAPACK subgroup).
+  Shrinking the cell shrinks it **quadratically**: 48 524^2 -> 16 800^2, i.e. 18.8 GB -> 2.3 GB.
+* The price of `R`-resolution is paid in **PQ space**, where the objects are small *and* distributed,
+  and it grows only **linearly** in `n_R`: 0.28 GB per rank at n=5.
+* `D_local` is bounded by the integration sphere (`cutoff_ri = r_c + r_RI = 11.2 A`, 48 524 points),
+  so in the large-cell scheme it **saturates and never improves** -- it is 66 % of the n=14 budget and
+  no larger cell will reduce it. The only other lever on it is lowering `CUTOFF_RADIUS_RI`.
+
+Sparsity does not rescue the large cell at the sizes of interest: `G/chi/W` on the grid are **100 %
+dense** at hBN n=5 and Si n=2, and only reach 34.9 % at n=14. The sparsity that the large-cell
+argument relies on appears exactly where the memory has already saturated.
+
+### 7.3 What is not yet established
+
+The numbers above say the grid-resolved scheme is *affordable* and that the atom-pair MIC is *crude*.
+They do **not** show that the grid-resolved MIC is converged at n=5: prerequisite Eq.~(74) still has
+to hold for `G, chi, Sigma` at grid resolution, and with `r_AO = 9.6 A` against `a_min/2 = 5.4 A` it
+may not. Testing that needs the implementation; the honest expectation is that it shifts the required
+cell down by some factor, not that it removes the requirement.
+
+One practical advantage over the notes as written: collecting the phases into
+`chi_PQ^{\mathcal R}` and Bloch-summing in PQ space keeps every grid-space matrix **real**, which
+sidesteps the concern raised in Sec.~8 that DBCSR has no complex support.
