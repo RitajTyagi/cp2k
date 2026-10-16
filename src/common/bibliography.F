@@ -102,7 +102,8 @@ MODULE bibliography
                             Cances2000, Herbst2022, Zhang2025, Gresch2017, Soluyanov2011, Dixon2023, Doll2025, &
                             Wong2026, Loring2015, EsteveParedes2023, Cerjan2023, Bairnsfather2026, Davidson1975, &
                             Olsen1988, Stratmann1998, Vecharynski2017, Stathopoulos1998, Bai2012, &
-                            Fukaya2014, Schreder2024_3, Pizzi2020, Marzari1997, Souza2001
+                            Fukaya2014, Schreder2024_3, Pizzi2020, Marzari1997, Souza2001, &
+                            Roy2026, Becke2018
 
 CONTAINS
 
@@ -1327,6 +1328,20 @@ CONTAINS
                          title="Maximally localized Wannier functions for entangled energy bands", &
                          source="Phys. Rev. B", volume="65", pages="035109", &
                          year=2001, doi="10.1103/PhysRevB.65.035109")
+
+      CALL add_reference(key=Roy2026, &
+                         authors=s2a("R. Roy", "A. Ghosal"), &
+                         title="Simple Model for Challenging Excited States: Low-Lying, Core-Level "// &
+                         "and Conical-Intersection Regimes", &
+                         source="J. Chem. Theory Comput.", volume="22", pages="8453-8465", &
+                         year=2026, doi="10.1021/acs.jctc.6c00850")
+
+      CALL add_reference(key=Becke2018, &
+                         authors=s2a("A. D. Becke"), &
+                         title="Singlet-triplet splittings from the virial theorem and "// &
+                         "single-particle excitation energies", &
+                         source="J. Chem. Phys.", volume="148", pages="044112", &
+                         year=2018, doi="10.1063/1.5012033")
 
       CALL add_reference(key=Monkhorst1976, &
                          authors=s2a("H. J. Monkhorst", "J. D. Pack"), &

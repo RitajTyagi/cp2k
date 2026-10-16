@@ -236,6 +236,10 @@ MODULE input_constants
    INTEGER, PARAMETER, PUBLIC               :: momtype_mom = 0, &
                                                momtype_imom = 1
 
+   ! How the exciton integral K_if = (if|if) of the BE exciton model is evaluated
+   INTEGER, PARAMETER, PUBLIC               :: be_kif_grid = 1, &
+                                               be_kif_analytic = 2
+
    INTEGER, PARAMETER, PUBLIC               :: almo_frz_none = 0, &
                                                almo_frz_isolated = 1, &
                                                almo_frz_crystal = 2, &

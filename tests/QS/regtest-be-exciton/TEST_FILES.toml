@@ -1,0 +1,16 @@
+# runs are executed in the same order as in this file
+# Becke exciton (BE) model, &PROPERTIES&BE_EXCITON: E_S = E_T + K_if, K_if = (if|if)
+# H2O PBE / DZVP-GTH (GPW), isolated, ground state E_GS = -17.2637001007
+# 4 (beta) -> 5 (alpha) triplet, K_45 on the grid (also writes the restart for the IMOM run)
+"h2o_be_t1_grid.inp"                    = [{matcher="BE_K_if", tol=1.0E-06, ref=0.02967193},
+                                           {matcher="BE_E_singlet", tol=1.0E-08, ref=-16.9436560198},
+                                           {matcher="BE_singlet_excitation", tol=1.0E-06, ref=8.708842}]
+# same state, K_45 from four-centre integrals (HFX)
+"h2o_be_t1_analytic.inp"                = [{matcher="BE_K_if", tol=1.0E-06, ref=0.02967359}]
+# 3 (beta) -> 5 (alpha) triplet from IMOM, K_35 on the grid
+"h2o_be_imom_t2.inp"                    = [{matcher="BE_K_if", tol=1.0E-06, ref=0.03070713},
+                                           {matcher="BE_singlet_excitation", tol=1.0E-06, ref=10.902213}]
+# all-electron GAPW, def2-SVP: last pair is the O 1s -> 4a1 core pair (one-centre terms)
+"h2o_be_ae_gapw.inp"                    = [{matcher="BE_K_if", tol=1.0E-06, ref=0.01477845},
+                                           {matcher="BE_E_singlet", tol=1.0E-08, ref=-75.9824193622}]
+#EOF

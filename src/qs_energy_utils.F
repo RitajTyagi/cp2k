@@ -41,6 +41,7 @@ MODULE qs_energy_utils
                                               pw_scale
    USE pw_pool_types,                   ONLY: pw_pool_type
    USE pw_types,                        ONLY: pw_r3d_rs_type
+   USE qs_be_exciton,                   ONLY: be_exciton_main
    USE qs_core_matrices,                ONLY: core_matrices
    USE qs_dispersion_types,             ONLY: qs_dispersion_type
    USE qs_energy_types,                 ONLY: qs_energy_type
@@ -100,7 +101,7 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'qs_energies_properties'
 
       INTEGER                                            :: handle, natom
-      LOGICAL                                            :: do_bse_props, do_et, do_et_proj, &
+      LOGICAL                                            :: do_be_exciton, do_bse_props, do_et, do_et_proj, &
                                                             do_post_scf_bandstructure, do_tip_scan
       REAL(KIND=dp)                                      :: ekts
       TYPE(atprop_type), POINTER                         :: atprop
@@ -109,7 +110,7 @@ CONTAINS
       TYPE(pw_env_type), POINTER                         :: pw_env
       TYPE(pw_r3d_rs_type), POINTER                      :: v_hartree_rspace
       TYPE(qs_energy_type), POINTER                      :: energy
-      TYPE(section_vals_type), POINTER                   :: bse_props_section, input, &
+      TYPE(section_vals_type), POINTER                   :: be_exciton_section, bse_props_section, input, &
                                                             post_scf_bands_section, proj_section, &
                                                             rest_b_section, tip_scan_section
 
@@ -219,6 +220,12 @@ CONTAINS
       bse_props_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%BSE")
       CALL section_vals_get(bse_props_section, explicit=do_bse_props)
       IF (do_bse_props) CALL bse_from_bs_env(qs_env, bse_props_section)
+
+      ! Becke exciton model on top of a state-specific (MOM) triplet: E_S = E_T + K_if
+      NULLIFY (be_exciton_section)
+      be_exciton_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%BE_EXCITON")
+      CALL section_vals_get(be_exciton_section, explicit=do_be_exciton)
+      IF (do_be_exciton) CALL be_exciton_main(qs_env, be_exciton_section)
 
       ! tip scan
       NULLIFY (tip_scan_section)

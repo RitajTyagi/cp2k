@@ -12,7 +12,7 @@
 !> \author MI
 ! **************************************************************************************************
 MODULE input_cp2k_properties_dft
-   USE bibliography, ONLY: Dixon2023, Doll2025, Wong2026, Loring2015, Cerjan2023, Futera2017, &
+   USE bibliography, ONLY: Becke2018, Roy2026, Dixon2023, Doll2025, Wong2026, Loring2015, Cerjan2023, Futera2017, &
                            Hedin1965, &
                            Hybertsen1986, &
                            Tyagi2024, &
@@ -39,7 +39,7 @@ MODULE input_cp2k_properties_dft
                                  silent_print_level
    USE cp_units, ONLY: cp_unit_to_cp2k
    USE input_constants, ONLY: &
-      cohsex_diagonal, cohsex_off, cohsex_qp_update, &
+      be_kif_analytic, be_kif_grid, cohsex_diagonal, cohsex_off, cohsex_qp_update, &
       current_gauge_atom, current_gauge_r, current_gauge_r_and_step_func, &
       current_orb_center_atom, current_orb_center_box, current_orb_center_common, &
       current_orb_center_wannier, do_et_ddapc, do_full_density, do_no_et, do_spin_density, &
@@ -53,6 +53,7 @@ MODULE input_cp2k_properties_dft
       tddfpt_kernel_stda, no_sf_tddfpt, tddfpt_sf_col, tddfpt_sf_noncol, use_mom_ref_coac, &
       use_mom_ref_com, use_mom_ref_user, use_mom_ref_zero
    USE input_cp2k_atprop, ONLY: create_atprop_section
+   USE input_cp2k_hfx, ONLY: create_hfx_section
    USE input_cp2k_dft, ONLY: create_interp_section, &
                              create_mgrid_section
    USE input_cp2k_mp2, ONLY: create_bse_section
@@ -171,7 +172,79 @@ CONTAINS
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 
+      CALL create_be_exciton_section(subsection)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
+
    END SUBROUTINE create_properties_section
+
+! **************************************************************************************************
+!> \brief Input section of the Becke exciton (BE) model: E_S = E_T + K_if on top of a
+!>        state-specific (MOM/IMOM) UKS triplet, K_if = (if|if)
+!> \param section the section to create
+! **************************************************************************************************
+   SUBROUTINE create_be_exciton_section(section)
+      TYPE(section_type), POINTER                        :: section
+
+      TYPE(keyword_type), POINTER                        :: keyword
+      TYPE(section_type), POINTER                        :: print_key, subsection
+
+      CPASSERT(.NOT. ASSOCIATED(section))
+      CALL section_create(section, __LOCATION__, name="BE_EXCITON", &
+                          description="Becke exciton (BE) model for open-shell singlet excited states "// &
+                          "from a closed-shell reference. The current SCF must be the state-specific "// &
+                          "M_S=+1 UKS triplet of the excitation i->f (e.g. obtained with &SCF&MOM, "// &
+                          "MOM_TYPE IMOM). The singlet energy is E_S = E_T + K_if, where "// &
+                          "K_if = (if|if) is the Coulomb self-energy of the transition density "// &
+                          "phi_i*phi_f built from the alpha orbitals i and f of the triplet.", &
+                          n_keywords=4, n_subsections=2, repeats=.FALSE., &
+                          citations=[Roy2026, Becke2018])
+
+      NULLIFY (keyword, subsection, print_key)
+
+      CALL keyword_create(keyword, __LOCATION__, name="ORBITAL_PAIR", &
+                          description="Alpha MO indices i and f (in the ordering of the converged "// &
+                          "triplet) of the two singly occupied orbitals of the excitation i->f. "// &
+                          "Both must be occupied in the alpha spin channel. Repeat the keyword "// &
+                          "for several pairs; K_if is computed for each of them.", &
+                          usage="ORBITAL_PAIR 4 5", type_of_var=integer_t, n_var=2, repeats=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="METHOD", &
+                          description="How K_if is evaluated.", &
+                          usage="METHOD GRID", &
+                          enum_c_vals=s2a("GRID", "ANALYTIC"), &
+                          enum_i_vals=[be_kif_grid, be_kif_analytic], &
+                          enum_desc=s2a("Collocate the transition density on the real-space grid and "// &
+                                        "solve the Poisson equation with the &POISSON settings of the "// &
+                                        "SCF (GPW and GAPW, including one-centre terms).", &
+                                        "Four-centre integrals (fi|fi) from the HFX module, using the "// &
+                                        "HF subsection of BE_EXCITON. Reference / small systems."), &
+                          default_i_val=be_kif_grid)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="E_GROUND_STATE", &
+                          description="Total energy of the closed-shell ground state [Hartree]. If given, "// &
+                          "the triplet and singlet excitation energies and the frozen-orbital oscillator strength "// &
+                          "f = 2/3 omega_S |<f|r|i>|^2 of the singlet (molecules) are printed as well.", &
+                          usage="E_GROUND_STATE -17.1234", type_of_var=real_t, unit_str="hartree")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      ! four-centre integral settings for METHOD ANALYTIC (FRACTION is ignored)
+      CALL create_hfx_section(subsection)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
+
+      CALL cp_print_key_section_create(print_key, __LOCATION__, name="PRINT", &
+                                       description="Controls the printing of the BE exciton results.", &
+                                       print_level=low_print_level, filename="__STD_OUT__")
+      CALL section_add_subsection(section, print_key)
+      CALL section_release(print_key)
+
+   END SUBROUTINE create_be_exciton_section
 
 ! **************************************************************************************************
 !> \brief creates the input structure used to activate finite-volume Kubo transport

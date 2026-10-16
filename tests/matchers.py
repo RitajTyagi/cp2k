@@ -629,3 +629,8 @@ registry["Kubo_symmetry_current_error"] = GenericMatcher(
 registry["Kubo_symmetry_points"] = GenericMatcher(
     r"KUBO_TRANSPORT| Property symmetry representatives:", col=5
 )
+
+# Becke exciton model (&PROPERTIES&BE_EXCITON): K_if = (if|if), E_S = E_T + K_if [Hartree]
+registry["BE_K_if"] = GenericMatcher("BE| K_if = (if|if)", col=5)
+registry["BE_E_singlet"] = GenericMatcher("BE| E_S = E_T + K_if", col=7)
+registry["BE_singlet_excitation"] = GenericMatcher("BE| Singlet excitation energy", col=5)

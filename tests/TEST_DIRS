@@ -402,6 +402,7 @@ QS/regtest-sccs-3
 QS/regtest-mp2-admm-stress-numer                            libint !ifx
 QS/regtest-libint-backend                                   libint !ifx
 QS/regtest-mom-1
+QS/regtest-be-exciton                                       libint
 QS/regtest-epr-2
 QS/regtest-nlmo
 QS/regtest-as-fci                                           libfci libint libxc !ifx

@@ -558,6 +558,7 @@ list(
   qs_band_structure.F
   qs_basis_gradient.F
   qs_basis_rotation_methods.F
+  qs_be_exciton.F
   qs_block_davidson_types.F
   qs_cdft_grid.F
   qs_cdft_methods.F
