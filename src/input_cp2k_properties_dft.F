@@ -2545,6 +2545,25 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="EPS_CHI_POS_DEFINITE", &
+                          description="Largest relative negative eigenvalue of the "// &
+                          "polarizability $\\chi_{PQ}(i\\omega,\\mathbf{k})$ that is accepted "// &
+                          "without clipping. $\\chi$ must be positive semidefinite for the "// &
+                          "Cholesky factorization of $\\varepsilon$ to succeed; this is "// &
+                          "guaranteed by diagonalizing $\\chi$ and removing its negative "// &
+                          "eigenvalues, which costs a full complex eigendecomposition for every "// &
+                          "k-point and frequency although it usually changes nothing. Instead a "// &
+                          "Cholesky factorization of $\\chi + \\eta\\mathbf{1}$ with "// &
+                          "$\\eta$ = EPS_CHI_POS_DEFINITE $\\cdot \\max_{PQ}|\\chi_{PQ}|$ "// &
+                          "is tried first, at roughly 1/30 of the cost; it succeeds precisely "// &
+                          "when $\\lambda_\\mathrm{min}(\\chi) > -\\eta$, and only a "// &
+                          "failure pays for the eigendecomposition. A negative value disables "// &
+                          "the probe and always diagonalizes.", &
+                          usage="EPS_CHI_POS_DEFINITE 1.0E-10", &
+                          default_r_val=1.0E-10_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="CUTOFF_RADIUS_RI", &
                           description="The cutoff radius (in Angstrom) for the truncated  "// &
                           "Coulomb operator. The larger the cutoff radius, the faster "// &

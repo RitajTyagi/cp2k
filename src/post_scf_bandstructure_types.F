@@ -202,6 +202,10 @@ MODULE post_scf_bandstructure_types
                                                       input_regularization_RI = -1.0_dp, &
                                                       regularization_RI = -1.0_dp
 
+      ! relative shift of the positive-semidefiniteness probe on chi(i*omega,k); negative
+      ! disables the probe and always diagonalizes, which is the reference route
+      REAL(KIND=dp)                                :: eps_chi_pos_definite = -1.0_dp
+
       ! global full cfm_1d used in GW
       TYPE(cp_fm_type)                             :: fm_s_Gamma = cp_fm_type(), &
                                                       fm_Gocc = cp_fm_type(), &

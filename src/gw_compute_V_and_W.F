@@ -14,6 +14,7 @@ MODULE gw_compute_V_and_W
    USE constants_operator,              ONLY: operator_coulomb
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
    USE cp_cfm_basic_linalg,             ONLY: cp_cfm_add_on_diag,&
+                                              cp_cfm_norm,&
                                               cp_cfm_uplo_to_full
    USE cp_cfm_cholesky,                 ONLY: cp_cfm_cholesky_decompose,&
                                               cp_cfm_cholesky_invert
@@ -516,12 +517,16 @@ CONTAINS
 !> \param cfm_chi_eps_W_ikp_freq_j input chi; overwritten by W
 !> \param cfm_V_sqrt_ikp square root of the Coulomb matrix
 !> \param cfm_M_inv_V_sqrt_ikp metric-weighted Coulomb factor
+!> \param info_out Cholesky status of epsilon. When present, an indefinite epsilon returns
+!>        info_out /= 0 with cfm_chi_eps_W_ikp_freq_j left consumed, so that the caller can
+!>        rebuild chi and retry. When absent, an indefinite epsilon aborts as before.
 ! **************************************************************************************************
    SUBROUTINE compute_cfm_W_ikp_freq_j(bs_env, cfm_chi_eps_W_ikp_freq_j, cfm_V_sqrt_ikp, &
-                                       cfm_M_inv_V_sqrt_ikp)
+                                       cfm_M_inv_V_sqrt_ikp, info_out)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(cp_cfm_type), INTENT(INOUT)                   :: cfm_chi_eps_W_ikp_freq_j
       TYPE(cp_cfm_type), INTENT(IN)                      :: cfm_V_sqrt_ikp, cfm_M_inv_V_sqrt_ikp
+      INTEGER, INTENT(OUT), OPTIONAL                     :: info_out
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_cfm_W_ikp_freq_j'
 
@@ -541,7 +546,13 @@ CONTAINS
 
       ! 2. a) Cholesky-factorize epsilon before inversion.
       CALL cp_cfm_cholesky_decompose(matrix=cfm_chi_eps_W_ikp_freq_j, n=bs_env%n_RI, info_out=info)
-      CPASSERT(info == 0)
+      IF (PRESENT(info_out)) info_out = info
+      IF (info /= 0) THEN
+         ! Only a caller that asked for info_out is prepared to recover from this.
+         CPASSERT(PRESENT(info_out))
+         CALL timestop(handle)
+         RETURN
+      END IF
 
       ! 2. b) Invert epsilon, subtract Id, then contract with V^0.5 on both sides.
       CALL cfm_screened_interaction_from_eps_cholesky(cfm_chi_eps_W_ikp_freq_j, cfm_V_sqrt_ikp)
@@ -665,7 +676,8 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_fm_W_MIC_freq_j_from_chi'
 
-      INTEGER                                            :: handle
+      INTEGER                                            :: handle, info
+      LOGICAL                                            :: chi_clipped
       TYPE(cp_cfm_type)                                  :: cfm_chi_eps_W_ikp_freq_j
 
       CALL timeset(routineN, handle)
@@ -676,12 +688,26 @@ CONTAINS
       CALL cfm_ikp_from_fm_Gamma(cfm_chi_eps_W_ikp_freq_j, bs_env%fm_chi_Gamma_freq, &
                                  ikp, qs_env, bs_env%kpoints_chi_eps_W, "RI_AUX")
 
-      ! 2. Remove all negative eigenvalues from χ_PQ(iω_j,k_i)
-      CALL cp_cfm_power(cfm_chi_eps_W_ikp_freq_j, threshold=0.0_dp, exponent=1.0_dp)
+      ! 2. Remove all negative eigenvalues from χ_PQ(iω_j,k_i), but only if it has any: the
+      !    probe is ~30x cheaper than the eigendecomposition it guards.
+      CALL enforce_chi_psd(bs_env, cfm_chi_eps_W_ikp_freq_j, chi_clipped)
 
       ! 3. ε(iω_j,k_i) = Id - V^0.5(k_i)*M^-1(k_i)*χ(iω_j,k_i)*M^-1(k_i)*V^0.5(k_i)
       CALL compute_cfm_W_ikp_freq_j(bs_env, cfm_chi_eps_W_ikp_freq_j, cfm_V_sqrt_ikp, &
-                                    cfm_M_inv_V_sqrt_ikp)
+                                    cfm_M_inv_V_sqrt_ikp, info_out=info)
+
+      IF (info /= 0) THEN
+         ! ε came out indefinite although the probe waved χ through, i.e. the negative spectrum
+         ! of χ sat below the probe shift but was still amplified enough by V^0.5(k)*M^-1(k) to
+         ! matter. Refold χ from Γ -- an O(N^2) pass, the Γ matrix is untouched -- and clip it
+         ! unconditionally, which is exactly what the unguarded route would have done.
+         CPASSERT(.NOT. chi_clipped)
+         CALL cfm_ikp_from_fm_Gamma(cfm_chi_eps_W_ikp_freq_j, bs_env%fm_chi_Gamma_freq, &
+                                    ikp, qs_env, bs_env%kpoints_chi_eps_W, "RI_AUX")
+         CALL cp_cfm_power(cfm_chi_eps_W_ikp_freq_j, threshold=0.0_dp, exponent=1.0_dp)
+         CALL compute_cfm_W_ikp_freq_j(bs_env, cfm_chi_eps_W_ikp_freq_j, cfm_V_sqrt_ikp, &
+                                       cfm_M_inv_V_sqrt_ikp)
+      END IF
 
       ! 4. k-point integration W_PQ(iω_j, k_i) to W_PQ^MIC(iω_j)
       SELECT CASE (bs_env%approx_kp_extrapol)
@@ -727,6 +753,65 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE compute_fm_W_MIC_freq_j_from_chi
+
+! **************************************************************************************************
+!> \brief Make χ_PQ(iω_j,k_i) positive semidefinite, skipping the eigendecomposition whenever it
+!>        already is.
+!>
+!>        compute_cfm_W_ikp_freq_j Cholesky-factorizes ε(iω_j,k_i), which needs ε to be positive
+!>        definite; χ ⪰ 0 guarantees it. The reference route enforces that by diagonalizing χ and
+!>        clipping its negative eigenvalues to zero (cp_cfm_power with exponent 1). That is a full
+!>        pzheevd for every (k_i, ω_j) pair although in the common case it changes nothing: on a
+!>        10388-function RI basis it measured 13.1 s per call and 60 % of the whole W stage.
+!>
+!>        A Cholesky factorization of χ + η·Id on a scratch copy settles the same question for
+!>        about 1/30 of the cost (0.44 s against 13.1 s on that system). Success proves
+!>        λ_min(χ) > -η, so clipping at threshold 0 would remove nothing but eigenvalues at or
+!>        below the roundoff that the reconstruction U·diag(λ)·U^H introduces itself, and it is
+!>        skipped. η = EPS_CHI_POS_DEFINITE·max|χ_PQ| is scaled with the largest matrix element,
+!>        so the criterion is on the relative spectrum. Only a failed probe pays for the
+!>        eigendecomposition. A negative EPS_CHI_POS_DEFINITE skips the probe and always
+!>        diagonalizes, which restores the reference route for an A/B check.
+!>
+!>        Both routes read the upper triangle only -- pzpotrf('U') here, pzheevd('V','U') inside
+!>        cp_cfm_power -- so skipping the reconstruction cannot make the two triangles disagree
+!>        in a way that matters downstream.
+!> \param bs_env ...
+!> \param cfm_chi χ_PQ(iω_j,k_i); clipped in place only when the probe fails
+!> \param clipped .TRUE. if the eigendecomposition was performed
+! **************************************************************************************************
+   SUBROUTINE enforce_chi_psd(bs_env, cfm_chi, clipped)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(cp_cfm_type), INTENT(INOUT)                   :: cfm_chi
+      LOGICAL, INTENT(OUT)                               :: clipped
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'enforce_chi_psd'
+
+      INTEGER                                            :: handle, info
+      REAL(KIND=dp)                                      :: eta
+      TYPE(cp_cfm_type)                                  :: cfm_probe
+
+      CALL timeset(routineN, handle)
+
+      IF (bs_env%eps_chi_pos_definite < 0.0_dp) THEN
+         ! probe disabled by input: always diagonalize
+         info = 1
+      ELSE
+         eta = bs_env%eps_chi_pos_definite*cp_cfm_norm(cfm_chi, 'M')
+
+         CALL cp_cfm_create(cfm_probe, cfm_chi%matrix_struct)
+         CALL cp_cfm_to_cfm(cfm_chi, cfm_probe)
+         CALL cp_cfm_add_on_diag(cfm_probe, CMPLX(eta, 0.0_dp, KIND=dp))
+         CALL cp_cfm_cholesky_decompose(matrix=cfm_probe, n=bs_env%n_RI, info_out=info)
+         CALL cp_cfm_release(cfm_probe)
+      END IF
+
+      clipped = (info /= 0)
+      IF (clipped) CALL cp_cfm_power(cfm_chi, threshold=0.0_dp, exponent=1.0_dp)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE enforce_chi_psd
 
 ! **************************************************************************************************
 !> \brief ...

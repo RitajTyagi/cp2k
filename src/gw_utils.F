@@ -288,6 +288,7 @@ CONTAINS
       CALL section_vals_val_get(gw_sec, "EPS_FILTER", r_val=bs_env%eps_filter)
       CALL section_vals_val_get(gw_sec, "REGULARIZATION_RI", r_val=bs_env%input_regularization_RI)
       CALL section_vals_val_get(gw_sec, "REGULARIZATION_MINIMAX", r_val=bs_env%input_regularization_minimax)
+      CALL section_vals_val_get(gw_sec, "EPS_CHI_POS_DEFINITE", r_val=bs_env%eps_chi_pos_definite)
       CALL section_vals_val_get(gw_sec, "CUTOFF_RADIUS_RI", r_val=bs_env%ri_metric%cutoff_radius)
       CALL section_vals_val_get(gw_sec, "MEMORY_PER_PROC", r_val=bs_env%input_memory_per_proc_GB)
       CALL section_vals_val_get(gw_sec, "APPROX_KP_EXTRAPOL", l_val=bs_env%approx_kp_extrapol)
@@ -1779,12 +1780,17 @@ CONTAINS
          CPASSERT(bs_env%auto_ri%ready)
          CALL cp_fm_to_fm(bs_env%auto_ri%M_pq_inv, bs_env%fm_Minv_Gamma)
       ELSE
+         ! M^-1(k=0) is folded into W by compute_W_MIC (fm_contract_ABA), so it has to be
+         ! built the same way for every implementation of the same physics. The tensor
+         ! large-cell-Gamma path regularizes it nowhere -- heuristic_RI_regularization is
+         ! reached only by tensor_small_cell_full_kp -- so the RI-RS path must not either,
+         ! otherwise the two differ in W alone. REGULARIZATION_RI still defaults to 1.0E-2
+         ! for periodic systems and is applied to M(k) in compute_MinvVsqrt_Vsqrt, which both
+         ! codes share; applying it here as well made periodic RI-RS disagree with the tensor
+         ! reference by up to 3.8 eV in Sigma^c while chi and Sigma^c themselves agree to
+         ! 4-10 meV. For molecules regularization_RI is 0 anyway, so nothing changes there.
          metric_regularization = 0.0_dp
          eigenvalue_threshold = 0.0_dp
-         IF (bs_env%do_gw_ri_rs) THEN
-            metric_regularization = bs_env%regularization_RI
-            eigenvalue_threshold = bs_env%eps_eigval_mat_RI
-         END IF
          CALL RI_2c_integral_mat(qs_env, fm_M, bs_env%fm_RI_RI%matrix_struct, bs_env%n_RI, &
                                  bs_env%ri_metric, &
                                  regularization_RI=metric_regularization)
