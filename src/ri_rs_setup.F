@@ -317,17 +317,32 @@ CONTAINS
                               bs_env%i_ao_start_from_atom(j) + 1)
          END DO
 
-         ! Keep each path's integration domain: r_c + r_RI(P) for molecules,
-         ! r_c + r_AO(P) for the Gamma image-summed approximation.
+         ! Per-atom RI-RS integration sphere:
+         !   cutoff_ri(P) = r_c + r_RI(P)
+         ! where r_c is the truncated-Coulomb cutoff of the RI metric and r_RI the radius of
+         ! the most diffuse RI auxiliary Gaussian on P. The SAME domain is used for molecules
+         ! and for the periodic Gamma path.
+         !
+         ! History: the original periodic driver used r_c + r_AO(P) in its own copy of this
+         ! setup, and #6318 preserved that when it unified the two paths. r_c + r_RI(P) is
+         ! what the periodic results were validated with (Si 2x2x2 agreeing with the tensor
+         ! code to 0.0 meV, h-BN 5x5 to 8.5 meV, regtest 09 at 23.312 eV), and r_AO is not
+         ! affordable: on a 14x14 h-BN supercell (35.0 A cell) it makes the N sphere 17.83 A,
+         ! i.e. wider than the cell, so the worst-case local grid is 122649 of 131712 points
+         ! (93 % of the whole grid) and the sphere locality that RI-RS depends on is gone --
+         ! Z_lP occupancy 46 % -> 84 %, compute_Z_lP 2828 s -> 23656 s.
+         !
+         ! It buys nothing where it matters: measured against r_c + r_AO on that system,
+         ! Sigma^x (which uses the same Z_lP but is not analytically continued, so it is a
+         ! clean probe) changed by less than the 1 meV print resolution for every state below
+         ! +10 eV -- all 784 occupied states and the whole frontier region. Only high-lying
+         ! diffuse virtuals moved, reaching 2.1 eV at eps_DFT = 288 eV, and in G0W0 those do
+         ! not feed back into G.
          ALLOCATE (cutoff_ri_per_atom(natom))
 
          r_c = bs_env%ri_metric%cutoff_radius
          DO iatom = 1, natom
-            IF (periodic_images) THEN
-               cutoff_ri_per_atom(iatom) = r_c + bs_env%ri_rs%radius_ao_per_atom(iatom)
-            ELSE
-               cutoff_ri_per_atom(iatom) = r_c + bs_env%ri_rs%radius_ri_per_atom(iatom)
-            END IF
+            cutoff_ri_per_atom(iatom) = r_c + bs_env%ri_rs%radius_ri_per_atom(iatom)
          END DO
 
          CALL print_sphere_cutoff_table(bs_env, cutoff_ri_per_atom)

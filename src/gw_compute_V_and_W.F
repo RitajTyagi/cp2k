@@ -63,7 +63,8 @@ MODULE gw_compute_V_and_W
                                               dp
    USE kpoint_coulomb_2c,               ONLY: build_2c_coulomb_matrix_kp
    USE libint_2c_3c,                    ONLY: libint_potential_type
-   USE machine,                         ONLY: m_walltime
+   USE machine,                         ONLY: m_flush,&
+                                              m_walltime
    USE mathconstants,                   ONLY: z_one,&
                                               z_zero
    USE mp2_ri_2c,                       ONLY: RI_2c_integral_mat_kp
@@ -690,7 +691,7 @@ CONTAINS
 
       ! 2. Remove all negative eigenvalues from χ_PQ(iω_j,k_i), but only if it has any: the
       !    probe is ~30x cheaper than the eigendecomposition it guards.
-      CALL enforce_chi_psd(bs_env, cfm_chi_eps_W_ikp_freq_j, chi_clipped)
+      CALL enforce_chi_psd(bs_env, cfm_chi_eps_W_ikp_freq_j, chi_clipped, ikp, j_w)
 
       ! 3. ε(iω_j,k_i) = Id - V^0.5(k_i)*M^-1(k_i)*χ(iω_j,k_i)*M^-1(k_i)*V^0.5(k_i)
       CALL compute_cfm_W_ikp_freq_j(bs_env, cfm_chi_eps_W_ikp_freq_j, cfm_V_sqrt_ikp, &
@@ -776,19 +777,33 @@ CONTAINS
 !>        Both routes read the upper triangle only -- pzpotrf('U') here, pzheevd('V','U') inside
 !>        cp_cfm_power -- so skipping the reconstruction cannot make the two triangles disagree
 !>        in a way that matters downstream.
+!>
+!>        Diagnostic: every clipping reports how much it removes. χ_PQ(k) is built from
+!>        χ_PQ(Γ) as a Hadamard product with the phase matrix M_PQ = exp(i k·R^MIC_PQ). When
+!>        R^MIC does not wrap, M = u u^H is rank 1 and positive semidefinite, so by the Schur
+!>        product theorem χ(k) inherits χ(Γ)'s positive semidefiniteness and nothing is
+!>        clipped. Once the minimum image wraps -- i.e. on any production-sized cell -- M is
+!>        no longer rank 1 and χ(k) is genuinely indefinite, so the clipping is repairing the
+!>        k-point reconstruction, not roundoff. n_neg and Σ|λ_neg|/λ_max measure how large
+!>        that repair is, which decides whether a partial eigensolver over the negative
+!>        subspace alone would do, and quantifies the positivity violation of the MIC scheme.
 !> \param bs_env ...
 !> \param cfm_chi χ_PQ(iω_j,k_i); clipped in place only when the probe fails
 !> \param clipped .TRUE. if the eigendecomposition was performed
+!> \param ikp k-point index, for the diagnostic line
+!> \param j_w frequency index, for the diagnostic line
 ! **************************************************************************************************
-   SUBROUTINE enforce_chi_psd(bs_env, cfm_chi, clipped)
+   SUBROUTINE enforce_chi_psd(bs_env, cfm_chi, clipped, ikp, j_w)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(cp_cfm_type), INTENT(INOUT)                   :: cfm_chi
       LOGICAL, INTENT(OUT)                               :: clipped
+      INTEGER, INTENT(IN)                                :: ikp, j_w
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'enforce_chi_psd'
 
-      INTEGER                                            :: handle, info
-      REAL(KIND=dp)                                      :: eta
+      INTEGER                                            :: handle, info, n_neg
+      REAL(KIND=dp)                                      :: discarded, eta, rel
+      REAL(KIND=dp), DIMENSION(2)                        :: ev
       TYPE(cp_cfm_type)                                  :: cfm_probe
 
       CALL timeset(routineN, handle)
@@ -807,7 +822,34 @@ CONTAINS
       END IF
 
       clipped = (info /= 0)
-      IF (clipped) CALL cp_cfm_power(cfm_chi, threshold=0.0_dp, exponent=1.0_dp)
+
+      n_neg = 0
+      discarded = 0.0_dp
+      ev(:) = 0.0_dp
+      IF (clipped) THEN
+         CALL cp_cfm_power(cfm_chi, threshold=0.0_dp, exponent=1.0_dp, &
+                           n_dependent=n_neg, eigvals=ev, discarded_trace=discarded)
+      END IF
+
+      IF (bs_env%unit_nr > 0) THEN
+         IF (ikp == 1 .AND. j_w == 1) THEN
+            WRITE (bs_env%unit_nr, '(A)') ' '
+            WRITE (bs_env%unit_nr, '(T2,A)') &
+               'chi positive-semidefiniteness per (k,omega): n_neg counts the clipped modes'
+            WRITE (bs_env%unit_nr, '(T2,A)') &
+               '  ikp  j_w    n_neg     n_RI        lambda_min        lambda_max   sum|l_neg|/l_max'
+         END IF
+         rel = 0.0_dp
+         IF (ev(2) > 0.0_dp) rel = discarded/ev(2)
+         IF (clipped) THEN
+            WRITE (bs_env%unit_nr, '(T2,I5,I5,I9,I9,2ES18.6,ES19.6)') &
+               ikp, j_w, n_neg, bs_env%n_RI, ev(1), ev(2), rel
+         ELSE
+            WRITE (bs_env%unit_nr, '(T2,I5,I5,I9,I9,A)') &
+               ikp, j_w, 0, bs_env%n_RI, '   (probe passed: no eigendecomposition)'
+         END IF
+         CALL m_flush(bs_env%unit_nr)
+      END IF
 
       CALL timestop(handle)
 

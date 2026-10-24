@@ -232,23 +232,28 @@ CONTAINS
 !> \param exponent matrix exponent
 !> \param threshold nonnegative lower bound for retained eigenvalues
 !> \param n_dependent optional number of discarded eigenvalues
+!> \param discarded_trace optional sum of |eigenvalue| over the discarded modes; together with
+!>        n_dependent and eigvals it quantifies how much spectral weight the threshold removes
 !> \param verbose optional flag to print spectral diagnostics (default false)
 !> \param eigvals optional smallest and largest eigenvalues before filtering
 ! **************************************************************************************************
-   SUBROUTINE cp_cfm_power(matrix, work, exponent, threshold, n_dependent, verbose, eigvals)
+   SUBROUTINE cp_cfm_power(matrix, work, exponent, threshold, n_dependent, verbose, eigvals, &
+                           discarded_trace)
       TYPE(cp_cfm_type), INTENT(INOUT)                   :: matrix
       TYPE(cp_cfm_type), INTENT(INOUT), OPTIONAL, TARGET :: work
       REAL(KIND=dp), INTENT(IN)                          :: exponent, threshold
       INTEGER, INTENT(OUT), OPTIONAL                     :: n_dependent
       LOGICAL, INTENT(IN), OPTIONAL                      :: verbose
       REAL(KIND=dp), DIMENSION(2), INTENT(OUT), OPTIONAL :: eigvals
+      REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: discarded_trace
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'cp_cfm_power'
 
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)        :: eigenvalue_scales
       INTEGER                                            :: handle, i, ncol_global, ndep, nrow_global
       LOGICAL                                            :: my_verbose
-      REAL(KIND=dp)                                      :: condition_number, sqrt_power_eval
+      REAL(KIND=dp)                                      :: condition_number, discarded, &
+                                                            sqrt_power_eval
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalues
       TYPE(cp_cfm_type), POINTER                         :: cfm_work
       TYPE(cp_cfm_type), TARGET                          :: local_work
@@ -272,17 +277,20 @@ CONTAINS
       ! Reconstruct matrix**exponent as X*X^H, where
       ! X = U*diag(eigenvalues**(exponent/2)) on the retained modes.
       ndep = 0
+      discarded = 0.0_dp
       DO i = 1, nrow_global
          ! Keep zero modes quenched, including inverse powers with threshold=0.
          IF (eigenvalues(i) < threshold .OR. eigenvalues(i) <= 0.0_dp) THEN
             sqrt_power_eval = 0.0_dp
             ndep = ndep + 1
+            discarded = discarded + ABS(eigenvalues(i))
          ELSE
             sqrt_power_eval = eigenvalues(i)**(0.5_dp*exponent)
          END IF
          eigenvalue_scales(i) = CMPLX(sqrt_power_eval, 0.0_dp, KIND=dp)
       END DO
       IF (PRESENT(n_dependent)) n_dependent = ndep
+      IF (PRESENT(discarded_trace)) discarded_trace = discarded
 
       CALL cp_cfm_column_scale(cfm_work, eigenvalue_scales)
 
