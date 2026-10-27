@@ -14,8 +14,6 @@ MODULE gw_compute_V_and_W
    USE constants_operator,              ONLY: operator_coulomb
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
    USE cp_cfm_basic_linalg,             ONLY: cp_cfm_add_on_diag,&
-                                              cp_cfm_get_diag,&
-                                              cp_cfm_norm,&
                                               cp_cfm_uplo_to_full
    USE cp_cfm_cholesky,                 ONLY: cp_cfm_cholesky_decompose,&
                                               cp_cfm_cholesky_invert
@@ -519,23 +517,16 @@ CONTAINS
 !> \param cfm_chi_eps_W_ikp_freq_j input chi; overwritten by W
 !> \param cfm_V_sqrt_ikp square root of the Coulomb matrix
 !> \param cfm_M_inv_V_sqrt_ikp metric-weighted Coulomb factor
-!> \param info_out Cholesky status of epsilon. When present, an indefinite epsilon returns
-!>        info_out /= 0 with cfm_chi_eps_W_ikp_freq_j left consumed, so that the caller can
-!>        rebuild chi and retry. When absent, an indefinite epsilon aborts as before.
-!> \param pivot_min_out smallest Cholesky pivot of epsilon, as a margin against indefiniteness
 ! **************************************************************************************************
    SUBROUTINE compute_cfm_W_ikp_freq_j(bs_env, cfm_chi_eps_W_ikp_freq_j, cfm_V_sqrt_ikp, &
-                                       cfm_M_inv_V_sqrt_ikp, info_out, pivot_min_out)
+                                       cfm_M_inv_V_sqrt_ikp)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(cp_cfm_type), INTENT(INOUT)                   :: cfm_chi_eps_W_ikp_freq_j
       TYPE(cp_cfm_type), INTENT(IN)                      :: cfm_V_sqrt_ikp, cfm_M_inv_V_sqrt_ikp
-      INTEGER, INTENT(OUT), OPTIONAL                     :: info_out
-      REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: pivot_min_out
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_cfm_W_ikp_freq_j'
 
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)        :: diag_eps
-      INTEGER                                            :: handle, info
+      INTEGER                                            :: handle
 
       CALL timeset(routineN, handle)
 
@@ -549,27 +540,9 @@ CONTAINS
 
       ! 2. W(iw,k) = V^0.5(k)*(epsilon^-1(iw,k)-Id)*V^0.5(k)
 
-      ! 2. a) Cholesky-factorize epsilon before inversion.
-      CALL cp_cfm_cholesky_decompose(matrix=cfm_chi_eps_W_ikp_freq_j, n=bs_env%n_RI, info_out=info)
-      IF (PRESENT(info_out)) info_out = info
-      IF (info /= 0) THEN
-         ! Only a caller that asked for info_out is prepared to recover from this.
-         CPASSERT(PRESENT(info_out))
-         CALL timestop(handle)
-         RETURN
-      END IF
-
-      ! 2. a') How much room was left. epsilon = U^H*U, and the k-th pivot |U_kk|^2 is a diagonal
-      !        entry of the Schur complement of epsilon's leading (k-1) block, so every pivot is
-      !        >= lambda_min(epsilon): a small pivot certifies that epsilon came close to losing
-      !        positive definiteness, which is the quantity that decides whether chi needs
-      !        clipping at all. Free -- the factor is in memory and is overwritten just below.
-      IF (PRESENT(pivot_min_out)) THEN
-         ALLOCATE (diag_eps(bs_env%n_RI))
-         CALL cp_cfm_get_diag(cfm_chi_eps_W_ikp_freq_j, diag_eps)
-         pivot_min_out = MINVAL(ABS(diag_eps))**2
-         DEALLOCATE (diag_eps)
-      END IF
+      ! 2. a) Cholesky-factorize epsilon before inversion. chi was made positive semidefinite
+      !       by the caller, so epsilon >= Id and this cannot fail.
+      CALL cp_cfm_cholesky_decompose(matrix=cfm_chi_eps_W_ikp_freq_j, n=bs_env%n_RI)
 
       ! 2. b) Invert epsilon, subtract Id, then contract with V^0.5 on both sides.
       CALL cfm_screened_interaction_from_eps_cholesky(cfm_chi_eps_W_ikp_freq_j, cfm_V_sqrt_ikp)
@@ -693,9 +666,8 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_fm_W_MIC_freq_j_from_chi'
 
-      INTEGER                                            :: handle, info, n_neg
-      LOGICAL                                            :: chi_clipped
-      REAL(KIND=dp)                                      :: chi_max, discarded, pivot_min
+      INTEGER                                            :: handle, n_neg
+      REAL(KIND=dp)                                      :: discarded
       REAL(KIND=dp), DIMENSION(2)                        :: ev
       TYPE(cp_cfm_type)                                  :: cfm_chi_eps_W_ikp_freq_j
 
@@ -707,35 +679,24 @@ CONTAINS
       CALL cfm_ikp_from_fm_Gamma(cfm_chi_eps_W_ikp_freq_j, bs_env%fm_chi_Gamma_freq, &
                                  ikp, qs_env, bs_env%kpoints_chi_eps_W, "RI_AUX")
 
-      ! 2. Optionally force χ_PQ(iω_j,k_i) positive semidefinite. The default route does not:
-      !    χ ⪰ 0 is merely sufficient for ε ≻ 0, and step 3 settles the necessary condition on
-      !    its own. See enforce_chi_psd.
-      CALL enforce_chi_psd(bs_env, cfm_chi_eps_W_ikp_freq_j, chi_clipped, n_neg, ev, &
-                           discarded, chi_max)
+      ! 2. Remove the negative eigenvalues of χ_PQ(iω_j,k_i), which the Cholesky factorization
+      !    of ε in step 3 needs, and which the minimum image convention puts there: χ(k) is
+      !    χ(Γ) Hadamard-multiplied by the phase matrix M_PQ = exp(i k·R^MIC_PQ), and M is a
+      !    rank-1 u u^H -- hence positive semidefinite, hence harmless by the Schur product
+      !    theorem -- only as long as R^MIC does not wrap. On any production-sized cell it does,
+      !    M is no longer rank 1, and χ(k) is genuinely indefinite although the physical χ, a
+      !    Gram matrix of occupied-virtual products, is not. The clipping repairs that
+      !    reconstruction, so it is part of the method and not a numerical safeguard: skipping
+      !    it wherever ε happens to stay positive definite runs 1.5x faster on the W stage and
+      !    moves the QP gap of a 392-atom h-BN supercell by 55 meV.
+      CALL cp_cfm_power(cfm_chi_eps_W_ikp_freq_j, threshold=0.0_dp, exponent=1.0_dp, &
+                        n_dependent=n_neg, eigvals=ev, discarded_trace=discarded)
+
+      CALL report_chi_mic_artifact(bs_env, ikp, j_w, n_neg, ev, discarded)
 
       ! 3. ε(iω_j,k_i) = Id - V^0.5(k_i)*M^-1(k_i)*χ(iω_j,k_i)*M^-1(k_i)*V^0.5(k_i)
-      pivot_min = 0.0_dp
       CALL compute_cfm_W_ikp_freq_j(bs_env, cfm_chi_eps_W_ikp_freq_j, cfm_V_sqrt_ikp, &
-                                    cfm_M_inv_V_sqrt_ikp, info_out=info, pivot_min_out=pivot_min)
-
-      IF (info /= 0) THEN
-         ! ε came out indefinite: χ's negative spectrum survived step 2 and V^0.5(k)*M^-1(k)
-         ! amplified it enough to push an eigenvalue of Id + V^0.5*M^-1*χ*M^-1*V^0.5 through
-         ! zero. Refold χ from Γ -- an O(N^2) pass, the Γ matrix is untouched -- clip it
-         ! unconditionally and retry, which is what the unguarded route would have done from
-         ! the start. The only cost of having tried is one discarded Cholesky factorization.
-         CPASSERT(.NOT. chi_clipped)
-         CALL cfm_ikp_from_fm_Gamma(cfm_chi_eps_W_ikp_freq_j, bs_env%fm_chi_Gamma_freq, &
-                                    ikp, qs_env, bs_env%kpoints_chi_eps_W, "RI_AUX")
-         CALL cp_cfm_power(cfm_chi_eps_W_ikp_freq_j, threshold=0.0_dp, exponent=1.0_dp, &
-                           n_dependent=n_neg, eigvals=ev, discarded_trace=discarded)
-         chi_clipped = .TRUE.
-         CALL compute_cfm_W_ikp_freq_j(bs_env, cfm_chi_eps_W_ikp_freq_j, cfm_V_sqrt_ikp, &
-                                       cfm_M_inv_V_sqrt_ikp, pivot_min_out=pivot_min)
-      END IF
-
-      CALL report_chi_eps_conditioning(bs_env, ikp, j_w, chi_clipped, n_neg, ev, discarded, &
-                                       chi_max, pivot_min)
+                                    cfm_M_inv_V_sqrt_ikp)
 
       ! 4. k-point integration W_PQ(iω_j, k_i) to W_PQ^MIC(iω_j)
       SELECT CASE (bs_env%approx_kp_extrapol)
@@ -783,135 +744,27 @@ CONTAINS
    END SUBROUTINE compute_fm_W_MIC_freq_j_from_chi
 
 ! **************************************************************************************************
-!> \brief Make χ_PQ(iω_j,k_i) positive semidefinite -- if the input asks for it.
+!> \brief One line per (k_i,ω_j) on how far the minimum image convention pushes χ(k) out of the
+!>        positive semidefinite cone, i.e. how much of χ the clipping in step 2 throws away.
 !>
-!>        compute_cfm_W_ikp_freq_j Cholesky-factorizes ε(iω_j,k_i) = Id + V^0.5*M^-1*χ*M^-1*V^0.5,
-!>        which needs ε to be positive definite. χ ⪰ 0 guarantees that, and the reference route
-!>        enforces it by diagonalizing χ and clipping its negative eigenvalues to zero
-!>        (cp_cfm_power with exponent 1) for every (k_i, ω_j) pair.
-!>
-!>        But χ ⪰ 0 is only *sufficient*. The condition ε ≻ 0 actually needs is
-!>        λ_min(V^0.5*M^-1*χ*M^-1*V^0.5) > -1, and χ's negative spectrum on a production cell sits
-!>        four orders of magnitude below its largest eigenvalue (λ_min/λ_max ≈ -1E-4 at the first
-!>        frequency, -1E-6 at the tenth on a 392-atom h-BN supercell), so V^0.5*M^-1 would have to
-!>        amplify one of those near-null modes enormously for ε to turn indefinite. Enforcing ⪰ 0
-!>        on χ is therefore a far stronger demand than W is well-posed, and it is the dominant
-!>        cost of the whole W stage: on that system enforce_chi_psd took 19.3 s per (k,ω) against
-!>        6.5 s for the entire ε build, factorization, inversion and contraction it guards.
-!>
-!>        The necessary condition is tested for free, because the Cholesky factorization of ε has
-!>        to run anyway. So the default route leaves χ untouched and lets that factorization
-!>        decide: when it succeeds -- which is the self-validating part, every pass, on every
-!>        system -- W is well-posed and nothing was clipped; when it fails, the caller refolds χ
-!>        from Γ, clips unconditionally and retries, having wasted a single n^3/3 factorization.
-!>        The worst case is thus the cost of the reference route, the typical case removes 58 %
-!>        of the W stage, and no accuracy argument has to be taken on trust.
-!>
-!>        EPS_CHI_POS_DEFINITE selects between three routes:
-!>          = 0 (default)  never touch χ; ε's own Cholesky is the gate
-!>          > 0            Cholesky-probe χ + η·Id with η = EPS_CHI_POS_DEFINITE·max|χ_PQ|, which
-!>                         succeeds precisely when λ_min(χ) > -η, and clip only on failure. About
-!>                         1/30 of the cost of the eigendecomposition it replaces, but still paid
-!>                         on every pass
-!>          < 0            always diagonalize: the reference route, for A/B checks
-!>
-!>        All three read the upper triangle only -- pzpotrf('U') here and in compute_cfm_W_ikp_freq_j,
-!>        pzheevd('V','U') inside cp_cfm_power -- so skipping the reconstruction cannot make the two
-!>        triangles disagree in a way that matters downstream.
-!>
-!>        Where χ's negative eigenvalues come from: χ_PQ(k) is built from χ_PQ(Γ) as a Hadamard
-!>        product with the phase matrix M_PQ = exp(i k·R^MIC_PQ). When R^MIC does not wrap,
-!>        M = u u^H is rank 1 and positive semidefinite, so by the Schur product theorem χ(k)
-!>        inherits χ(Γ)'s positive semidefiniteness exactly. Once the minimum image wraps -- i.e.
-!>        on any production-sized cell -- M is no longer rank 1 and χ(k) is genuinely indefinite.
-!>        The clipping was therefore never repairing roundoff but the k-point reconstruction
-!>        itself, and n_neg and Σ|λ_neg|/λ_max quantify that positivity violation.
-!> \param bs_env ...
-!> \param cfm_chi χ_PQ(iω_j,k_i); clipped in place only when the selected route asks for it
-!> \param clipped .TRUE. if the eigendecomposition was performed
-!> \param n_neg number of clipped modes; 0 unless clipped
-!> \param ev smallest and largest eigenvalue of χ; 0 unless clipped
-!> \param discarded Σ|λ_neg| removed by the clipping; 0 unless clipped
-!> \param chi_max max|χ_PQ|, the scale of χ(k) for the probe and for the diagnostic
-! **************************************************************************************************
-   SUBROUTINE enforce_chi_psd(bs_env, cfm_chi, clipped, n_neg, ev, discarded, chi_max)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      TYPE(cp_cfm_type), INTENT(INOUT)                   :: cfm_chi
-      LOGICAL, INTENT(OUT)                               :: clipped
-      INTEGER, INTENT(OUT)                               :: n_neg
-      REAL(KIND=dp), DIMENSION(2), INTENT(OUT)           :: ev
-      REAL(KIND=dp), INTENT(OUT)                         :: discarded, chi_max
-
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'enforce_chi_psd'
-
-      INTEGER                                            :: handle, info
-      REAL(KIND=dp)                                      :: eta
-      TYPE(cp_cfm_type)                                  :: cfm_probe
-
-      CALL timeset(routineN, handle)
-
-      n_neg = 0
-      ev(:) = 0.0_dp
-      discarded = 0.0_dp
-
-      ! Scale of χ(k): the shift for the probe below, and the reference for the diagnostic line.
-      chi_max = cp_cfm_norm(cfm_chi, 'M')
-
-      IF (bs_env%eps_chi_pos_definite < 0.0_dp) THEN
-         ! reference route: always diagonalize
-         info = 1
-      ELSE IF (bs_env%eps_chi_pos_definite <= 0.0_dp) THEN
-         ! default route: leave χ alone, ε's Cholesky in compute_cfm_W_ikp_freq_j is the gate
-         info = 0
-      ELSE
-         eta = bs_env%eps_chi_pos_definite*chi_max
-
-         CALL cp_cfm_create(cfm_probe, cfm_chi%matrix_struct)
-         CALL cp_cfm_to_cfm(cfm_chi, cfm_probe)
-         CALL cp_cfm_add_on_diag(cfm_probe, CMPLX(eta, 0.0_dp, KIND=dp))
-         CALL cp_cfm_cholesky_decompose(matrix=cfm_probe, n=bs_env%n_RI, info_out=info)
-         CALL cp_cfm_release(cfm_probe)
-      END IF
-
-      clipped = (info /= 0)
-
-      IF (clipped) THEN
-         CALL cp_cfm_power(cfm_chi, threshold=0.0_dp, exponent=1.0_dp, &
-                           n_dependent=n_neg, eigvals=ev, discarded_trace=discarded)
-      END IF
-
-      CALL timestop(handle)
-
-   END SUBROUTINE enforce_chi_psd
-
-! **************************************************************************************************
-!> \brief One line per (k_i,ω_j) on how close χ and ε came to losing positive definiteness.
-!>
-!>        "min pivot(eps)" is the margin that justifies the default route: as long as it stays
-!>        well clear of zero, ε was comfortably positive definite and clipping χ would have been
-!>        a modification of the physics that W never needed. n_neg, λ_min, λ_max and
-!>        Σ|λ_neg|/λ_max are filled only when χ was actually diagonalized, and then measure how
-!>        far the minimum image convention pushes χ(k) out of the positive semidefinite cone.
+!>        Σ|λ_neg|/λ_max is the figure of merit. It is a pure artifact of reconstructing χ(k)
+!>        from χ(Γ) -- it would be exactly zero if the minimum image never wrapped -- so it
+!>        measures the error of any scheme that assumes the phase matrix is rank 1, the
+!>        Γ-collapse of the k-sum among them. On a 392-atom h-BN supercell it runs from 1.2E-2
+!>        at ω_1 to 4.8E-5 at ω_10, and it shrinks as the cell grows.
 !> \param bs_env ...
 !> \param ikp k-point index
 !> \param j_w frequency index
-!> \param clipped whether χ was diagonalized and clipped
 !> \param n_neg number of clipped modes
 !> \param ev smallest and largest eigenvalue of χ
 !> \param discarded Σ|λ_neg| removed by the clipping
-!> \param chi_max max|χ_PQ|
-!> \param pivot_min smallest Cholesky pivot of ε
 ! **************************************************************************************************
-   SUBROUTINE report_chi_eps_conditioning(bs_env, ikp, j_w, clipped, n_neg, ev, discarded, &
-                                          chi_max, pivot_min)
+   SUBROUTINE report_chi_mic_artifact(bs_env, ikp, j_w, n_neg, ev, discarded)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      INTEGER, INTENT(IN)                                :: ikp, j_w
-      LOGICAL, INTENT(IN)                                :: clipped
-      INTEGER, INTENT(IN)                                :: n_neg
+      INTEGER, INTENT(IN)                                :: ikp, j_w, n_neg
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: ev
-      REAL(KIND=dp), INTENT(IN)                          :: discarded, chi_max, pivot_min
+      REAL(KIND=dp), INTENT(IN)                          :: discarded
 
-      CHARACTER(LEN=64)                                  :: chi_fields
       REAL(KIND=dp)                                      :: rel
 
       IF (bs_env%unit_nr <= 0) RETURN
@@ -919,26 +772,19 @@ CONTAINS
       IF (ikp == 1 .AND. j_w == 1) THEN
          WRITE (bs_env%unit_nr, '(A)') ' '
          WRITE (bs_env%unit_nr, '(T2,A,I0)') &
-            'Conditioning of chi(i*omega,k) and epsilon(i*omega,k), n_RI = ', bs_env%n_RI
+            'Minimum-image artifact in chi(i*omega,k), clipped per (k,omega), n_RI = ', bs_env%n_RI
          WRITE (bs_env%unit_nr, '(T2,A)') &
-            '  ikp  j_w  clip    n_neg        lambda_min        lambda_max'// &
-            '   sum|l_neg|/l_max        max|chi_PQ|     min pivot(eps)'
+            '  ikp  j_w    n_neg        lambda_min        lambda_max   sum|l_neg|/l_max'
       END IF
 
-      IF (clipped) THEN
-         rel = 0.0_dp
-         IF (ev(2) > 0.0_dp) rel = discarded/ev(2)
-         WRITE (chi_fields, '(I9,2ES18.6,ES19.6)') n_neg, ev(1), ev(2), rel
-      ELSE
-         chi_fields = '       --                --                --                 --'
-      END IF
+      rel = 0.0_dp
+      IF (ev(2) > 0.0_dp) rel = discarded/ev(2)
 
-      WRITE (bs_env%unit_nr, '(T2,I5,I5,A6,A64,ES19.6,ES19.6)') &
-         ikp, j_w, MERGE('   yes', '    no', clipped), chi_fields, chi_max, pivot_min
+      WRITE (bs_env%unit_nr, '(T2,I5,I5,I9,2ES18.6,ES19.6)') ikp, j_w, n_neg, ev(1), ev(2), rel
 
       CALL m_flush(bs_env%unit_nr)
 
-   END SUBROUTINE report_chi_eps_conditioning
+   END SUBROUTINE report_chi_mic_artifact
 
 ! **************************************************************************************************
 !> \brief ...

@@ -2545,29 +2545,6 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
-      CALL keyword_create(keyword, __LOCATION__, name="EPS_CHI_POS_DEFINITE", &
-                          description="Largest relative negative eigenvalue of the "// &
-                          "polarizability $\\chi_{PQ}(i\\omega,\\mathbf{k})$ that is accepted "// &
-                          "without clipping. A positive semidefinite $\\chi$ guarantees that the "// &
-                          "Cholesky factorization of $\\varepsilon = \\mathbf{1} + "// &
-                          "V^{1/2}M^{-1}\\chi M^{-1}V^{1/2}$ succeeds, but it is only a "// &
-                          "sufficient condition, and enforcing it by diagonalizing $\\chi$ at "// &
-                          "every k-point and frequency costs several times the screened "// &
-                          "interaction it protects. The default 0 therefore leaves $\\chi$ "// &
-                          "untouched and lets the factorization of $\\varepsilon$, which runs "// &
-                          "anyway, decide: if it fails, $\\chi$ is rebuilt, clipped and the "// &
-                          "frequency retried, so the worst case is the cost of the reference "// &
-                          "route. A positive value instead Cholesky-probes $\\chi + "// &
-                          "\\eta\\mathbf{1}$ with $\\eta$ = EPS_CHI_POS_DEFINITE $\\cdot "// &
-                          "\\max_{PQ}|\\chi_{PQ}|$ before every frequency, which succeeds "// &
-                          "precisely when $\\lambda_\\mathrm{min}(\\chi) > -\\eta$ and costs "// &
-                          "about 1/30 of the eigendecomposition. A negative value always "// &
-                          "diagonalizes, which is the reference route.", &
-                          usage="EPS_CHI_POS_DEFINITE 0.0", &
-                          default_r_val=0.0_dp)
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
-
       CALL keyword_create(keyword, __LOCATION__, name="CUTOFF_RADIUS_RI", &
                           description="The cutoff radius (in Angstrom) for the truncated  "// &
                           "Coulomb operator. The larger the cutoff radius, the faster "// &

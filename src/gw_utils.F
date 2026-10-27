@@ -288,7 +288,6 @@ CONTAINS
       CALL section_vals_val_get(gw_sec, "EPS_FILTER", r_val=bs_env%eps_filter)
       CALL section_vals_val_get(gw_sec, "REGULARIZATION_RI", r_val=bs_env%input_regularization_RI)
       CALL section_vals_val_get(gw_sec, "REGULARIZATION_MINIMAX", r_val=bs_env%input_regularization_minimax)
-      CALL section_vals_val_get(gw_sec, "EPS_CHI_POS_DEFINITE", r_val=bs_env%eps_chi_pos_definite)
       CALL section_vals_val_get(gw_sec, "CUTOFF_RADIUS_RI", r_val=bs_env%ri_metric%cutoff_radius)
       CALL section_vals_val_get(gw_sec, "MEMORY_PER_PROC", r_val=bs_env%input_memory_per_proc_GB)
       CALL section_vals_val_get(gw_sec, "APPROX_KP_EXTRAPOL", l_val=bs_env%approx_kp_extrapol)
@@ -950,6 +949,7 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'setup_kpoints_chi_eps_W'
 
+      INTEGER                                            :: i_batch
       INTEGER                                            :: handle, i_dim, n_dim, nkp, nkp_extra, &
                                                             nkp_orig, u
       INTEGER, DIMENSION(3)                              :: nkp_grid, nkp_grid_extra, periodic
@@ -1078,7 +1078,20 @@ CONTAINS
       ! heuristic parameter: how many k-points for χ, ε, and W are used simultaneously
       ! (less simultaneous k-points: less memory, but more computational effort because of
       !  recomputation of V(k))
-      bs_env%nkp_chi_eps_W_batch = 4
+      !
+      ! compute_V_k_by_lattice_sum builds V(k) one batch at a time and takes the real-space
+      ! lattice-sum box from whichever of the two k-meshes the batch belongs to, so a batch
+      ! straddling the boundary at nkp_chi_eps_W_orig has no well-defined box and aborts. Use the
+      ! largest batch size up to the heuristic 4 that divides nkp_orig, which puts a batch
+      ! boundary exactly on the mesh boundary. Without this, small meshes abort: KPOINTS_W 2 2 1
+      ! gives nkp_orig = 2 and the first batch of 4 would span both meshes.
+      bs_env%nkp_chi_eps_W_batch = 1
+      DO i_batch = MIN(4, bs_env%nkp_chi_eps_W_orig), 2, -1
+         IF (MODULO(bs_env%nkp_chi_eps_W_orig, i_batch) == 0) THEN
+            bs_env%nkp_chi_eps_W_batch = i_batch
+            EXIT
+         END IF
+      END DO
 
       bs_env%num_chi_eps_W_batches = (bs_env%nkp_chi_eps_W_orig_plus_extra - 1)/ &
                                      bs_env%nkp_chi_eps_W_batch + 1
