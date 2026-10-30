@@ -54,6 +54,7 @@ MODULE rpa_main
    USE hfx_types,                       ONLY: block_ind_type,&
                                               hfx_compression_type
    USE input_constants,                 ONLY: cohsex_qp_update,&
+                                              gw_multipole_w,&
                                               rpa_exchange_axk,&
                                               rpa_exchange_none,&
                                               rpa_exchange_sosex,&
@@ -91,14 +92,11 @@ MODULE rpa_main
                                               rpa_grad_matrix_operations,&
                                               rpa_grad_needed_mem,&
                                               rpa_grad_type
-   USE rpa_gw,                          ONLY: allocate_matrices_gw,&
-                                              allocate_matrices_gw_im_time,&
-                                              compute_GW_self_energy,&
-                                              compute_QP_energies,&
-                                              compute_W_cubic_GW,&
-                                              deallocate_matrices_gw,&
-                                              deallocate_matrices_gw_im_time,&
-                                              get_fermi_level_offset
+   USE rpa_gw,                          ONLY: &
+        allocate_matrices_gw, allocate_matrices_gw_im_time, compute_GW_self_energy, &
+        compute_QP_energies, compute_W_cubic_GW, deallocate_matrices_gw, &
+        deallocate_matrices_gw_im_time, get_fermi_level_offset, multipole_w_qp_energies, &
+        multipole_w_setup, multipole_w_store
    USE rpa_gw_ic,                       ONLY: calculate_ic_correction
    USE rpa_gw_kpoints_util,             ONLY: get_bandstruc_and_k_dependent_MOs,&
                                               invert_eps_compute_W_and_Erpa_kp
@@ -1117,18 +1115,22 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: col_blk_size, prim_blk_sizes, &
                                                             RI_blk_sizes
       LOGICAL :: do_apply_ic_corr_to_gw, do_gw_im_time, do_ic_model, do_kpoints_cubic_RPA, &
-         do_periodic, do_print, do_ri_Sigma_x, do_static_cohsex, exit_ev_gw, first_cycle, &
-         first_cycle_periodic_correction, my_open_shell, print_ic_values
+         do_multipole_w, do_periodic, do_print, do_ri_Sigma_x, do_static_cohsex, exit_ev_gw, &
+         first_cycle, first_cycle_periodic_correction, my_open_shell, print_ic_values
       LOGICAL, ALLOCATABLE, DIMENSION(:, :, :, :, :)     :: has_mat_P_blocks
       REAL(KIND=dp) :: alpha, dbcsr_time, e_exchange, e_exchange_corr, eps_filter, &
          eps_filter_im_time, ext_scaling, fermi_level_offset, fermi_level_offset_input, &
-         my_flop_rate, omega, omega_max_fit, omega_old, tau, tau_old
+         multipole_w_max, multipole_w_min, my_flop_rate, omega, omega_max_fit, omega_old, tau, &
+         tau_old
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: delta_corr, diag_Qomega, e_fermi, &
-                                                            vec_omega_fit_gw, wkp_W
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: static_cohsex_eigenval_cn, &
+                                                            multipole_poles, vec_omega_fit_gw, &
+                                                            wkp_W
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: multipole_g_fit, &
+                                                            static_cohsex_eigenval_cn, &
                                                             static_cohsex_eigenval_dg, vec_W_gw
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: Eigenval_last, Eigenval_scf, &
                                                             static_cohsex_u, vec_Sigma_x_gw
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: multipole_w_data
       TYPE(cp_cfm_type)                                  :: cfm_mat_Q, cfm_mat_RI_global_work
       TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:)       :: cfm_mat_L_kpoints, &
                                                             cfm_mat_Minv_L_kpoints, cfm_mo_coeff
@@ -1158,6 +1160,8 @@ CONTAINS
       TYPE(rpa_sigma_type)                               :: rpa_sigma
       TYPE(time_frequency_grid_type)                     :: time_frequency_grid
       TYPE(two_dim_int_array), ALLOCATABLE, DIMENSION(:) :: t_3c_O_mo_ind
+
+! fixed-pole multipole model of W^c: poles w_k, G_jk = g_k(ω_j), data W^c_nm,mn(iω_j) (level, m, j, spin)
 
       CALL timeset(routineN, handle)
 
@@ -1197,10 +1201,31 @@ CONTAINS
             iter_evGW = 1
             iter_sc_GW0 = 1
          END IF
+         ! fixed-pole multipole model of W^c (ANALYTIC_CONTINUATION MULTIPOLE_W): W^c(iω_j) of the
+         ! frequency loop is fitted once; G0W0 and evGW0 (SC_GW0_ITER) are both done in
+         ! multipole_w_qp_energies, so the outer eigenvalue loop runs once
+         do_multipole_w = (mp2_env%ri_g0w0%analytic_continuation == gw_multipole_w) .AND. .NOT. do_static_cohsex
+         IF (do_multipole_w) THEN
+            IF (do_im_time) THEN
+               CPABORT("MULTIPOLE_W is only implemented in the O(N^4) GW code.")
+            END IF
+            IF (do_periodic) THEN
+               CPABORT("MULTIPOLE_W with PERIODIC_CORRECTION is not implemented.")
+            END IF
+            IF (do_ri_sos_laplace_mp2) THEN
+               CPABORT("MULTIPOLE_W with SOS-MP2 is not implemented.")
+            END IF
+            IF (mp2_env%ri_g0w0%iter_evGW > 1) THEN
+               CPABORT("MULTIPOLE_W: evGW (W updated) is not implemented, use SC_GW0_ITER (evGW0).")
+            END IF
+            iter_evGW = 1
+            iter_sc_GW0 = 1
+         END IF
       ELSE
          ext_scaling = 0.0_dp
          iter_evGW = 1
          iter_sc_GW0 = 1
+         do_multipole_w = .FALSE.
       END IF
 
       IF (do_kpoints_cubic_RPA .AND. do_ri_sos_laplace_mp2) THEN
@@ -1477,6 +1502,33 @@ CONTAINS
             first_cycle = .FALSE.
          END IF
 
+         ! ==============================================================================
+         ! fixed-pole multipole model of W^c (ANALYTIC_CONTINUATION MULTIPOLE_W)
+         !   poles w_k logarithmic in [w_min, w_max], w_min = DFT HOMO-LUMO gap, w_max = 2 max(ω_j) by default
+         !   G_jk = -2 w_k/(ω_j^2 + w_k^2),  ω_j the frequencies of this loop
+         !   W^c_nm,mn(iω_j) stored in the loop; residues T^(k)_nm >= 0 fitted after the loop
+         ! ==============================================================================
+         IF (do_multipole_w) THEN
+            multipole_w_min = mp2_env%ri_g0w0%multipole_w_min
+            IF (multipole_w_min <= 0.0_dp) THEN
+               multipole_w_min = Eigenval_scf(homo(1) + 1, 1, 1) - Eigenval_scf(homo(1), 1, 1)
+               DO ispin = 2, nspins
+                  multipole_w_min = MIN(multipole_w_min, &
+                                        Eigenval_scf(homo(ispin) + 1, 1, ispin) - Eigenval_scf(homo(ispin), 1, ispin))
+               END DO
+            END IF
+            ! highest pole: twice the highest sampled frequency by default; poles far above the sampled
+            ! frequencies are undetermined by the fit (H2O/cc-pVDZ, 40 points: 0.5 eV gap error for
+            ! w_max = 30 Ha, 0.000 eV for w_max = 2 max(ω_j))
+            multipole_w_max = mp2_env%ri_g0w0%multipole_w_max
+            IF (multipole_w_max <= 0.0_dp) multipole_w_max = 2.0_dp*MAXVAL(time_frequency_grid%frequency(1:num_integ_points))
+            CALL multipole_w_setup(time_frequency_grid%frequency(1:num_integ_points), multipole_w_min, &
+                                   multipole_w_max, mp2_env%ri_g0w0%multipole_w_npoles, &
+                                   multipole_poles, multipole_g_fit, unit_nr)
+            ALLOCATE (multipole_w_data(gw_corr_lev_tot, nmo, num_integ_points, nspins))
+            multipole_w_data(:, :, :, :) = 0.0_dp
+         END IF
+
          DO jquad = 1, num_integ_points
             ! static COHSEX needs no frequency integral
             IF (do_static_cohsex) EXIT
@@ -1646,6 +1698,12 @@ CONTAINS
                                               fm_mat_S_gw_work, mo_coeff(1), para_env, &
                                               para_env_RPA, matrix_berry_im_mo_mo, matrix_berry_re_mo_mo, &
                                               kpoints, qs_env, mp2_env)
+                  ! multipole model: store W^c_nm,mn(iω_j) (vec_W_gw of this frequency)
+                  IF (do_multipole_w) THEN
+                     DO ispin = 1, nspins
+                        CALL multipole_w_store(multipole_w_data(:, :, jquad, ispin), vec_W_gw(:, ispin), nmo)
+                     END DO
+                  END IF
                END IF
             END IF
 
@@ -1742,7 +1800,15 @@ CONTAINS
          ! for low-scaling and ordinary-scaling: analytic continuation from Sigma(iw) -> Sigma(w)
          !                                       and correction of quasiparticle energies e_n^GW
          ! (static COHSEX energies are already computed and printed in static_cohsex_qp_energies)
-         IF (my_do_gw .AND. .NOT. do_static_cohsex) THEN
+         IF (my_do_gw .AND. do_multipole_w) THEN
+            ! multipole model: Σ^c(ω) in closed form, QP equation solved exactly, evGW0 inside
+            CALL multipole_w_qp_energies(multipole_w_data, multipole_g_fit, multipole_poles, Eigenval, &
+                                         Eigenval_last, Eigenval_scf, &
+                                         gw_corr_lev_occ, gw_corr_lev_virt, gw_corr_lev_tot, homo, nmo, &
+                                         unit_nr, para_env, kpoints, mp2_env)
+            DEALLOCATE (multipole_w_data, multipole_poles, multipole_g_fit)
+            EXIT
+         ELSE IF (my_do_gw .AND. .NOT. do_static_cohsex) THEN
 
             CALL compute_QP_energies(vec_Sigma_c_gw, count_ev_sc_GW, gw_corr_lev_occ, &
                                      gw_corr_lev_tot, gw_corr_lev_virt, homo, &

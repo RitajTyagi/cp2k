@@ -144,6 +144,12 @@ CONTAINS
                                 i_val=mp2_env%ri_g0w0%nparam_pade)
       CALL section_vals_val_get(mp2_section, "RI_RPA%GW%ANALYTIC_CONTINUATION", &
                                 i_val=mp2_env%ri_g0w0%analytic_continuation)
+      CALL section_vals_val_get(mp2_section, "RI_RPA%GW%MULTIPOLE_W_NPOLES", &
+                                i_val=mp2_env%ri_g0w0%multipole_w_npoles)
+      CALL section_vals_val_get(mp2_section, "RI_RPA%GW%MULTIPOLE_W_MIN", &
+                                r_val=mp2_env%ri_g0w0%multipole_w_min)
+      CALL section_vals_val_get(mp2_section, "RI_RPA%GW%MULTIPOLE_W_MAX", &
+                                r_val=mp2_env%ri_g0w0%multipole_w_max)
       CALL section_vals_val_get(mp2_section, "RI_RPA%GW%OMEGA_MAX_FIT", &
                                 r_val=mp2_env%ri_g0w0%omega_max_fit)
       CALL section_vals_val_get(mp2_section, "RI_RPA%GW%CROSSING_SEARCH", &

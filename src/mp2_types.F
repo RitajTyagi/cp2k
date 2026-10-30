@@ -205,6 +205,12 @@ MODULE mp2_types
                                                             nparam_pade = 0, &
                                                             analytic_continuation = gw_pade_approx
       REAL(KIND=dp)                                      :: omega_max_fit = 0.0_dp
+      ! fixed-pole multipole model of W^c (ANALYTIC_CONTINUATION MULTIPOLE_W): number of poles and
+      ! lowest/highest pole energy (Hartree; multipole_w_min <= 0: DFT HOMO-LUMO gap,
+      ! multipole_w_max <= 0: twice the highest imaginary frequency of the grid)
+      INTEGER                                            :: multipole_w_npoles = 8
+      REAL(KIND=dp)                                      :: multipole_w_min = -1.0_dp, &
+                                                            multipole_w_max = -1.0_dp
       INTEGER                                            :: crossing_search = ri_rpa_g0w0_crossing_z_shot
       REAL(KIND=dp)                                      :: fermi_level_offset = 0.0_dp
       INTEGER                                            :: iter_evGW = 0, &

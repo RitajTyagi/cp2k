@@ -17,4 +17,7 @@
 "static_COHSEX_H2O_PBE_HFX_window.inp"       = [{matcher="E_static_COHSEX_gap_DG", tol=1e-04, ref=18.021}]
 "BSE_static_COHSEX_H2O_PBE_diagonal_TDA.inp"  = [{matcher="BSE_1st_excit_ener_TDA", tol=2e-05, ref=9.9944}]
 "BSE_static_COHSEX_H2O_PBE_qp_update.inp"     = [{matcher="BSE_1st_excit_ener", tol=2e-05, ref=9.8616}]
+"G0W0_H2O_PBE_multipole_w.inp"          = [{matcher="E_G0W0_gap", tol=1e-04, ref=16.3412}]
+"evGW0_H2O_PBE_multipole_w.inp"         = [{matcher="E_evGW0_gap_last", tol=1e-04, ref=16.8031}]
+"BSE_G0W0_H2O_PBE_multipole_w.inp"      = [{matcher="BSE_1st_excit_ener_TDA", tol=2e-05, ref=7.7301}]
 #EOF

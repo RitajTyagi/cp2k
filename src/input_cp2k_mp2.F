@@ -34,7 +34,7 @@ MODULE input_cp2k_mp2
       bse_triplet, do_eri_gpw, do_eri_mme, do_eri_os, do_potential_coulomb, do_potential_id, &
       do_potential_long, do_potential_mix_cl, do_potential_short, do_potential_truncated, &
       do_potential_tshpsc, eri_default, gaussian, gw_no_print_exx, gw_pade_approx, gw_print_exx, &
-      gw_read_exx, gw_skip_for_regtest, gw_two_pole_model, kp_weights_W_auto, &
+      gw_multipole_w, gw_read_exx, gw_skip_for_regtest, gw_two_pole_model, kp_weights_W_auto, &
       kp_weights_W_tailored, kp_weights_W_uniform, mp2_method_direct, mp2_method_gpw, &
       mp2_method_none, numerical, ot_precond_full_all, ot_precond_full_kinetic, &
       ot_precond_full_single, ot_precond_full_single_inverse, ot_precond_none, &
@@ -991,11 +991,49 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="ANALYTIC_CONTINUATION", &
                           description="Defines which type of analytic continuation for the self energy is used", &
                           usage="ANALYTIC_CONTINUATION", &
-                          enum_c_vals=s2a("TWO_POLE", "PADE"), &
-                          enum_i_vals=[gw_two_pole_model, gw_pade_approx], &
+                          enum_c_vals=s2a("TWO_POLE", "PADE", "MULTIPOLE_W"), &
+                          enum_i_vals=[gw_two_pole_model, gw_pade_approx, gw_multipole_w], &
                           enum_desc=s2a("Use 'two-pole' model.", &
-                                        "Use Pade approximation."), &
+                                        "Use Pade approximation.", &
+                                        "No continuation of the self-energy: the correlation part of the "// &
+                                        "screened interaction on the imaginary-frequency grid is represented "// &
+                                        "by poles at fixed real energies $w_k$, "// &
+                                        "$W^\text{c}(i\omega) \approx \sum_k R^{(k)}\,(-2w_k)/(\omega^2+w_k^2)$, "// &
+                                        "with residues $R^{(k)}$ from a linear least-squares fit. "// &
+                                        "$\Sigma^\text{c}(\omega)$ then follows in closed form on the real "// &
+                                        "axis and the quasiparticle equation is solved exactly. evGW0 "// &
+                                        "(SC_GW0_ITER) iterates only the energies in $G$ with $W$ built once. "// &
+                                        "See MULTIPOLE_W_NPOLES, MULTIPOLE_W_MIN and MULTIPOLE_W_MAX."), &
                           default_i_val=gw_pade_approx)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPOLE_W_NPOLES", &
+                          description="Number of poles $w_k$ of the multipole model of $W^\text{c}$ "// &
+                          "(ANALYTIC_CONTINUATION MULTIPOLE_W). Must not exceed QUADRATURE_POINTS.", &
+                          usage="MULTIPOLE_W_NPOLES 8", &
+                          default_i_val=8)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPOLE_W_MIN", &
+                          description="Lowest pole energy of the multipole model of $W^\text{c}$ "// &
+                          "(ANALYTIC_CONTINUATION MULTIPOLE_W); the poles are spaced logarithmically "// &
+                          "up to MULTIPOLE_W_MAX. Non-positive: the DFT HOMO-LUMO gap, the lower bound of "// &
+                          "the RPA excitation spectrum. Values below it place poles where $W^\text{c}$ has "// &
+                          "no spectral weight and are not recommended.", &
+                          usage="MULTIPOLE_W_MIN [eV] 5.0", &
+                          default_r_val=-1.0_dp, unit_str="eV")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPOLE_W_MAX", &
+                          description="Highest pole energy of the multipole model of $W^\text{c}$ "// &
+                          "(ANALYTIC_CONTINUATION MULTIPOLE_W). Non-positive: twice the highest imaginary "// &
+                          "frequency of the RPA_NUM_QUAD_POINTS grid. Poles far above the sampled "// &
+                          "frequencies are not determined by the fit and degrade the result.", &
+                          usage="MULTIPOLE_W_MAX [hartree] 10.0", &
+                          default_r_val=-1.0_dp, unit_str="hartree")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 

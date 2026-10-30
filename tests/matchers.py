@@ -395,6 +395,9 @@ registry["E_evGW0_gap"] = GenericMatcher(
     r"HOMO-LUMO gap in evGW0 iteration  3 (eV)", col=8
 )
 
+# evGW0 HOMO-LUMO gap of molecule, last iteration
+registry["E_evGW0_gap_last"] = GenericMatcher(r"HOMO-LUMO gap in evGW0 iteration", col=8)
+
 # evGW HOMO-LUMO gap of molecule
 registry["E_evGW_gap"] = GenericMatcher(
     r"HOMO-LUMO gap in evGW iteration  3 (eV)", col=8

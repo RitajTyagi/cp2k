@@ -166,7 +166,8 @@ MODULE rpa_gw
 
    PUBLIC :: allocate_matrices_gw_im_time, allocate_matrices_gw, compute_GW_self_energy, compute_QP_energies, &
              deallocate_matrices_gw_im_time, deallocate_matrices_gw, compute_minus_vxc_kpoints, trafo_to_mo_and_kpoints, &
-             get_fermi_level_offset, compute_W_cubic_GW, continuation_pade
+             get_fermi_level_offset, compute_W_cubic_GW, continuation_pade, multipole_w_setup, &
+             multipole_w_store, multipole_w_qp_energies
 
 CONTAINS
 
@@ -6485,5 +6486,455 @@ CONTAINS
 
       CALL timestop(handle)
    END SUBROUTINE trace_sigma_gw
+
+! **************************************************************************************************
+!> \brief Fixed-pole multipole model of the correlation part of the screened Coulomb interaction,
+!>        fitted on the imaginary-frequency grid of the GW frequency integration
+!>          W^c_nm,mn(iω) ≈ Σ_k T^(k)_nm g_k(ω),   g_k(ω) = -2 w_k / (ω^2 + w_k^2)
+!>        with W^c_nm,mn(iω) = Σ_PQ B^P_nm W^c_PQ(iω) B^Q_mn. Every pole acts like one RPA excitation
+!>        Ω_s = w_k of the exact spectral representation
+!>          W^c_nm,mn(iω) = -Σ_s 2 Ω_s |V^s_nm|^2 / (ω^2 + Ω_s^2),
+!>        so Σ^c(ω) follows on the real axis in closed form (no analytic continuation of Σ). Since the
+!>        exact W^c_nm,mn(iω) is a non-negative combination of the g_k (|V^s_nm|^2 >= 0), the residues
+!>        are fitted with non-negative least squares (multipole_w_qp_energies), T^(k)_nm >= 0.
+!>        Poles: logarithmic in [w_min, w_max]. The RPA spectrum starts at Ω_1 >= ϵ_LUMO - ϵ_HOMO
+!>        (A+B >= A-B = Δ), so w_min = DFT HOMO-LUMO gap places no pole below the physical spectrum
+!>        and keeps Σ^c pole-free near the band-edge quasiparticle energies. w_max should not exceed
+!>        about twice the highest sampled frequency: residues of poles far above the data are
+!>        undetermined (their g_k are nearly constant, i.e. collinear, on the sampled interval).
+!> \param frequency imaginary frequencies ω_j of the GW frequency grid
+!> \param w_min lowest pole energy (Hartree)
+!> \param w_max highest pole energy (Hartree)
+!> \param npoles number of poles N_k
+!> \param poles w_k (Hartree), allocated here
+!> \param g_fit G_jk = g_k(ω_j) (N_freq x N_k), allocated here
+!> \param unit_nr ...
+! **************************************************************************************************
+   SUBROUTINE multipole_w_setup(frequency, w_min, w_max, npoles, poles, g_fit, unit_nr)
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: frequency
+      REAL(KIND=dp), INTENT(IN)                          :: w_min, w_max
+      INTEGER, INTENT(IN)                                :: npoles
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:), &
+         INTENT(OUT)                                     :: poles
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT)                                     :: g_fit
+      INTEGER, INTENT(IN)                                :: unit_nr
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'multipole_w_setup'
+
+      INTEGER                                            :: handle, j, k, nfreq
+
+      CALL timeset(routineN, handle)
+
+      nfreq = SIZE(frequency)
+      IF (npoles < 1) THEN
+         CPABORT("MULTIPOLE_W_NPOLES must be positive.")
+      END IF
+      IF (npoles > nfreq) THEN
+         CPABORT("MULTIPOLE_W needs at least as many frequency points (QUADRATURE_POINTS) as poles.")
+      END IF
+      IF (w_min <= 0.0_dp .OR. w_max <= w_min) THEN
+         CPABORT("MULTIPOLE_W: need 0 < MULTIPOLE_W_MIN < MULTIPOLE_W_MAX.")
+      END IF
+
+      ! w_k = w_min (w_max/w_min)^((k-1)/(N_k-1)), logarithmic
+      ALLOCATE (poles(npoles))
+      DO k = 1, npoles
+         IF (npoles == 1) THEN
+            poles(k) = w_min
+         ELSE
+            poles(k) = w_min*(w_max/w_min)**(REAL(k - 1, dp)/REAL(npoles - 1, dp))
+         END IF
+      END DO
+
+      ! G_jk = -2 w_k / (ω_j^2 + w_k^2)
+      ALLOCATE (g_fit(nfreq, npoles))
+      DO k = 1, npoles
+         DO j = 1, nfreq
+            g_fit(j, k) = -2.0_dp*poles(k)/(frequency(j)**2 + poles(k)**2)
+         END DO
+      END DO
+
+      IF (unit_nr > 0) THEN
+         WRITE (unit_nr, '(/,T3,A)') 'MULTIPOLE_W| Fixed-pole model of W^c(iω), Σ^c(ω) evaluated analytically'
+         WRITE (unit_nr, '(T3,A,T75,I6)') 'MULTIPOLE_W| Number of poles', npoles
+         WRITE (unit_nr, '(T3,A,T75,I6)') 'MULTIPOLE_W| Number of imaginary frequencies of the fit', nfreq
+         WRITE (unit_nr, '(T3,A,T61,F10.3,F10.1)') 'MULTIPOLE_W| Lowest and highest pole (eV)', &
+            poles(1)*evolt, poles(npoles)*evolt
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE multipole_w_setup
+
+! **************************************************************************************************
+!> \brief Store W^c_nm,mn(iω_j) of one imaginary frequency for the multipole fit
+!>        vec_W_gw holds W^c_nm,mn(iω_j) from compute_GW_self_energy_deep for the local columns
+!>        (zero elsewhere), compound index nm = (n_level-1)*nmo + m, n_level = 1..gw_corr_lev_tot
+!> \param w_data W^c_nm,mn(iω_j) (n_level, m), partial data of this rank
+!> \param vec_W_gw W^c_nm,mn(iω_j)
+!> \param nmo ...
+! **************************************************************************************************
+   SUBROUTINE multipole_w_store(w_data, vec_W_gw, nmo)
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: w_data
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: vec_W_gw
+      INTEGER, INTENT(IN)                                :: nmo
+
+      INTEGER                                            :: m_global, n_level, nm_global
+
+      DO nm_global = 1, SIZE(vec_W_gw)
+         IF (vec_W_gw(nm_global) == 0.0_dp) CYCLE
+         ! same index mapping as in compute_GW_self_energy_deep
+         n_level = MAX(1, nm_global - 1)/nmo + 1
+         m_global = nm_global - (n_level - 1)*nmo
+         w_data(n_level, m_global) = w_data(n_level, m_global) + vec_W_gw(nm_global)
+      END DO
+
+   END SUBROUTINE multipole_w_store
+
+! **************************************************************************************************
+!> \brief Non-negative least squares, min ||A x - b|| subject to x >= 0 (Lawson and Hanson,
+!>        Solving Least Squares Problems, 1974, Ch. 23); the unconstrained subproblems on the
+!>        passive set are solved with LAPACK dgels
+!> \param a A (m x n)
+!> \param b b (m)
+!> \param x x (n), x >= 0
+! **************************************************************************************************
+   SUBROUTINE nnls_lawson_hanson(a, b, x)
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: a
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: b
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: x
+
+      INTEGER                                            :: i, info, inner, j, jmax, lwork, m, n, &
+                                                            n_passive, outer
+      LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: passive
+      REAL(KIND=dp)                                      :: alpha, tol, wmax
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: rhs, w, work, z
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: a_p
+
+      m = SIZE(a, 1)
+      n = SIZE(a, 2)
+      ALLOCATE (passive(n), w(n), z(n), rhs(MAX(m, n)), a_p(m, n), work(MAX(1, 64*(m + n))))
+      lwork = SIZE(work)
+      x(:) = 0.0_dp
+      passive(:) = .FALSE.
+      tol = 10.0_dp*EPSILON(1.0_dp)*MAXVAL(ABS(a))*REAL(MAX(m, n), dp)
+
+      DO outer = 1, 3*n
+         ! gradient w = A^T (b - A x)
+         w(:) = MATMUL(TRANSPOSE(a), b - MATMUL(a, x))
+         wmax = 0.0_dp
+         jmax = 0
+         DO j = 1, n
+            IF (.NOT. passive(j) .AND. w(j) > wmax) THEN
+               wmax = w(j)
+               jmax = j
+            END IF
+         END DO
+         IF (jmax == 0 .OR. wmax <= tol) EXIT
+         passive(jmax) = .TRUE.
+
+         DO inner = 1, 3*n
+            ! z = argmin ||A_P z - b|| on the passive set, z = 0 elsewhere
+            n_passive = 0
+            DO j = 1, n
+               IF (passive(j)) THEN
+                  n_passive = n_passive + 1
+                  a_p(:, n_passive) = a(:, j)
+               END IF
+            END DO
+            rhs(1:m) = b(:)
+            CALL dgels('N', m, n_passive, 1, a_p, m, rhs, MAX(m, n), work, lwork, info)
+            IF (info /= 0) CPABORT("nnls_lawson_hanson: dgels failed.")
+            z(:) = 0.0_dp
+            i = 0
+            DO j = 1, n
+               IF (passive(j)) THEN
+                  i = i + 1
+                  z(j) = rhs(i)
+               END IF
+            END DO
+            IF (ALL(z(:) > tol .OR. .NOT. passive(:))) THEN
+               x(:) = z(:)
+               EXIT
+            END IF
+            ! step back to the boundary of the feasible region
+            alpha = HUGE(1.0_dp)
+            DO j = 1, n
+               IF (passive(j) .AND. z(j) <= tol) alpha = MIN(alpha, x(j)/(x(j) - z(j)))
+            END DO
+            x(:) = x(:) + alpha*(z(:) - x(:))
+            DO j = 1, n
+               IF (passive(j) .AND. x(j) <= tol) THEN
+                  passive(j) = .FALSE.
+                  x(j) = 0.0_dp
+               END IF
+            END DO
+         END DO
+      END DO
+
+      DEALLOCATE (passive, w, z, rhs, a_p, work)
+
+   END SUBROUTINE nnls_lawson_hanson
+
+! **************************************************************************************************
+!> \brief Multipole-model correlation self-energy of one level and its frequency derivative
+!>          Σ^c_nn(ω) = Σ_k Σ_m T^(k)_nm [ θ_m^occ/(ω - ϵ_m + w_k) + θ_m^vir/(ω - ϵ_m - w_k) ]
+!> \param t_n T^(k)_nm (m, k) of level n
+!> \param poles w_k
+!> \param e_g energies ϵ_m in the Green's function
+!> \param homo ...
+!> \param omega ω
+!> \param sigma Σ^c_nn(ω)
+!> \param dsigma dΣ^c_nn/dω
+! **************************************************************************************************
+   PURE SUBROUTINE multipole_w_sigma(t_n, poles, e_g, homo, omega, sigma, dsigma)
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: t_n
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: poles, e_g
+      INTEGER, INTENT(IN)                                :: homo
+      REAL(KIND=dp), INTENT(IN)                          :: omega
+      REAL(KIND=dp), INTENT(OUT)                         :: sigma, dsigma
+
+      INTEGER                                            :: k, m
+      REAL(KIND=dp)                                      :: denom
+
+      sigma = 0.0_dp
+      dsigma = 0.0_dp
+      DO k = 1, SIZE(poles)
+         DO m = 1, SIZE(e_g)
+            IF (m <= homo) THEN
+               denom = omega - e_g(m) + poles(k)
+            ELSE
+               denom = omega - e_g(m) - poles(k)
+            END IF
+            sigma = sigma + t_n(m, k)/denom
+            dsigma = dsigma - t_n(m, k)/denom**2
+         END DO
+      END DO
+
+   END SUBROUTINE multipole_w_sigma
+
+! **************************************************************************************************
+!> \brief Quasiparticle energies with the fixed-pole multipole model of W^c, G0W0 or evGW0
+!>
+!>        QP equation for every level n of the window (CORR_MOS_OCC/VIRT):
+!>          ϵ_n^GW = ϵ_n^DFT + Σ^x_nn - v^xc_nn + Σ^c_nn(ϵ_n^GW)
+!>        Between consecutive poles of Σ^c_nn (residues T >= 0) the equation has exactly one root; the
+!>        roots within ±1 Ha of the current energy are found by Newton safeguarded with bisection, and
+!>        the one with the largest spectral weight Z = 1/(1 - dΣ^c/dω) is the quasiparticle energy.
+!>        Σ^c_nn(ω) from multipole_w_sigma with the energies ϵ_m in G of the current cycle.
+!>        evGW0 (SC_GW0_ITER > 1): W and the residues T^(k)_nm are built once from the DFT energies;
+!>        each cycle only replaces ϵ_m in the denominators by the QP energies of the previous cycle,
+!>        the levels outside the window are shifted rigidly (scissor, shift_unshifted_levels).
+!>        Converged when the HOMO-LUMO gap changes by less than EPS_ITER.
+!> \param w_data W^c_nm,mn(iω_j) (n_level, m, j, spin), summed over all ranks here
+!> \param g_fit G_jk = g_k(ω_j)
+!> \param poles w_k
+!> \param Eigenval on exit: QP energies (scissor outside the window)
+!> \param Eigenval_last on exit: DFT energies, i.e. the energies of the χ build (used by the BSE to
+!>        remove the RPA energy factor of the 3-center integrals)
+!> \param Eigenval_scf DFT energies
+!> \param gw_corr_lev_occ ...
+!> \param gw_corr_lev_virt ...
+!> \param gw_corr_lev_tot ...
+!> \param homo ...
+!> \param nmo ...
+!> \param unit_nr ...
+!> \param para_env ...
+!> \param kpoints ...
+!> \param mp2_env ...
+! **************************************************************************************************
+   SUBROUTINE multipole_w_qp_energies(w_data, g_fit, poles, Eigenval, Eigenval_last, Eigenval_scf, &
+                                      gw_corr_lev_occ, gw_corr_lev_virt, gw_corr_lev_tot, homo, nmo, &
+                                      unit_nr, para_env, kpoints, mp2_env)
+      REAL(KIND=dp), DIMENSION(:, :, :, :), &
+         INTENT(INOUT)                                   :: w_data
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: g_fit
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: poles
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT)   :: Eigenval, Eigenval_last, Eigenval_scf
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: gw_corr_lev_occ, gw_corr_lev_virt
+      INTEGER, INTENT(IN)                                :: gw_corr_lev_tot
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: homo
+      INTEGER, INTENT(IN)                                :: nmo, unit_nr
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(mp2_type)                                     :: mp2_env
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'multipole_w_qp_energies'
+      INTEGER, PARAMETER                                 :: maxit_newton = 200
+      REAL(KIND=dp), PARAMETER                           :: search_range = 1.0_dp, &
+                                                            tol_newton = 1.0E-9_dp
+
+      INTEGER                                            :: count_sc_GW0, handle, i_fit, i_int, &
+                                                            ispin, ispin_print, it, k, m, n_iter, &
+                                                            n_level, n_pole, n_ref, nspins
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: sort_idx
+      LOGICAL                                            :: all_converged, converged
+      REAL(KIND=dp) :: a_br, b_br, base, dsigma, f_a, f_b, f_val, gap_new, gap_old, omega, omega0, &
+         omega_new, omega_root, pole, sigma, t_cut, z_best, z_root
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: e_g, m_value, pole_list, z_value
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: vec_gw_energ
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: t_mp
+
+      CALL timeset(routineN, handle)
+
+      nspins = SIZE(Eigenval, 3)
+
+      ! residues T^(k)_nm >= 0: NNLS fit of the sampled W^c_nm,mn(iω_j), min_T ||G T_nm - W_nm||,
+      ! distributed over the ranks
+      CALL para_env%sum(w_data)
+      ALLOCATE (t_mp(SIZE(w_data, 1), nmo, SIZE(poles), nspins))
+      t_mp(:, :, :, :) = 0.0_dp
+      i_fit = 0
+      DO ispin = 1, nspins
+         DO m = 1, nmo
+            DO n_level = 1, SIZE(w_data, 1)
+               i_fit = i_fit + 1
+               IF (MODULO(i_fit, para_env%num_pe) /= para_env%mepos) CYCLE
+               CALL nnls_lawson_hanson(g_fit, w_data(n_level, m, :, ispin), t_mp(n_level, m, :, ispin))
+            END DO
+         END DO
+      END DO
+      CALL para_env%sum(t_mp)
+
+      ! evGW0: SC_GW0_ITER cycles of the energies in G (W fixed); G0W0: one cycle
+      n_iter = MAX(1, mp2_env%ri_g0w0%iter_sc_GW0)
+
+      ALLOCATE (vec_gw_energ(gw_corr_lev_tot, nspins), z_value(gw_corr_lev_tot), &
+                m_value(gw_corr_lev_tot), e_g(nmo), pole_list(nmo*SIZE(poles) + 2), &
+                sort_idx(nmo*SIZE(poles) + 2))
+      ! the full QP equation is solved: E_GW = E_SCF + Σ^c(E_GW) + Σ^x - v^xc, i.e. Z = 1, m = 0
+      ! in print_and_update_for_ev_sc
+      z_value(:) = 1.0_dp
+      m_value(:) = 0.0_dp
+      all_converged = .TRUE.
+
+      DO count_sc_GW0 = 1, n_iter
+
+         gap_old = MINVAL(Eigenval(homo(1) + 1:homo(1) + gw_corr_lev_virt(1), 1, 1)) - &
+                   MAXVAL(Eigenval(homo(1) - gw_corr_lev_occ(1) + 1:homo(1), 1, 1))
+
+         vec_gw_energ(:, :) = 0.0_dp
+         DO ispin = 1, nspins
+            ! energies in G of this cycle (DFT in the first cycle)
+            e_g(:) = Eigenval(:, 1, ispin)
+            DO n_level = 1, gw_corr_lev_occ(ispin) + gw_corr_lev_virt(ispin)
+               n_ref = n_level + homo(ispin) - gw_corr_lev_occ(ispin)
+               ! QP solution with the largest spectral weight Z = 1/(1 - dΣ^c/dω):
+               ! Σ^c_nn has poles at ϵ_m - w_k (m occupied) and ϵ_m + w_k (m virtual) with T^(k)_nm > 0.
+               ! Between two consecutive poles f(ω) = ω - ϵ_n^DFT - (Σ^x - v^xc)_nn - Σ^c_nn(ω) has f' >= 1
+               ! and runs from -∞ to +∞, so each such interval holds exactly one root. All intervals within
+               ! ±search_range of the current energy ω_0 are scanned (poles with residues below
+               ! 1E-3 max_k,m T^(k)_nm are ignored), and the root with the largest Z is the quasiparticle;
+               ! near the gap there is a single root. Roots by safeguarded Newton (bisection if Newton
+               ! leaves the bracket).
+               omega0 = Eigenval(n_ref, 1, ispin)
+               base = Eigenval_scf(n_ref, 1, ispin) + mp2_env%ri_g0w0%vec_Sigma_x_minus_vxc_gw(n_ref, ispin, 1)
+               t_cut = 1.0E-3_dp*MAXVAL(t_mp(n_level, :, :, ispin))
+               n_pole = 0
+               pole_list(1) = omega0 - search_range
+               DO k = 1, SIZE(poles)
+                  DO m = 1, nmo
+                     IF (t_mp(n_level, m, k, ispin) <= t_cut) CYCLE
+                     IF (m <= homo(ispin)) THEN
+                        pole = e_g(m) - poles(k)
+                     ELSE
+                        pole = e_g(m) + poles(k)
+                     END IF
+                     IF (ABS(pole - omega0) < search_range) THEN
+                        n_pole = n_pole + 1
+                        pole_list(n_pole + 1) = pole
+                     END IF
+                  END DO
+               END DO
+               pole_list(n_pole + 2) = omega0 + search_range
+               CALL sort(pole_list(1:n_pole + 2), n_pole + 2, sort_idx(1:n_pole + 2))
+               converged = .FALSE.
+               z_best = -1.0_dp
+               omega = omega0
+               DO i_int = 1, n_pole + 1
+                  a_br = pole_list(i_int) + 1.0E-9_dp
+                  b_br = pole_list(i_int + 1) - 1.0E-9_dp
+                  IF (b_br <= a_br) CYCLE
+                  CALL multipole_w_sigma(t_mp(n_level, :, :, ispin), poles, e_g, homo(ispin), a_br, sigma, dsigma)
+                  f_a = a_br - base - sigma
+                  CALL multipole_w_sigma(t_mp(n_level, :, :, ispin), poles, e_g, homo(ispin), b_br, sigma, dsigma)
+                  f_b = b_br - base - sigma
+                  IF (.NOT. (f_a < 0.0_dp .AND. f_b > 0.0_dp)) CYCLE
+                  omega_root = 0.5_dp*(a_br + b_br)
+                  DO it = 1, maxit_newton
+                     CALL multipole_w_sigma(t_mp(n_level, :, :, ispin), poles, e_g, homo(ispin), omega_root, &
+                                            sigma, dsigma)
+                     f_val = omega_root - base - sigma
+                     IF (f_val < 0.0_dp) THEN
+                        a_br = omega_root
+                     ELSE
+                        b_br = omega_root
+                     END IF
+                     omega_new = omega_root - f_val/(1.0_dp - dsigma)
+                     ! bisection if Newton leaves the bracket
+                     IF (omega_new <= a_br .OR. omega_new >= b_br) omega_new = 0.5_dp*(a_br + b_br)
+                     IF (ABS(omega_new - omega_root) < tol_newton) THEN
+                        omega_root = omega_new
+                        EXIT
+                     END IF
+                     omega_root = omega_new
+                  END DO
+                  CALL multipole_w_sigma(t_mp(n_level, :, :, ispin), poles, e_g, homo(ispin), omega_root, &
+                                         sigma, dsigma)
+                  z_root = 1.0_dp/(1.0_dp - dsigma)
+                  IF (z_root > z_best) THEN
+                     z_best = z_root
+                     omega = omega_root
+                     converged = .TRUE.
+                  END IF
+               END DO
+               IF (.NOT. converged) THEN
+                  ! no root within ±search_range: linearized solution at ω_0
+                  CALL multipole_w_sigma(t_mp(n_level, :, :, ispin), poles, e_g, homo(ispin), omega0, &
+                                         sigma, dsigma)
+                  omega = omega0 + (base + sigma - omega0)/(1.0_dp - dsigma)
+               END IF
+               IF (.NOT. converged) all_converged = .FALSE.
+               CALL multipole_w_sigma(t_mp(n_level, :, :, ispin), poles, e_g, homo(ispin), omega, &
+                                      sigma, dsigma)
+               vec_gw_energ(n_level, ispin) = sigma
+            END DO
+         END DO
+
+         ! print, update Eigenval in the window (Eigenval_last <- previous energies), scissor outside
+         DO ispin = 1, nspins
+            ispin_print = ispin
+            IF (nspins == 1) ispin_print = 0
+            CALL print_and_update_for_ev_sc(vec_gw_energ(:, ispin), z_value, m_value, &
+                                            mp2_env%ri_g0w0%vec_Sigma_x_minus_vxc_gw(:, ispin, 1), &
+                                            Eigenval(:, 1, ispin), Eigenval_last(:, 1, ispin), &
+                                            Eigenval_scf(:, 1, ispin), gw_corr_lev_occ(ispin), &
+                                            gw_corr_lev_virt(ispin), gw_corr_lev_tot, &
+                                            ri_rpa_g0w0_crossing_newton, homo(ispin), unit_nr, 1, &
+                                            count_sc_GW0, 1, 1, kpoints, ispin_print)
+            CALL shift_unshifted_levels(Eigenval(:, 1, ispin), Eigenval_last(:, 1, ispin), &
+                                        gw_corr_lev_occ(ispin), gw_corr_lev_virt(ispin), homo(ispin), nmo)
+         END DO
+
+         gap_new = MINVAL(Eigenval(homo(1) + 1:homo(1) + gw_corr_lev_virt(1), 1, 1)) - &
+                   MAXVAL(Eigenval(homo(1) - gw_corr_lev_occ(1) + 1:homo(1), 1, 1))
+         IF (count_sc_GW0 > 1 .AND. ABS(gap_new - gap_old) < mp2_env%ri_g0w0%eps_iter) EXIT
+
+      END DO
+
+      IF (.NOT. all_converged) THEN
+         CPWARN("MULTIPOLE_W: the quasiparticle equation did not converge for some levels.")
+      END IF
+
+      ! the BSE removes the RPA energy factor of the 3-center integrals with Eigenval_last, i.e. with
+      ! the energies of the χ build, which are the DFT energies here (W is built once)
+      Eigenval_last(:, :, :) = Eigenval_scf(:, :, :)
+
+      DEALLOCATE (vec_gw_energ, z_value, m_value, e_g, t_mp, pole_list, sort_idx)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE multipole_w_qp_energies
 
 END MODULE rpa_gw
