@@ -73,6 +73,17 @@ MODULE ri_rs_types
       ! gamma_corr_tabulate: K_head(i_R, i_t) and K_wing(i_R, a, i_t) on a regular R mesh.
       INTEGER, DIMENSION(2)                            :: n_tab = 0
       REAL(KIND=dp), ALLOCATABLE                       :: K_head(:, :), K_wing(:, :, :)
+      ! Hot-loop layout of the same information, built once at the end of gamma_corr_tabulate.
+      ! Sigma^c touches every grid PAIR, so the kernel evaluation has to cost a handful of
+      ! contiguous loads rather than a frequency transform and a pbc() call per pair:
+      !   K_time(1:4, i_R, i_t)   head and the three wing components already transformed to
+      !                           imaginary time, interleaved so one bilinear corner is one
+      !                           cache line
+      !   U_grid(1:4, l, i_t)     (Z_l0, T_wing(l,1:3)) packed per grid point
+      !   frac(1:2, l)            in-plane fractional coordinates of every grid point, so the
+      !                           minimum image is a subtraction and an ANINT
+      REAL(KIND=dp), ALLOCATABLE                       :: K_time(:, :, :), U_grid(:, :, :), &
+                                                          frac(:, :)
    END TYPE gamma_corr_type
 
    ! User input for the in-memory RI-RS grid optimization.
@@ -198,6 +209,9 @@ CONTAINS
       IF (ALLOCATED(ri_rs%gamma_corr%T_wing)) DEALLOCATE (ri_rs%gamma_corr%T_wing)
       IF (ALLOCATED(ri_rs%gamma_corr%K_head)) DEALLOCATE (ri_rs%gamma_corr%K_head)
       IF (ALLOCATED(ri_rs%gamma_corr%K_wing)) DEALLOCATE (ri_rs%gamma_corr%K_wing)
+      IF (ALLOCATED(ri_rs%gamma_corr%K_time)) DEALLOCATE (ri_rs%gamma_corr%K_time)
+      IF (ALLOCATED(ri_rs%gamma_corr%U_grid)) DEALLOCATE (ri_rs%gamma_corr%U_grid)
+      IF (ALLOCATED(ri_rs%gamma_corr%frac)) DEALLOCATE (ri_rs%gamma_corr%frac)
       ri_rs%gamma_corr%ready = .FALSE.
 
       CALL timestop(handle)

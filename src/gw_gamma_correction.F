@@ -50,6 +50,7 @@ MODULE gw_gamma_correction
    USE cell_types,                      ONLY: cell_type,&
                                               pbc
    USE constants_operator,              ONLY: operator_coulomb
+   USE commutator_rpnl,                 ONLY: build_com_mom_nl
    USE cp_dbcsr_api,                    ONLY: dbcsr_add,&
                                               dbcsr_copy,&
                                               dbcsr_create,&
@@ -61,15 +62,19 @@ MODULE gw_gamma_correction
                                               dbcsr_multiply,&
                                               dbcsr_p_type,&
                                               dbcsr_release,&
+                                              dbcsr_scale,&
                                               dbcsr_set,&
-                                              dbcsr_type
+                                              dbcsr_type,&
+                                              dbcsr_type_antisymmetric
    USE cp_dbcsr_contrib,                ONLY: dbcsr_reserve_all_blocks
    USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
                                               cp_fm_struct_release,&
                                               cp_fm_struct_type
+   USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
                                               copy_fm_to_dbcsr,&
+                                              dbcsr_allocate_matrix_set,&
                                               dbcsr_deallocate_matrix_set
    USE cp_cfm_types,                    ONLY: cp_cfm_get_info,&
                                               cp_cfm_type
@@ -94,8 +99,10 @@ MODULE gw_gamma_correction
    USE orbital_pointers,                ONLY: indco,&
                                               ncoset
    USE parallel_gemm_api,               ONLY: parallel_gemm
-   USE qs_moments,                      ONLY: build_local_moment_matrix
+   USE qs_operators_ao,                 ONLY: build_lin_mom_matrix
+   USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE particle_types,                  ONLY: particle_type
+   USE cp_control_types,                ONLY: dft_control_type
    USE post_scf_bandstructure_types,    ONLY: post_scf_bandstructure_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
@@ -129,7 +136,7 @@ MODULE gw_gamma_correction
              gamma_corr_grid_orbitals, &
              gamma_corr_response, &
              gamma_corr_tabulate, &
-             gamma_corr_delta_W, &
+             gamma_corr_add_block, &
              gamma_corr_project_coulomb, &
              gamma_corr_auxiliary_charges, &
              gamma_corr_metric_head, &
@@ -858,10 +865,18 @@ CONTAINS
 
       INTEGER                                            :: handle, i_dir, i_occ, i_spin, i_vir, &
                                                             n_ao, n_mo, n_occ, n_vir
+      REAL(KIND=dp)                                      :: delta, n_elec
+      REAL(KIND=dp), DIMENSION(3)                        :: f_sum
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: mu_mo
+      TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_fm_struct_type), POINTER                   :: struct_mo_mo
       TYPE(cp_fm_type)                                   :: fm_mo_mo, fm_r_ao, fm_r_mo
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_s, moments
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_orb, sap_ppnl
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
 
       CALL timeset(routineN, handle)
 
@@ -869,27 +884,44 @@ CONTAINS
       n_mo = bs_env%n_mo_retained
       IF (n_mo <= 0) n_mo = n_ao
 
-      ! r^α_µν for α = x, y, z, referenced to the cell origin with minimum-image pairing.
+      ! The commutator [H, r^α], NOT the position operator itself.
       !
-      ! The sparsity must be EXACTLY the overlap matrix's: build_local_moment_matrix walks the
-      ! sab_orb neighbour lists and asserts that a block exists for every pair it visits. Creating
-      ! from bs_env%mat_ao_ao and calling dbcsr_reserve_all_blocks does NOT produce that pattern --
-      ! it reserves the Cartesian product local_rows x local_cols of this rank's grid slice, and
-      ! for a symmetric matrix (only one triangle stored) the blocks a rank owns are not that
-      ! product, so the pairs that fall outside it are never reserved and the assert fires. Hence
-      ! dbcsr_copy from S, which is what every other caller of the routine does.
-      NULLIFY (matrix_s)
-      CALL get_qs_env(qs_env, matrix_s=matrix_s)
+      !   [H, r^α] = -∂^α + [V_nl, r^α]     and      ⟨a|r^α|i⟩ = ⟨a|[H, r^α]|i⟩ / (ε_a - ε_i)
+      !
+      ! Under periodic boundary conditions r^α is not a legal operator: the Γ-cell Bloch states
+      ! are delocalized and ⟨a|r^α|i⟩ built from a minimum-image-folded position matrix is both
+      ! origin-dependent and spuriously large, because folding couples pairs that carry no
+      ! crystal momentum transfer. Its two signatures on a 14x14 h-BN cell were an in-plane head
+      ! three orders of magnitude above the known 2D polarizability and S_xx /= S_yy on a
+      ! hexagonal lattice, while S_zz -- the one direction that is NOT periodic and therefore
+      ! never folded -- came out the right size. The commutator is translation invariant, so it
+      ! has neither defect, and it vanishes between states of different crystal momentum as it
+      ! must.
+      !
+      ! Construction follows the COMMUTATOR_HR print path in qs_scf_post_gpw: both builders
+      ! ACCUMULATE into the same antisymmetric matrix, then one overall sign makes it [H, r].
+      ! build_com_mom_nl returns immediately when sap_ppnl is null, so all-electron runs get the
+      ! bare -∂^α, which is the correct commutator for a purely local potential.
+      NULLIFY (matrix_s, particle_set, qs_kind_set, sab_orb, sap_ppnl, cell, dft_control)
+      CALL get_qs_env(qs_env, matrix_s=matrix_s, particle_set=particle_set, &
+                      qs_kind_set=qs_kind_set, sab_orb=sab_orb, sap_ppnl=sap_ppnl, &
+                      cell=cell, dft_control=dft_control)
+
       NULLIFY (moments)
-      ALLOCATE (moments(3))
+      CALL dbcsr_allocate_matrix_set(moments, 3)
       DO i_dir = 1, 3
-         NULLIFY (moments(i_dir)%matrix)
          ALLOCATE (moments(i_dir)%matrix)
-         CALL dbcsr_copy(moments(i_dir)%matrix, matrix_s(1)%matrix)
+         CALL dbcsr_create(moments(i_dir)%matrix, template=matrix_s(1)%matrix, &
+                           name='COMMUTATOR_HR', matrix_type=dbcsr_type_antisymmetric)
+         CALL cp_dbcsr_alloc_block_from_nbl(moments(i_dir)%matrix, sab_orb)
          CALL dbcsr_set(moments(i_dir)%matrix, 0.0_dp)
       END DO
-      CALL build_local_moment_matrix(qs_env, moments, 1, &
-                                     ref_point=[0.0_dp, 0.0_dp, 0.0_dp], minimum_image=.TRUE.)
+      CALL build_com_mom_nl(qs_kind_set, sab_orb, sap_ppnl, dft_control%qs_control%eps_ppnl, &
+                            particle_set, cell, matrix_rv=moments)
+      CALL build_lin_mom_matrix(qs_env, moments)
+      DO i_dir = 1, 3
+         CALL dbcsr_scale(moments(i_dir)%matrix, alpha_scalar=-1.0_dp)
+      END DO
 
       n_occ = MAXVAL(bs_env%n_occ(1:bs_env%n_spin))
       n_vir = n_mo - MINVAL(bs_env%n_occ(1:bs_env%n_spin))
@@ -919,11 +951,16 @@ CONTAINS
                                fm_r_mo, 0.0_dp, fm_mo_mo)
             CALL cp_fm_get_submatrix(fm_mo_mo, mu_mo)
 
-            ! Keep only the occupied-empty block; i runs over occupied, a over empty.
+            ! Keep only the occupied-empty block and divide by the energy denominator:
+            ! µ^α_ai = ⟨a|[H,r^α]|i⟩/(ε_a - ε_i). i runs over occupied, a over empty, so the
+            ! denominator is the positive excitation energy and cannot vanish in a gapped system.
             DO i_vir = 1, n_mo - bs_env%n_occ(i_spin)
                DO i_occ = 1, bs_env%n_occ(i_spin)
+                  delta = bs_env%eigenval_scf_Gamma(bs_env%n_occ(i_spin) + i_vir, i_spin) - &
+                          bs_env%eigenval_scf_Gamma(i_occ, i_spin)
+                  CPASSERT(delta > 0.0_dp)
                   mu(i_dir, i_occ, i_vir, i_spin) = &
-                     mu_mo(i_occ, bs_env%n_occ(i_spin) + i_vir)
+                     mu_mo(i_occ, bs_env%n_occ(i_spin) + i_vir)/delta
                END DO
             END DO
          END DO
@@ -935,6 +972,35 @@ CONTAINS
       CALL cp_fm_release(fm_r_mo)
       CALL cp_fm_struct_release(struct_mo_mo)
       CALL dbcsr_deallocate_matrix_set(moments)
+
+      ! Thomas-Reiche-Kuhn sum rule, the one basis- and gauge-independent check on µ:
+      !
+      !   (2/n_spin) Σ_spin Σ_ai 2 (ε_a - ε_i) |µ^α_ai|²  =  N_electrons
+      !
+      ! A truncated virtual space can only make the left side too SMALL, so a ratio above one is
+      ! unambiguous evidence of spurious dipoles -- which is exactly what the folded position
+      ! operator produced. Printed per direction because the in-plane and out-of-plane
+      ! directions fail differently under periodic boundary conditions.
+      IF (bs_env%unit_nr > 0) THEN
+         f_sum(:) = 0.0_dp
+         DO i_spin = 1, bs_env%n_spin
+            DO i_vir = 1, n_mo - bs_env%n_occ(i_spin)
+               DO i_occ = 1, bs_env%n_occ(i_spin)
+                  delta = bs_env%eigenval_scf_Gamma(bs_env%n_occ(i_spin) + i_vir, i_spin) - &
+                          bs_env%eigenval_scf_Gamma(i_occ, i_spin)
+                  f_sum(:) = f_sum(:) + 2.0_dp*delta*mu(:, i_occ, i_vir, i_spin)**2
+               END DO
+            END DO
+         END DO
+         f_sum(:) = f_sum(:)*2.0_dp/REAL(bs_env%n_spin, dp)
+         n_elec = 2.0_dp/REAL(bs_env%n_spin, dp)*REAL(SUM(bs_env%n_occ(1:bs_env%n_spin)), dp)
+         WRITE (bs_env%unit_nr, '(T2,A)') &
+            'Gamma-point correction: Thomas-Reiche-Kuhn sum rule of the transition dipoles'
+         WRITE (bs_env%unit_nr, '(T4,A,T60,3F12.4)') 'f-sum / N_electrons   (x, y, z)', &
+            f_sum(:)/MAX(n_elec, 1.0_dp)
+         WRITE (bs_env%unit_nr, '(T4,A,T72,F10.1)') 'N_electrons in the retained MO window', n_elec
+         WRITE (bs_env%unit_nr, '(A)') ' '
+      END IF
 
       CALL timestop(handle)
 
@@ -1545,6 +1611,8 @@ CONTAINS
       CALL bs_env%para_env%sum(gc%K_head)
       CALL bs_env%para_env%sum(gc%K_wing)
 
+      CALL gamma_corr_pack_hot_loop(bs_env)
+
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A,T60,I6,A,I6)') &
             'Gamma-point correction: cell-integral table', n_tab, ' x', n_tab
@@ -1683,81 +1751,145 @@ CONTAINS
 !> \param lp_grid second grid index
 !> \return ΔW^c_ℓℓ'(iτ_t)
 ! **************************************************************************************************
-   FUNCTION gamma_corr_delta_W(bs_env, i_t, l_grid, lp_grid) RESULT(delta_W)
+   SUBROUTINE gamma_corr_pack_hot_loop(bs_env)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      INTEGER, INTENT(IN)                                :: i_t, l_grid, lp_grid
-      REAL(KIND=dp)                                      :: delta_W
 
-      INTEGER                                            :: i_dir, i_u, i_v, i_w, n_tab
-      REAL(KIND=dp)                                      :: f_u, f_v, head, weight, wing(3)
-      REAL(KIND=dp), DIMENSION(2)                        :: frac
-      REAL(KIND=dp), DIMENSION(3)                        :: R_cart
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_pack_hot_loop'
+
+      INTEGER                                            :: handle, i_dir, i_t, i_w, l, n_grid, &
+                                                            n_pt, n_t
+      REAL(KIND=dp)                                      :: weight
       TYPE(gamma_corr_type), POINTER                     :: gc
 
+      CALL timeset(routineN, handle)
+
       gc => bs_env%ri_rs%gamma_corr
-      n_tab = gc%n_tab(1)
+      n_t = bs_env%num_time_freq_points
+      n_grid = bs_env%ri_rs%n_grid_points
+      n_pt = gc%n_tab(1)*gc%n_tab(2)
 
-      ! Minimum-image displacement R = r_l - r_l', then its fractional in-plane coordinates in
-      ! [-1/2, 1/2]. NOTE the argument order: pbc3(ra, rb) returns rb - ra, so the grid points go
-      ! in reversed. K_h is even in R and would not notice, but K_w is ODD, so getting this
-      ! backwards would flip the sign of the whole wing contribution.
-      R_cart = pbc(bs_env%ri_rs%grid_points(:, lp_grid), &
-                   bs_env%ri_rs%grid_points(:, l_grid), bs_env%ri_rs%cell)
-      frac(1) = DOT_PRODUCT(bs_env%ri_rs%cell%h_inv(1, :), R_cart)
-      frac(2) = DOT_PRODUCT(bs_env%ri_rs%cell%h_inv(2, :), R_cart)
-      frac(:) = frac - ANINT(frac)
-
-      ! Bilinear weights on the table mesh.
-      f_u = (frac(1) + 0.5_dp)*REAL(n_tab - 1, dp)
-      f_v = (frac(2) + 0.5_dp)*REAL(n_tab - 1, dp)
-      i_u = MIN(MAX(INT(f_u), 0), n_tab - 2)
-      i_v = MIN(MAX(INT(f_v), 0), n_tab - 2)
-      f_u = f_u - REAL(i_u, dp)
-      f_v = f_v - REAL(i_v, dp)
-
-      head = 0.0_dp
-      wing(:) = 0.0_dp
-      DO i_w = 1, bs_env%num_time_freq_points
-         weight = bs_env%time_frequency_grid%cosine_frequency_to_time(i_t, i_w)
-         head = head + weight*gamma_corr_bilinear(gc%K_head(:, i_w), n_tab, i_u, i_v, f_u, f_v)
-         DO i_dir = 1, 3
-            wing(i_dir) = wing(i_dir) + &
-                          weight*gamma_corr_bilinear(gc%K_wing(:, i_dir, i_w), n_tab, &
-                                                     i_u, i_v, f_u, f_v)
+      ! K_time(c, i_R, i_t) = Σ_ω w^(cos)_(i_t,ω) K_c(i_R, ω), c = (head, wing_x, wing_y, wing_z).
+      ! The iω -> iτ transform used to sit inside the per-pair kernel, which meant 10 frequency
+      ! points x 4 kernels x 4 bilinear corners = 160 strided table loads for every grid pair.
+      ! Doing it here costs n_R x n_t and leaves 4 contiguous doubles per corner.
+      ALLOCATE (gc%K_time(4, n_pt, n_t))
+      gc%K_time(:, :, :) = 0.0_dp
+      DO i_t = 1, n_t
+         DO i_w = 1, n_t
+            weight = bs_env%time_frequency_grid%cosine_frequency_to_time(i_t, i_w)
+            gc%K_time(1, :, i_t) = gc%K_time(1, :, i_t) + weight*gc%K_head(:, i_w)
+            DO i_dir = 1, 3
+               gc%K_time(1 + i_dir, :, i_t) = gc%K_time(1 + i_dir, :, i_t) + &
+                                              weight*gc%K_wing(:, i_dir, i_w)
+            END DO
          END DO
       END DO
 
-      delta_W = gc%Z_l0(l_grid)*gc%Z_l0(lp_grid)*head
-      DO i_dir = 1, 3
-         delta_W = delta_W + wing(i_dir)* &
-                   (gc%T_wing(l_grid, i_dir, i_t)*gc%Z_l0(lp_grid) - &
-                    gc%Z_l0(l_grid)*gc%T_wing(lp_grid, i_dir, i_t))
+      ! U_grid(:, l, i_t) = (Z_ℓ0, T^w_ℓx, T^w_ℓy, T^w_ℓz): the four grid-side factors a pair
+      ! needs, packed contiguously so each grid point is one load instead of four strided ones.
+      ALLOCATE (gc%U_grid(4, n_grid, n_t))
+      DO i_t = 1, n_t
+         DO l = 1, n_grid
+            gc%U_grid(1, l, i_t) = gc%Z_l0(l)
+            gc%U_grid(2:4, l, i_t) = gc%T_wing(l, 1:3, i_t)
+         END DO
       END DO
 
-   END FUNCTION gamma_corr_delta_W
+      ! Fractional in-plane coordinates. pbc() folds with s = s - ANINT(s) on the same h_inv, so
+      ! taking the difference of folded fractions reproduces the minimum image exactly while
+      ! replacing two 3x3 matrix-vector products per pair with one subtraction.
+      ALLOCATE (gc%frac(2, n_grid))
+!$OMP PARALLEL DO DEFAULT(NONE) PRIVATE(l) SHARED(gc, bs_env, n_grid) SCHEDULE(static)
+      DO l = 1, n_grid
+         gc%frac(1, l) = DOT_PRODUCT(bs_env%ri_rs%cell%h_inv(1, :), &
+                                     bs_env%ri_rs%grid_points(:, l))
+         gc%frac(2, l) = DOT_PRODUCT(bs_env%ri_rs%cell%h_inv(2, :), &
+                                     bs_env%ri_rs%grid_points(:, l))
+      END DO
+!$OMP END PARALLEL DO
+
+      CALL timestop(handle)
+
+   END SUBROUTINE gamma_corr_pack_hot_loop
 
 ! **************************************************************************************************
-!> \brief Bilinear interpolation on the flattened n_tab x n_tab table.
-!> \param table flattened table, index 1 + i_u + n_tab*i_v
-!> \param n_tab points per direction
-!> \param i_u lower u index
-!> \param i_v lower v index
-!> \param f_u fractional offset in u
-!> \param f_v fractional offset in v
-!> \return interpolated value
+!> \brief Add ΔW_ℓℓ'(iτ) to one dense block of the grid-pair panel.
+!>
+!>        ΔW_ℓℓ' = Z_ℓ0 Z_ℓ'0 K_h(R) + Σ_α K_wα(R) (T^w_ℓα Z_ℓ'0 - Z_ℓ0 T^w_ℓ'α),  R = r_ℓ - r_ℓ'
+!>
+!>        the head-and-wing part of W that the Γ-only calculation left out, with K_h and K_w the
+!>        cell integrals over the small Brillouin zone tabulated by gamma_corr_tabulate and read
+!>        here by bilinear interpolation in the in-plane minimum-image displacement.
+!>
+!>        This runs once per grid PAIR, i.e. n_grid^2 times per time point, so it is written as a
+!>        block kernel rather than a scalar function: the whole R dependence is 2 subtractions,
+!>        2 ANINTs and 4 contiguous 4-vectors.
+!>
+!>        NOTE the sign of R. K_h is even in R and would not notice, but K_w is ODD, so taking
+!>        the displacement the other way round flips the entire wing contribution.
+!> \param gc Γ-correction state, with gamma_corr_pack_hot_loop already run
+!> \param i_t imaginary-time index
+!> \param l_offset global grid index of block row 1, minus one
+!> \param lp_offset global grid index of block column 1, minus one
+!> \param block the panel block, updated in place
 ! **************************************************************************************************
-   PURE FUNCTION gamma_corr_bilinear(table, n_tab, i_u, i_v, f_u, f_v) RESULT(value)
-      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: table
-      INTEGER, INTENT(IN)                                :: n_tab, i_u, i_v
-      REAL(KIND=dp), INTENT(IN)                          :: f_u, f_v
-      REAL(KIND=dp)                                      :: value
+   SUBROUTINE gamma_corr_add_block(gc, i_t, l_offset, lp_offset, block)
+      TYPE(gamma_corr_type), INTENT(IN)                  :: gc
+      INTEGER, INTENT(IN)                                :: i_t, l_offset, lp_offset
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: block
 
-      value = (1.0_dp - f_u)*(1.0_dp - f_v)*table(1 + i_u + n_tab*i_v) + &
-              f_u*(1.0_dp - f_v)*table(2 + i_u + n_tab*i_v) + &
-              (1.0_dp - f_u)*f_v*table(1 + i_u + n_tab*(i_v + 1)) + &
-              f_u*f_v*table(2 + i_u + n_tab*(i_v + 1))
+      INTEGER                                            :: i, i_u, i_v, j, k00, n_tab, n_u
+      REAL(KIND=dp) :: du, dv, f_u, f_v, fx_p, fy_p, scale, w00, w01, w10, w11
+      REAL(KIND=dp), DIMENSION(4)                        :: ker, u_l, u_p
 
-   END FUNCTION gamma_corr_bilinear
+      n_tab = gc%n_tab(1)
+      n_u = gc%n_tab(1)
+      scale = REAL(n_tab - 1, dp)
+
+!$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(static) &
+!$OMP          PRIVATE(i, j, i_u, i_v, k00, du, dv, f_u, f_v, fx_p, fy_p, ker, u_l, u_p, &
+!$OMP                  w00, w01, w10, w11) &
+!$OMP          SHARED(gc, block, i_t, l_offset, lp_offset, n_tab, n_u, scale)
+      DO j = 1, SIZE(block, 2)
+         fx_p = gc%frac(1, lp_offset + j)
+         fy_p = gc%frac(2, lp_offset + j)
+         u_p(:) = gc%U_grid(:, lp_offset + j, i_t)
+
+         DO i = 1, SIZE(block, 1)
+            ! Minimum-image fractional displacement of r_ℓ - r_ℓ', mapped onto [-1/2, 1/2].
+            du = gc%frac(1, l_offset + i) - fx_p
+            dv = gc%frac(2, l_offset + i) - fy_p
+            du = du - ANINT(du)
+            dv = dv - ANINT(dv)
+
+            f_u = (du + 0.5_dp)*scale
+            f_v = (dv + 0.5_dp)*scale
+            i_u = MIN(MAX(INT(f_u), 0), n_tab - 2)
+            i_v = MIN(MAX(INT(f_v), 0), n_tab - 2)
+            f_u = f_u - REAL(i_u, dp)
+            f_v = f_v - REAL(i_v, dp)
+
+            w00 = (1.0_dp - f_u)*(1.0_dp - f_v)
+            w10 = f_u*(1.0_dp - f_v)
+            w01 = (1.0_dp - f_u)*f_v
+            w11 = f_u*f_v
+
+            k00 = 1 + i_u + n_u*i_v
+            ker(:) = w00*gc%K_time(:, k00, i_t) + w10*gc%K_time(:, k00 + 1, i_t) + &
+                     w01*gc%K_time(:, k00 + n_u, i_t) + w11*gc%K_time(:, k00 + n_u + 1, i_t)
+
+            u_l(:) = gc%U_grid(:, l_offset + i, i_t)
+
+            block(i, j) = block(i, j) + ker(1)*u_l(1)*u_p(1) + &
+                          ker(2)*(u_l(2)*u_p(1) - u_l(1)*u_p(2)) + &
+                          ker(3)*(u_l(3)*u_p(1) - u_l(1)*u_p(3)) + &
+                          ker(4)*(u_l(4)*u_p(1) - u_l(1)*u_p(4))
+         END DO
+      END DO
+!$OMP END PARALLEL DO
+
+   END SUBROUTINE gamma_corr_add_block
+
 
 ! **************************************************************************************************
 !> \brief Project the charge channel out of V(k) in the REGULAR W path, V(k) <- Π V(k) Π.

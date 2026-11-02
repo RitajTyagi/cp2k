@@ -36,7 +36,7 @@ MODULE ri_rs_matrices
                                               mp_para_env_type
    USE mp2_ri_2c,                       ONLY: RI_2c_integral_mat
    USE qs_environment_types,            ONLY: qs_environment_type
-   USE gw_gamma_correction,             ONLY: gamma_corr_delta_W
+   USE gw_gamma_correction,             ONLY: gamma_corr_add_block
    USE post_scf_bandstructure_types,    ONLY: post_scf_bandstructure_type
    USE ri_rs_types,                     ONLY: ri_rs_env
    USE ri_rs_utils,                     ONLY: evaluate_ao_basis_on_points
@@ -1237,8 +1237,8 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'add_gamma_corr_to_panel'
 
-      INTEGER                                            :: col, col_blk, handle, i, i_blk, j, l, &
-                                                            lp, n_blk, row, row_blk
+      INTEGER                                            :: col, col_blk, handle, i_blk, n_blk, &
+                                                            row, row_blk
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: grid_offset
       INTEGER, DIMENSION(:), POINTER                     :: r_blk_sizes
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
@@ -1268,13 +1268,10 @@ CONTAINS
          CPASSERT(row_blk >= 1 .AND. row_blk <= n_blk)
          CPASSERT(col_blk >= 1 .AND. col_blk <= n_blk)
 
-         DO j = 1, SIZE(block, 2)
-            lp = grid_offset(col_blk) + j
-            DO i = 1, SIZE(block, 1)
-               l = grid_offset(row_blk) + i
-               block(i, j) = block(i, j) + gamma_corr_delta_W(bs_env, i_t, l, lp)
-            END DO
-         END DO
+         ! Whole-block kernel: the per-pair work is 2 subtractions, 2 ANINTs and 4 contiguous
+         ! 4-vectors, which matters because this runs n_grid^2 times per time point.
+         CALL gamma_corr_add_block(bs_env%ri_rs%gamma_corr, i_t, grid_offset(row_blk), &
+                                   grid_offset(col_blk), block)
       END DO
       CALL dbcsr_iterator_stop(iter)
 
