@@ -51,6 +51,7 @@ MODULE gw_gamma_correction
                                               pbc
    USE constants_operator,              ONLY: operator_coulomb
    USE cp_dbcsr_api,                    ONLY: dbcsr_add,&
+                                              dbcsr_copy,&
                                               dbcsr_create,&
                                               dbcsr_iterator_blocks_left,&
                                               dbcsr_iterator_next_block,&
@@ -108,6 +109,16 @@ MODULE gw_gamma_correction
    PRIVATE
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_gamma_correction'
+
+   ! Relative eigenvalue cut used to invert the neutral body V_b = Π V(0) Π on its range.
+   ! This is a NUMERICAL null-space threshold and must not be confused with REGULARIZATION_RI,
+   ! which is a Tikhonov shift of the RI metric and whose default is 1E-02: used as a relative
+   ! eigenvalue cut that discards every mode below 1 % of λ_max, which on a 4704-function
+   ! auxiliary basis throws away about 85 % of the neutral subspace. The only modes that must go
+   ! are the exact charge direction and whatever linear dependence the RI basis itself carries,
+   ! so the cut sits just above the level to which the projection Π can leave the (much larger)
+   ! charge eigenvalue contaminating V_b, i.e. a few orders of magnitude above ε_machine.
+   REAL(KIND=dp), PARAMETER, PRIVATE :: eps_null_V_b = 1.0E-10_dp
 
    PUBLIC :: gamma_corr_requested, &
              gamma_corr_init, &
@@ -313,17 +324,21 @@ CONTAINS
 !>        V_b = Π V(0) Π is singular by construction: the charge direction c is an exact null
 !>        vector, and the neutral functions ϕ̄_Q = Σ_P ϕ_P Π_PQ are linearly dependent. Matrix
 !>        powers must therefore act only on the nonzero neutral subspace, which is what the
-!>        relative eigenvalue cut does. The caller passes REGULARIZATION_RI as the threshold, the
-!>        same knob the rest of the RI metric uses.
+!>        relative eigenvalue cut does. The threshold is eps_null_V_b, NOT REGULARIZATION_RI; see
+!>        the comment on the parameter for why the two must not be confused.
 !> \param matrix on entry the symmetric matrix, on exit its p-th power; replicated
 !> \param exponent p
 !> \param relative_eps modes with λ < relative_eps · max λ are set to zero
 !> \param n_dropped optional count of discarded modes
+!> \param lambda_max optional largest eigenvalue, for reporting the conditioning
+!> \param lambda_kept optional smallest retained eigenvalue, for reporting the conditioning
 ! **************************************************************************************************
-   SUBROUTINE gamma_corr_symmetric_power(matrix, exponent, relative_eps, n_dropped)
+   SUBROUTINE gamma_corr_symmetric_power(matrix, exponent, relative_eps, n_dropped, &
+                                        lambda_max, lambda_kept)
       REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: matrix
       REAL(KIND=dp), INTENT(IN)                          :: exponent, relative_eps
       INTEGER, INTENT(OUT), OPTIONAL                     :: n_dropped
+      REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: lambda_max, lambda_kept
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_symmetric_power'
 
@@ -362,6 +377,18 @@ CONTAINS
       CALL dgemm('N', 'T', n, n, n, 1.0_dp, scaled, n, vectors, n, 0.0_dp, matrix, n)
 
       IF (PRESENT(n_dropped)) n_dropped = n_drop
+      ! The pair (λ_max, smallest retained λ) says whether the cut fell inside a genuine gap or
+      ! sliced through a continuum of physical modes; eigenvalues come out of dsyev ascending.
+      IF (PRESENT(lambda_max)) lambda_max = eigenvalues(n)
+      IF (PRESENT(lambda_kept)) THEN
+         lambda_kept = 0.0_dp
+         DO i = 1, n
+            IF (eigenvalues(i) > cut) THEN
+               lambda_kept = eigenvalues(i)
+               EXIT
+            END IF
+         END DO
+      END IF
 
       DEALLOCATE (vectors, eigenvalues, work, scaled)
 
@@ -402,7 +429,7 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_build_coulomb_maps'
 
       INTEGER                                            :: handle, i, n_drop_inv, n_drop_sqrt, n_RI
-      REAL(KIND=dp)                                      :: norm_c
+      REAL(KIND=dp)                                      :: lambda_kept, lambda_max, norm_c
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: M_inv, projector, V_b_inv_sqrt, &
                                                             V_b_sqrt, V_zero, work
       TYPE(gamma_corr_type), POINTER                     :: gc
@@ -448,8 +475,9 @@ CONTAINS
                  0.0_dp, V_b_sqrt, n_RI)
 
       V_b_inv_sqrt(:, :) = V_b_sqrt
-      CALL gamma_corr_symmetric_power(V_b_sqrt, 0.5_dp, bs_env%regularization_RI, n_drop_sqrt)
-      CALL gamma_corr_symmetric_power(V_b_inv_sqrt, -0.5_dp, bs_env%regularization_RI, n_drop_inv)
+      CALL gamma_corr_symmetric_power(V_b_sqrt, 0.5_dp, eps_null_V_b, n_drop_sqrt, &
+                                      lambda_max=lambda_max, lambda_kept=lambda_kept)
+      CALL gamma_corr_symmetric_power(V_b_inv_sqrt, -0.5_dp, eps_null_V_b, n_drop_inv)
       CPASSERT(n_drop_sqrt == n_drop_inv)
 
       ! ---------------------------------------------------------------------------------------
@@ -486,6 +514,8 @@ CONTAINS
          WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'RI metric head int dr v(r)', gc%metric_head
          WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Norm of the charge vector |c|', norm_c
          WRITE (bs_env%unit_nr, '(T4,A,T72,I10)') 'Null modes of the neutral body V_b', n_drop_sqrt
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Largest eigenvalue of V_b', lambda_max
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Smallest retained eigenvalue of V_b', lambda_kept
       END IF
 
       DEALLOCATE (V_zero, projector, work, V_b_sqrt, V_b_inv_sqrt, M_inv)
@@ -831,7 +861,7 @@ CONTAINS
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: mu_mo
       TYPE(cp_fm_struct_type), POINTER                   :: struct_mo_mo
       TYPE(cp_fm_type)                                   :: fm_mo_mo, fm_r_ao, fm_r_mo
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: moments
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_s, moments
 
       CALL timeset(routineN, handle)
 
@@ -840,13 +870,22 @@ CONTAINS
       IF (n_mo <= 0) n_mo = n_ao
 
       ! r^α_µν for α = x, y, z, referenced to the cell origin with minimum-image pairing.
+      !
+      ! The sparsity must be EXACTLY the overlap matrix's: build_local_moment_matrix walks the
+      ! sab_orb neighbour lists and asserts that a block exists for every pair it visits. Creating
+      ! from bs_env%mat_ao_ao and calling dbcsr_reserve_all_blocks does NOT produce that pattern --
+      ! it reserves the Cartesian product local_rows x local_cols of this rank's grid slice, and
+      ! for a symmetric matrix (only one triangle stored) the blocks a rank owns are not that
+      ! product, so the pairs that fall outside it are never reserved and the assert fires. Hence
+      ! dbcsr_copy from S, which is what every other caller of the routine does.
+      NULLIFY (matrix_s)
+      CALL get_qs_env(qs_env, matrix_s=matrix_s)
       NULLIFY (moments)
       ALLOCATE (moments(3))
       DO i_dir = 1, 3
          NULLIFY (moments(i_dir)%matrix)
          ALLOCATE (moments(i_dir)%matrix)
-         CALL dbcsr_create(moments(i_dir)%matrix, template=bs_env%mat_ao_ao%matrix)
-         CALL dbcsr_reserve_all_blocks(moments(i_dir)%matrix)
+         CALL dbcsr_copy(moments(i_dir)%matrix, matrix_s(1)%matrix)
          CALL dbcsr_set(moments(i_dir)%matrix, 0.0_dp)
       END DO
       CALL build_local_moment_matrix(qs_env, moments, 1, &
