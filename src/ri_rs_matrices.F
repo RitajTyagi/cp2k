@@ -36,6 +36,8 @@ MODULE ri_rs_matrices
                                               mp_para_env_type
    USE mp2_ri_2c,                       ONLY: RI_2c_integral_mat
    USE qs_environment_types,            ONLY: qs_environment_type
+   USE gw_gamma_correction,             ONLY: gamma_corr_delta_W
+   USE post_scf_bandstructure_types,    ONLY: post_scf_bandstructure_type
    USE ri_rs_types,                     ONLY: ri_rs_env
    USE ri_rs_utils,                     ONLY: evaluate_ao_basis_on_points
 #include "./base/base_uses.f90"
@@ -1005,7 +1007,7 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE contract_grid_panels(L_A, M_A, L_B, M_B, L_out, mat_out, scale, eps, para_env, &
                                    pan_first, pan_last, lb_eq_la, lout_eq_la, zero_out, &
-                                   centroids, cutoff, grid_occupation)
+                                   centroids, cutoff, grid_occupation, bs_env_gamma_corr, i_t)
 
       TYPE(dbcsr_type), INTENT(INOUT), TARGET            :: L_A
       TYPE(dbcsr_type), DIMENSION(:), INTENT(INOUT)      :: M_A
@@ -1021,6 +1023,12 @@ CONTAINS
          OPTIONAL                                        :: centroids
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: cutoff
       REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: grid_occupation
+      ! Present only for the Gamma-point correction of W: the grid-space term DeltaW_ll' is added
+      ! to each B panel before the Hadamard product, because it cannot be expressed in the RI
+      ! space that M_B lives in -- its cell integrals depend on the minimum-image displacement
+      ! r_l - r_l', which is a property of the pair, not of the auxiliary indices.
+      TYPE(post_scf_bandstructure_type), OPTIONAL, POINTER :: bs_env_gamma_corr
+      INTEGER, INTENT(IN), OPTIONAL                      :: i_t
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'contract_grid_panels'
 
@@ -1165,6 +1173,15 @@ CONTAINS
          CALL dbcsr_release(tmpB)
          CALL dbcsr_release(LA_panC)
 
+         ! W_ll' <- W_ll' + DeltaW_ll', the Gamma-point head-and-wing correction.
+         ! A disassociated pointer actual argument is still PRESENT, so the association has to be
+         ! tested separately; the caller leaves it NULL whenever the correction is off.
+         IF (PRESENT(bs_env_gamma_corr)) THEN
+            IF (ASSOCIATED(bs_env_gamma_corr)) THEN
+               CALL add_gamma_corr_to_panel(B_pan, bs_env_gamma_corr, i_t, blk0, gmap, use_cutoff)
+            END IF
+         END IF
+
          DO i_A = 1, SIZE(M_A)
             ! Reuse A_pan storage for its Hadamard product with the shared B panel.
             CALL hadamard_product_inplace(A_pan(i_A), B_pan, scale)
@@ -1191,6 +1208,81 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE contract_grid_panels
+
+! **************************************************************************************************
+!> \brief Add the Gamma-point correction DeltaW_ll' to one grid x grid panel of W.
+!>
+!>        The panel's rows are the grid blocks blk0 .. blk0+nrowblk-1 of the full grid; its columns
+!>        are either all grid blocks or, when the grid cutoff is active, the "near" subset whose
+!>        global block index is col_map(j). Both are translated back to global grid POINT indices
+!>        through the prefix sums of the grid block sizes, because DeltaW is defined per pair of
+!>        points and not per block.
+!>
+!>        Only blocks already present are touched. The panel's sparsity was fixed by the A panels
+!>        and retain_sparsity, and the Hadamard product that follows would discard anything outside
+!>        it, so creating new blocks here would be wasted work.
+!> \param B_pan the W panel, modified in place
+!> \param bs_env band-structure environment carrying the correction tables
+!> \param i_t imaginary-time index
+!> \param blk0 first global grid block index of this panel
+!> \param col_map global grid block index of each panel column block (cutoff case)
+!> \param use_cutoff whether col_map applies
+! **************************************************************************************************
+   SUBROUTINE add_gamma_corr_to_panel(B_pan, bs_env, i_t, blk0, col_map, use_cutoff)
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: B_pan
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      INTEGER, INTENT(IN)                                :: i_t, blk0
+      INTEGER, ALLOCATABLE, DIMENSION(:), INTENT(IN)     :: col_map
+      LOGICAL, INTENT(IN)                                :: use_cutoff
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'add_gamma_corr_to_panel'
+
+      INTEGER                                            :: col, col_blk, handle, i, i_blk, j, l, &
+                                                            lp, n_blk, row, row_blk
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: grid_offset
+      INTEGER, DIMENSION(:), POINTER                     :: r_blk_sizes
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
+      TYPE(dbcsr_iterator_type)                          :: iter
+
+      CALL timeset(routineN, handle)
+
+      ! Global element offset of every grid block, from the blocking of phi_mu_l.
+      CALL dbcsr_get_info(bs_env%ri_rs%mat_phi_mu_l, row_blk_size=r_blk_sizes)
+      n_blk = SIZE(r_blk_sizes)
+      ALLOCATE (grid_offset(n_blk + 1))
+      grid_offset(1) = 0
+      DO i_blk = 2, n_blk + 1
+         grid_offset(i_blk) = grid_offset(i_blk - 1) + r_blk_sizes(i_blk - 1)
+      END DO
+
+      CALL dbcsr_iterator_start(iter, B_pan)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
+         CALL dbcsr_iterator_next_block(iter, row, col, block)
+
+         row_blk = blk0 + row - 1
+         IF (use_cutoff) THEN
+            col_blk = col_map(col)
+         ELSE
+            col_blk = col
+         END IF
+         CPASSERT(row_blk >= 1 .AND. row_blk <= n_blk)
+         CPASSERT(col_blk >= 1 .AND. col_blk <= n_blk)
+
+         DO j = 1, SIZE(block, 2)
+            lp = grid_offset(col_blk) + j
+            DO i = 1, SIZE(block, 1)
+               l = grid_offset(row_blk) + i
+               block(i, j) = block(i, j) + gamma_corr_delta_W(bs_env, i_t, l, lp)
+            END DO
+         END DO
+      END DO
+      CALL dbcsr_iterator_stop(iter)
+
+      DEALLOCATE (grid_offset)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE add_gamma_corr_to_panel
 
 ! **************************************************************************************************
 !> \brief Build the unfiltered auxiliary interaction M^-1 V^tr M^-1 in the Z-column layout.

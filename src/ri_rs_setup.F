@@ -54,6 +54,9 @@ MODULE ri_rs_setup
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_kind_types,                   ONLY: qs_kind_type
+   USE gw_gamma_correction,             ONLY: gamma_corr_charge_rhs,&
+                                              gamma_corr_grid_owner,&
+                                              gamma_corr_init
    USE ri_rs_fitting,                   ONLY: solve_ri_rs_fit,&
                                               store_Z_lP_columns
    USE ri_rs_grid_setup,                ONLY: setup_ri_rs_grid
@@ -110,6 +113,10 @@ CONTAINS
                                          periodic_images=bs_env%do_periodic)
          CALL print_matrix_occupation(bs_env%ri_rs%mat_phi_mu_l, 'ϕ_μ(r_l)', &
                                       bs_env%para_env, bs_env%unit_nr, bs_env%dbcsr_msg_elem_limit)
+         ! Decide on the Gamma-point correction of W before fitting, because when it applies the
+         ! fit carries one extra right-hand side: the grid representation of the constant
+         ! function, which the correction needs for the separated charge channel.
+         CALL gamma_corr_init(bs_env)
          ! Fit Z_lP using the integration domains and RI basis described in compute_Z_lP below.
          CALL compute_Z_lP(qs_env, bs_env, bs_env%ri_rs%grid_points, &
                            bs_env%ri_rs%mat_phi_mu_l, bs_env%ri_rs%mat_Z_lP, &
@@ -225,17 +232,17 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: key = 'PROPERTIES%BANDSTRUCTURE%GW%PRINT%RESTART', &
          routineN = 'compute_Z_lP_standard'
 
-      INTEGER :: atom_j_mepos, atom_j_stride, atom_P, G, handle, i_blk, iatom, idx, iphase, j, &
-         max_ao_size, my_group, n_big, n_done, n_groups, n_loc_ri, n_local_grid, n_my_atoms, &
-         n_small, natom, npcol_phi, num_grid_chunks, phase_hi
-      INTEGER, ALLOCATABLE, DIMENSION(:) :: ao_atoms, ao_col_start, big_list, local_grid_idx, &
-         my_atoms_A, my_atoms_B, n_local_grid_atom, row_offset, small_list
+      INTEGER :: atom_j_mepos, atom_j_stride, atom_P, G, handle, i_blk, i_loc, iatom, idx, &
+         iphase, j, max_ao_size, my_group, n_big, n_done, n_groups, n_loc_ri, n_local_grid, &
+         n_my_atoms, n_rhs, n_small, natom, npcol_phi, num_grid_chunks, phase_hi
+      INTEGER, ALLOCATABLE, DIMENSION(:) :: ao_atoms, ao_col_start, big_list, grid_owner, &
+         local_grid_idx, my_atoms_A, my_atoms_B, n_local_grid_atom, row_offset, small_list
       INTEGER, DIMENSION(:), POINTER                     :: col_dist_ri, r_blk_sizes, ri_blk_sizes, &
                                                             row_dist_grid
-      LOGICAL                                            :: do_scatter, use_dist
+      LOGICAL                                            :: do_gamma_corr, do_scatter, use_dist
       LOGICAL, ALLOCATABLE                               :: ao_nonzero(:, :)
       REAL(KIND=dp)                                      :: cutoff_ri, item_start_time, r_c, t1
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: cutoff_ri_per_atom
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: cutoff_ri_per_atom, d_l0
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: d_lp_local, phi_local
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_blacs_env_type), POINTER                   :: blacs_env_sub
@@ -283,6 +290,35 @@ CONTAINS
 
       CALL dbcsr_distribution_new(dist_Z, template=dist_phi, &
                                   row_dist=row_dist_grid, col_dist=col_dist_ri)
+
+      ! =========================================================================
+      ! 1b. CHARGE CHANNEL FOR THE GAMMA-POINT CORRECTION OF W
+      !     The correction needs the grid representation of the normalized constant function
+      !     1/sqrt(A), fitted through the same metric D_ll' as every Z_lP (gwp42 Eq. 61):
+      !
+      !       sum_l' D_ll' Z_l'0 = d_l0,   d_l0 = (metric_head/sqrt(A)) phi_l^T S phi_l.
+      !
+      !     It is solved as one extra right-hand side alongside each atom's own RI columns, so
+      !     it costs one more DPOTRS column per sphere and no extra factorization. Unlike Z_lP
+      !     the target is global rather than centered on an atom, so a grid point that several
+      !     spheres cover gets a value from each of them and exactly one must be kept: the one
+      !     from the nearest atom, where r_l sits deepest inside the sphere and truncating
+      !     D_ll' at its boundary does the least damage.
+      ! =========================================================================
+      do_gamma_corr = bs_env%ri_rs%gamma_corr%enabled
+      IF (do_gamma_corr) THEN
+         CALL gamma_corr_charge_rhs(bs_env, d_l0)
+         CALL gamma_corr_grid_owner(bs_env, grid_owner)
+         ALLOCATE (bs_env%ri_rs%gamma_corr%Z_l0(bs_env%ri_rs%n_grid_points))
+         bs_env%ri_rs%gamma_corr%Z_l0(:) = 0.0_dp
+         ! A stored Z_lP.matrix holds no charge column, and refitting only that column would
+         ! mean redoing every sphere factorization anyway, so the restart buys nothing here.
+         IF (bs_env%ri_rs%Z_lP_exists .AND. bs_env%unit_nr > 0) THEN
+            WRITE (bs_env%unit_nr, '(T2,A)') &
+               '*** NOTE: Z_lP restart ignored, the Gamma-point correction refits the grid ***'
+         END IF
+         bs_env%ri_rs%Z_lP_exists = .FALSE.
+      END IF
 
       IF (bs_env%ri_rs%Z_lP_exists) THEN
          CALL dbcsr_binary_read(filepath=TRIM(bs_env%prefix)//"Z_lP.matrix", &
@@ -429,20 +465,31 @@ CONTAINS
                                         ao_atoms, ao_col_start, periodic_images=periodic_images, ao_nonzero=ao_nonzero)
 
                ! ---------------------------------------------------------------------
-               ! B. Right-hand side  d_lP = Σ_μν ϕ_μ(r_l) ϕ_ν(r_l) (μν|P)
+               ! B. Right-hand side  d_lP = Σ_μν ϕ_μ(r_l) ϕ_ν(r_l) (μν|P), plus, for the
+               !    Gamma-point correction of W, the charge column d_l0 in position n_loc_ri+1.
                ! ---------------------------------------------------------------------
-               ALLOCATE (d_lp_local(n_local_grid, n_loc_ri))
+               n_rhs = n_loc_ri
+               IF (do_gamma_corr) n_rhs = n_loc_ri + 1
+               ALLOCATE (d_lp_local(n_local_grid, n_rhs))
                d_lp_local = 0.0_dp
 
-               CALL compute_d_lp(bs_env, ctx_3c, phi_local, ao_atoms, ao_col_start, ao_nonzero, d_lp_local, n_local_grid, &
+               CALL compute_d_lp(bs_env, ctx_3c, phi_local, ao_atoms, ao_col_start, ao_nonzero, &
+                                 d_lp_local(:, 1:n_loc_ri), n_local_grid, &
                                  n_loc_ri, atom_P, max_ao_size, atom_j_mepos, atom_j_stride, periodic_images)
 
                DEALLOCATE (ao_atoms, ao_col_start, ao_nonzero)
 
                ! Reduce per-subgroup-rank partials into the replicated d_lp_local.
                ! Skipped for BLAS path: each rank has the full sum locally.
+               ! Only the 3c columns are partial sums; d_l0 is already complete on every rank.
                IF (use_dist) THEN
-                  CALL para_env_sub%sum(d_lp_local)
+                  CALL para_env_sub%sum(d_lp_local(:, 1:n_loc_ri))
+               END IF
+
+               IF (do_gamma_corr) THEN
+                  DO i_loc = 1, n_local_grid
+                     d_lp_local(i_loc, n_rhs) = d_l0(local_grid_idx(i_loc))
+                  END DO
                END IF
 
                ! ---------------------------------------------------------------------
@@ -461,9 +508,20 @@ CONTAINS
                do_scatter = .TRUE.
                IF (use_dist) do_scatter = (para_env_sub%mepos == 0)
                IF (do_scatter) THEN
-                  CALL store_Z_lP_columns(mat_Z_lP, d_lp_local, local_grid_idx, n_local_grid, &
-                                          n_loc_ri, atom_P, r_blk_sizes, row_offset, &
+                  CALL store_Z_lP_columns(mat_Z_lP, d_lp_local(:, 1:n_loc_ri), local_grid_idx, &
+                                          n_local_grid, n_loc_ri, atom_P, r_blk_sizes, row_offset, &
                                           bs_env%eps_filter)
+
+                  ! Keep Z_l0 only where atom_P is the nearest atom; undo the metric_head
+                  ! scaling that put the charge column on the same footing as the 3c columns
+                  ! for the fixed Tikhonov parameter.
+                  IF (do_gamma_corr) THEN
+                     DO i_loc = 1, n_local_grid
+                        IF (grid_owner(local_grid_idx(i_loc)) /= atom_P) CYCLE
+                        bs_env%ri_rs%gamma_corr%Z_l0(local_grid_idx(i_loc)) = &
+                           d_lp_local(i_loc, n_rhs)/bs_env%ri_rs%gamma_corr%metric_head
+                     END DO
+                  END IF
                END IF
 
                DEALLOCATE (d_lp_local)
@@ -490,6 +548,13 @@ CONTAINS
          CALL gw_3c_ctx_release(ctx_3c)
 
          CALL dbcsr_finalize(mat_Z_lP)
+
+         ! Every grid point was owned by exactly one atom, handled by exactly one rank or
+         ! subgroup root, so the partial vectors are disjoint and one sum completes them.
+         IF (do_gamma_corr) THEN
+            CALL para_env%sum(bs_env%ri_rs%gamma_corr%Z_l0)
+            DEALLOCATE (d_l0, grid_owner)
+         END IF
 
          CALL para_env%sync()
          CALL print_Z_lP_progress(bs_env, natom, natom, m_walltime() - t1, &

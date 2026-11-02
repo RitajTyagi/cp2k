@@ -60,10 +60,10 @@ MODULE gw_compute_V_and_W
    USE input_section_types,             ONLY: section_vals_type
    USE kinds,                           ONLY: default_path_length,&
                                               dp
+   USE gw_gamma_correction,             ONLY: gamma_corr_project_coulomb
    USE kpoint_coulomb_2c,               ONLY: build_2c_coulomb_matrix_kp
    USE libint_2c_3c,                    ONLY: libint_potential_type
-   USE machine,                         ONLY: m_flush,&
-                                              m_walltime
+   USE machine,                         ONLY: m_walltime
    USE mathconstants,                   ONLY: z_one,&
                                               z_zero
    USE mp2_ri_2c,                       ONLY: RI_2c_integral_mat_kp
@@ -420,6 +420,16 @@ CONTAINS
          CALL copy_dbcsr_to_fm(mat_V_kp(ikp, 2)%matrix, fm_V_kp_work)
          cfm_V_kp(ikp)%local_data = CMPLX(REAL(cfm_V_kp(ikp)%local_data, KIND=dp), &
                                           fm_V_kp_work%local_data, KIND=dp)
+
+         ! V(k) <- Pi V(k) Pi when the Gamma-point correction is active. The charge channel is
+         ! then carried analytically by the correction instead of by this lattice sum, which is
+         ! mandatory rather than cosmetic: at q = 0 the charged sum diverges with the summation
+         ! range, and leaving it in would also double count the head and wings that DeltaW adds
+         ! back. Between two neutral localized functions the interaction falls off as R^-3, so
+         ! what remains converges absolutely.
+         IF (bs_env%ri_rs%gamma_corr%enabled) THEN
+            CALL gamma_corr_project_coulomb(bs_env, cfm_V_kp(ikp))
+         END IF
       END DO
       CALL cp_fm_release(fm_V_kp_work)
       CALL dbcsr_deallocate_matrix_set(mat_V_kp)
@@ -526,7 +536,7 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_cfm_W_ikp_freq_j'
 
-      INTEGER                                            :: handle
+      INTEGER                                            :: handle, info
 
       CALL timeset(routineN, handle)
 
@@ -540,9 +550,11 @@ CONTAINS
 
       ! 2. W(iw,k) = V^0.5(k)*(epsilon^-1(iw,k)-Id)*V^0.5(k)
 
-      ! 2. a) Cholesky-factorize epsilon before inversion. chi was made positive semidefinite
-      !       by the caller, so epsilon >= Id and this cannot fail.
-      CALL cp_cfm_cholesky_decompose(matrix=cfm_chi_eps_W_ikp_freq_j, n=bs_env%n_RI)
+      ! 2. a) Cholesky-factorize epsilon before inversion. The caller clipped chi into the
+      !       positive semidefinite cone, so epsilon = Id + V^0.5 M^-1 chi M^-1 V^0.5 >= Id and
+      !       every pivot is >= 1; the check only guards against that invariant being broken.
+      CALL cp_cfm_cholesky_decompose(matrix=cfm_chi_eps_W_ikp_freq_j, n=bs_env%n_RI, info_out=info)
+      CPASSERT(info == 0)
 
       ! 2. b) Invert epsilon, subtract Id, then contract with V^0.5 on both sides.
       CALL cfm_screened_interaction_from_eps_cholesky(cfm_chi_eps_W_ikp_freq_j, cfm_V_sqrt_ikp)
@@ -666,9 +678,7 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_fm_W_MIC_freq_j_from_chi'
 
-      INTEGER                                            :: handle, n_neg
-      REAL(KIND=dp)                                      :: discarded
-      REAL(KIND=dp), DIMENSION(2)                        :: ev
+      INTEGER                                            :: handle
       TYPE(cp_cfm_type)                                  :: cfm_chi_eps_W_ikp_freq_j
 
       CALL timeset(routineN, handle)
@@ -679,20 +689,17 @@ CONTAINS
       CALL cfm_ikp_from_fm_Gamma(cfm_chi_eps_W_ikp_freq_j, bs_env%fm_chi_Gamma_freq, &
                                  ikp, qs_env, bs_env%kpoints_chi_eps_W, "RI_AUX")
 
-      ! 2. Remove the negative eigenvalues of χ_PQ(iω_j,k_i), which the Cholesky factorization
-      !    of ε in step 3 needs, and which the minimum image convention puts there: χ(k) is
-      !    χ(Γ) Hadamard-multiplied by the phase matrix M_PQ = exp(i k·R^MIC_PQ), and M is a
-      !    rank-1 u u^H -- hence positive semidefinite, hence harmless by the Schur product
-      !    theorem -- only as long as R^MIC does not wrap. On any production-sized cell it does,
-      !    M is no longer rank 1, and χ(k) is genuinely indefinite although the physical χ, a
-      !    Gram matrix of occupied-virtual products, is not. The clipping repairs that
-      !    reconstruction, so it is part of the method and not a numerical safeguard: skipping
-      !    it wherever ε happens to stay positive definite runs 1.5x faster on the W stage and
-      !    moves the QP gap of a 392-atom h-BN supercell by 55 meV.
-      CALL cp_cfm_power(cfm_chi_eps_W_ikp_freq_j, threshold=0.0_dp, exponent=1.0_dp, &
-                        n_dependent=n_neg, eigvals=ev, discarded_trace=discarded)
-
-      CALL report_chi_mic_artifact(bs_env, ikp, j_w, n_neg, ev, discarded)
+      ! 2. Remove the negative eigenvalues of χ_PQ(iω_j,k_i). The physical χ is a Gram matrix
+      !    of occupied-virtual products and so exactly positive semidefinite; the negative
+      !    modes are an artifact of reconstructing χ(k) from χ(Γ) with the minimum image
+      !    convention, i.e. χ(k) = M(k) ∘ χ(Γ) with the phase M_PQ = exp(i k·R^MIC_PQ). M is a
+      !    rank-1 u u^H, hence positive semidefinite, hence harmless by the Schur product
+      !    theorem -- but only while R^MIC does not wrap, which on any production-sized cell it
+      !    does. The clipping repairs that reconstruction and is therefore part of the method,
+      !    not a numerical safeguard: skipping it wherever ε happens to stay positive definite
+      !    runs 1.5x faster on the W stage and moves the QP gap of a 392-atom h-BN supercell by
+      !    55 meV. It is also what the Cholesky factorization of ε in step 3 relies on.
+      CALL cp_cfm_power(cfm_chi_eps_W_ikp_freq_j, threshold=0.0_dp, exponent=1.0_dp)
 
       ! 3. ε(iω_j,k_i) = Id - V^0.5(k_i)*M^-1(k_i)*χ(iω_j,k_i)*M^-1(k_i)*V^0.5(k_i)
       CALL compute_cfm_W_ikp_freq_j(bs_env, cfm_chi_eps_W_ikp_freq_j, cfm_V_sqrt_ikp, &
@@ -742,49 +749,6 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE compute_fm_W_MIC_freq_j_from_chi
-
-! **************************************************************************************************
-!> \brief One line per (k_i,ω_j) on how far the minimum image convention pushes χ(k) out of the
-!>        positive semidefinite cone, i.e. how much of χ the clipping in step 2 throws away.
-!>
-!>        Σ|λ_neg|/λ_max is the figure of merit. It is a pure artifact of reconstructing χ(k)
-!>        from χ(Γ) -- it would be exactly zero if the minimum image never wrapped -- so it
-!>        measures the error of any scheme that assumes the phase matrix is rank 1, the
-!>        Γ-collapse of the k-sum among them. On a 392-atom h-BN supercell it runs from 1.2E-2
-!>        at ω_1 to 4.8E-5 at ω_10, and it shrinks as the cell grows.
-!> \param bs_env ...
-!> \param ikp k-point index
-!> \param j_w frequency index
-!> \param n_neg number of clipped modes
-!> \param ev smallest and largest eigenvalue of χ
-!> \param discarded Σ|λ_neg| removed by the clipping
-! **************************************************************************************************
-   SUBROUTINE report_chi_mic_artifact(bs_env, ikp, j_w, n_neg, ev, discarded)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      INTEGER, INTENT(IN)                                :: ikp, j_w, n_neg
-      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: ev
-      REAL(KIND=dp), INTENT(IN)                          :: discarded
-
-      REAL(KIND=dp)                                      :: rel
-
-      IF (bs_env%unit_nr <= 0) RETURN
-
-      IF (ikp == 1 .AND. j_w == 1) THEN
-         WRITE (bs_env%unit_nr, '(A)') ' '
-         WRITE (bs_env%unit_nr, '(T2,A,I0)') &
-            'Minimum-image artifact in chi(i*omega,k), clipped per (k,omega), n_RI = ', bs_env%n_RI
-         WRITE (bs_env%unit_nr, '(T2,A)') &
-            '  ikp  j_w    n_neg        lambda_min        lambda_max   sum|l_neg|/l_max'
-      END IF
-
-      rel = 0.0_dp
-      IF (ev(2) > 0.0_dp) rel = discarded/ev(2)
-
-      WRITE (bs_env%unit_nr, '(T2,I5,I5,I9,2ES18.6,ES19.6)') ikp, j_w, n_neg, ev(1), ev(2), rel
-
-      CALL m_flush(bs_env%unit_nr)
-
-   END SUBROUTINE report_chi_mic_artifact
 
 ! **************************************************************************************************
 !> \brief ...

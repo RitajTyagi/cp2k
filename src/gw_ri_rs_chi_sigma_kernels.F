@@ -274,6 +274,10 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: blk_aux, dist_row_aux
       LOGICAL                                            :: retain_work
       REAL(KIND=dp)                                      :: t1, tau
+      ! Passed through to contract_grid_panels only when the Gamma-point correction is active, so
+      ! that W_ll' picks up DeltaW_ll' before it is contracted with G. Left NULL otherwise, which
+      ! makes the optional argument absent and the panel loop byte-identical to before.
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env_corr
       TYPE(dbcsr_distribution_type)                      :: dist_aux_aux
       TYPE(dbcsr_p_type)                                 :: mat_Sigma_tau(2)
       TYPE(dbcsr_type)                                   :: matrix_G_ao(2), matrix_W_aux
@@ -283,6 +287,12 @@ CONTAINS
 
       retain_work = .FALSE.
       IF (PRESENT(keep_w_and_files)) retain_work = keep_w_and_files
+
+      NULLIFY (bs_env_corr)
+      IF (bs_env%ri_rs%gamma_corr%enabled) THEN
+         CPASSERT(bs_env%ri_rs%gamma_corr%ready)
+         bs_env_corr => bs_env
+      END IF
 
       ! =========================================================================
       ! 1. SETUP AUXILIARY TOPOLOGY AND PRE-ALLOCATE OUTPUT ARRAYS
@@ -332,7 +342,8 @@ CONTAINS
                                       scale=1.0_dp, eps=bs_env%eps_filter, para_env=bs_env%para_env, &
                                       pan_first=pan_first, pan_last=pan_last, &
                                       lb_eq_la=.FALSE., lout_eq_la=.TRUE., zero_out=.TRUE., &
-                                      centroids=bs_env%ri_rs%chunk_centroids, cutoff=cutoff)
+                                      centroids=bs_env%ri_rs%chunk_centroids, cutoff=cutoff, &
+                                      bs_env_gamma_corr=bs_env_corr, i_t=i_t)
             CALL dbcsr_scale(matrix_Sigma_tau(1), -1.0_dp)
 
             ! FM time sector 1 is positive, sector 2 is negative.

@@ -14,6 +14,9 @@ MODULE gw_ri_rs_large_cell_Gamma
    USE cp_fm_types,                     ONLY: cp_fm_release,&
                                               cp_fm_type
    USE gw_compute_V_and_W,              ONLY: get_W_MIC
+   USE gw_gamma_correction,             ONLY: gamma_corr_build_coulomb_maps,&
+                                              gamma_corr_response,&
+                                              gamma_corr_tabulate
    USE gw_ri_rs_chi_sigma_kernels,      ONLY: compute_Sigma_c,&
                                               compute_Sigma_x,&
                                               get_mat_chi_Gamma_tau
@@ -79,6 +82,26 @@ CONTAINS
        !!    χ_PQ(iτ)        = sum_ll' Z_lP χ_ll'(iτ) Z_l'Q
        !!========================================================================
       CALL get_mat_chi_Gamma_tau(bs_env, bs_env%mat_chi_Gamma_tau, cutoff=0.0_dp)
+
+       !!========================================================================
+       !! 4b. Gamma-point head-and-wing correction of W (2D slabs whose k-mesh for χ, ε, W
+       !!     contains q = 0, where the real-space Coulomb lattice sum over charged auxiliary
+       !!     functions diverges).
+       !!     c_P, Π = Id - c cᵀ, V_b = Π V(0) Π           -- separate the charge channel
+       !!     Y_αβ(iτ), X_lα(iτ)                           -- optical head and Cartesian wings
+       !!     B_PQ = δ_PQ + F_densityᵀ χ_PQ(Γ) F_density   -- the regular body, reused as is
+       !!     S_αβ = Y - Eᵀ B⁻¹ E,  T^w_lα                 -- block inversion in closed form
+       !!     K_h(R), K_w(R)                               -- Brillouin-zone cell integrals
+       !!     ΔW^c_ll' is then added to W_ll' inside the Σ^c panel loop, since its cell integrals
+       !!     depend on the minimum-image displacement r_l - r_l' and so cannot live in RI space.
+       !!     It has to run here, after χ_PQ(Γ,iτ) exists and before get_W_MIC consumes it.
+       !!========================================================================
+      IF (bs_env%ri_rs%gamma_corr%enabled) THEN
+         CALL gamma_corr_build_coulomb_maps(qs_env, bs_env)
+         CALL gamma_corr_response(bs_env, qs_env, bs_env%mat_chi_Gamma_tau)
+         CALL gamma_corr_tabulate(bs_env, n_tab=128)
+         bs_env%ri_rs%gamma_corr%ready = .TRUE.
+      END IF
 
        !!========================================================================
        !! 5. Compute Screened Interaction (W^MIC)
