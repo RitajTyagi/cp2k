@@ -986,6 +986,16 @@ CONTAINS
             END SELECT
          END DO
 
+         ! Gamma-only RI-RS for a 2D slab (KPOINTS_W 1 1 1): no extrapolation mesh. W is then
+         ! W(Gamma) plus the analytic head-and-wing integral over the whole small Brillouin zone
+         ! (gw_gamma_correction). With the extrapolation mesh kept, Gamma would enter the s-s
+         ! elements of W with weight 1/(1 - sqrt(2)) = -2.414 and all other elements with weight
+         ! zero, i.e. it would be a 2x2 calculation with a sign-flipped, amplified Gamma term.
+         IF (bs_env%gw_implementation == ri_rs_large_cell_Gamma .AND. &
+             ALL(periodic == [1, 1, 0]) .AND. ALL(nkp_grid == 1)) THEN
+            nkp_grid_extra(1:3) = 1
+         END IF
+
       ELSE IF (bs_env%nkp_grid_chi_eps_W_input(1) == -1 .AND. &
                bs_env%nkp_grid_chi_eps_W_input(2) == -1 .AND. &
                bs_env%nkp_grid_chi_eps_W_input(3) == -1) THEN
@@ -1051,15 +1061,21 @@ CONTAINS
 
          n_dim_inv = 1.0_dp/REAL(n_dim, KIND=dp)
 
-         ! k-point weights are chosen to automatically extrapolate the k-point mesh
-         CALL compute_wkp(kpoints_chi_eps_W%wkp(1:nkp_orig), nkp_orig, nkp_extra, n_dim_inv)
-         CALL compute_wkp(kpoints_chi_eps_W%wkp(nkp_orig + 1:nkp), &
-                          nkp_extra, nkp_orig, n_dim_inv)
+         IF (nkp_extra == 0) THEN
+            ! Gamma only: one point, weight one, for every element class of W.
+            kpoints_chi_eps_W%wkp(1:nkp_orig) = 1.0_dp/REAL(nkp_orig, KIND=dp)
+            bs_env%wkp_no_extra(1:nkp_orig) = 1.0_dp/REAL(nkp_orig, KIND=dp)
+         ELSE
+            ! k-point weights are chosen to automatically extrapolate the k-point mesh
+            CALL compute_wkp(kpoints_chi_eps_W%wkp(1:nkp_orig), nkp_orig, nkp_extra, n_dim_inv)
+            CALL compute_wkp(kpoints_chi_eps_W%wkp(nkp_orig + 1:nkp), &
+                             nkp_extra, nkp_orig, n_dim_inv)
 
-         bs_env%wkp_no_extra(1:nkp_orig) = 0.0_dp
-         bs_env%wkp_no_extra(nkp_orig + 1:nkp) = 1.0_dp/REAL(nkp_extra, KIND=dp)
+            bs_env%wkp_no_extra(1:nkp_orig) = 0.0_dp
+            bs_env%wkp_no_extra(nkp_orig + 1:nkp) = 1.0_dp/REAL(nkp_extra, KIND=dp)
+         END IF
 
-         IF (n_dim == 3) THEN
+         IF (n_dim == 3 .AND. nkp_extra > 0) THEN
             ! W_PQ(k) for an s-function P and a p-function Q diverges as 1/k at k=0
             ! (instead of 1/k^2 for P and Q both being s-functions).
             exp_s_p = 2.0_dp*n_dim_inv
@@ -1101,8 +1117,13 @@ CONTAINS
       IF (u > 0 .AND. bs_env%do_periodic) THEN
          WRITE (u, FMT="(T2,A)") " "
          WRITE (u, FMT="(T2,1A,T71,3I4)") "K-point mesh 1 for χ, ε, W", nkp_grid(1:3)
-         WRITE (u, FMT="(T2,2A,T71,3I4)") "K-point mesh 2 for χ, ε, W ", &
-            "(for k-point extrapolation of W)", nkp_grid_extra(1:3)
+         IF (nkp_extra > 0) THEN
+            WRITE (u, FMT="(T2,2A,T71,3I4)") "K-point mesh 2 for χ, ε, W ", &
+               "(for k-point extrapolation of W)", nkp_grid_extra(1:3)
+         ELSE
+            WRITE (u, FMT="(T2,A)") "K-point mesh 2 for χ, ε, W: none, Gamma-only W with the " &
+               //"analytic head-and-wing integral"
+         END IF
          WRITE (u, FMT="(T2,A,T80,L)") "Approximate the k-point extrapolation", &
             bs_env%approx_kp_extrapol
       END IF

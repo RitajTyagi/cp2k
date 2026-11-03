@@ -54,8 +54,9 @@ MODULE ri_rs_types
       ! that the fixed Tikhonov parameter regularizes it on the same footing as the Gaussian
       ! columns, and the fitted coefficients are divided by it again.
       REAL(KIND=dp)                                    :: metric_head = 0.0_dp
-      ! Normalized auxiliary charge vector c_P / ||c||, n_RI entries, replicated.
+      ! Normalized auxiliary charge vector c_P / ||c||, n_RI entries, replicated, and ||c||.
       REAL(KIND=dp), ALLOCATABLE                       :: charge(:)
+      REAL(KIND=dp)                                    :: charge_norm = 0.0_dp
       ! F_density = M^-1(0) Pi V_b^(1/2)   maps a fitted grid density to the response basis
       ! F_extern  = M^-1(0) V(0) Pi V_b^(-1/2)  maps it to the external potential
       ! Both n_RI x n_RI, replicated on every rank.

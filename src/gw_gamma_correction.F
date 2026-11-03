@@ -28,11 +28,20 @@
 !>          ϕ_0   = 1/√A,  v(q) = 2π/q                                separated charge mode
 !>
 !>        Between two neutral localized functions the interaction decays as R⁻³, so the 2D lattice
-!>        sum of V_b converges absolutely where the unprojected one does not. The dielectric head
-!>        and wings in the extended basis {0, 1, …, N_RI} are then integrated over the WHOLE small
-!>        Brillouin zone of the supercell. Nothing is subtracted, unlike the full-k code of
-!>        J. Wilhelm (cp2k#6447, gwp42 Eq. 78), because the charge mode was never sampled here in
-!>        the first place.
+!>        sum of V_b converges absolutely where the unprojected one does not. V_b is the body of
+!>        the CORRECTION only (Eqs. 66-67). The regular W path keeps the full V(0) with just its
+!>        divergent G = 0 constant removed, V(0) − D_box c cᵀ (gwp42 Sec. II, "the singular G = 0
+!>        term omitted"); see gamma_corr_subtract_divergent_head for why the projection must not
+!>        be used there. The dielectric head and wings in the extended basis {0, 1, …, N_RI} are
+!>        then integrated over the WHOLE small Brillouin zone of the supercell. Nothing is
+!>        subtracted, unlike the full-k code of J. Wilhelm (cp2k#6447, gwp42 Eq. 78), because the
+!>        regular path is Γ only and its sampled head was removed exactly.
+!>
+!>        **Γ only means Γ only.** setup_kpoints_chi_eps_W drops the extrapolation mesh for this
+!>        case. With it, "KPOINTS_W 1 1 1" would be a 2x2 calculation in disguise: Γ enters the
+!>        s–s elements of W with the extrapolation weight −2.414 and every other element with
+!>        weight 0 (MIC_contribution_from_ikp), so the Γ-point W would be amplified and sign
+!>        flipped where it matters and ignored everywhere else.
 !>
 !>        Equations follow J. Wilhelm, *Periodic real-space RI for full-k GW band structures*,
 !>        Sec. VI; equation numbers below refer to that manuscript. The derivation of the Γ-only
@@ -52,8 +61,15 @@ MODULE gw_gamma_correction
    USE constants_operator,              ONLY: operator_coulomb
    USE commutator_rpnl,                 ONLY: build_com_mom_nl
    USE cp_dbcsr_api,                    ONLY: dbcsr_add,&
+                                              dbcsr_complete_redistribute,&
                                               dbcsr_copy,&
                                               dbcsr_create,&
+                                              dbcsr_distribution_get,&
+                                              dbcsr_distribution_new,&
+                                              dbcsr_distribution_release,&
+                                              dbcsr_distribution_type,&
+                                                                                            dbcsr_get_info,&
+                                              dbcsr_get_stored_coordinates,&
                                               dbcsr_iterator_blocks_left,&
                                               dbcsr_iterator_next_block,&
                                               dbcsr_iterator_start,&
@@ -65,7 +81,8 @@ MODULE gw_gamma_correction
                                               dbcsr_scale,&
                                               dbcsr_set,&
                                               dbcsr_type,&
-                                              dbcsr_type_antisymmetric
+                                              dbcsr_type_antisymmetric,&
+                                              dbcsr_type_no_symmetry
    USE cp_dbcsr_contrib,                ONLY: dbcsr_reserve_all_blocks
    USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
@@ -129,7 +146,7 @@ MODULE gw_gamma_correction
 
    PUBLIC :: gamma_corr_requested, &
              gamma_corr_init, &
-             gamma_corr_grid_owner, &
+             gamma_corr_fit_charge_channel, &
              gamma_corr_build_coulomb_maps, &
              gamma_corr_charge_rhs, &
              gamma_corr_transition_dipoles, &
@@ -137,7 +154,7 @@ MODULE gw_gamma_correction
              gamma_corr_response, &
              gamma_corr_tabulate, &
              gamma_corr_add_block, &
-             gamma_corr_project_coulomb, &
+             gamma_corr_subtract_divergent_head, &
              gamma_corr_auxiliary_charges, &
              gamma_corr_metric_head, &
              gamma_corr_slab_geometry, &
@@ -148,10 +165,10 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Whether the Γ-point correction applies to this calculation.
 !>
-!>        It is meaningful only when the mesh for χ, ε, W actually contains q = 0, i.e. when every
-!>        periodic direction has an ODD number of points (compute_xkp puts a point at the origin
-!>        for odd n and half-shifts for even n), and only for a 2D slab, which is the only
-!>        geometry whose head/wing construction is implemented here.
+!>        It is meaningful only when the mesh for χ, ε, W actually samples q = 0, which with the
+!>        ±k pairing of setup_kpoints_chi_eps_W happens for the 1x1x1 mesh alone (see below), and
+!>        only for a 2D slab, which is the only geometry whose head/wing construction is
+!>        implemented here.
 !> \param bs_env ...
 !> \return TRUE if the correction should be built
 ! **************************************************************************************************
@@ -166,10 +183,12 @@ CONTAINS
       ! Only PERIODIC XY: the 3D construction needs the Ewald ΔV and the 1/q² head instead.
       IF (.NOT. ALL(bs_env%periodic == [1, 1, 0])) RETURN
 
-      ! q = 0 is in the mesh only if every periodic direction is odd.
+      ! q = 0 is actually SAMPLED only for the 1x1x1 mesh. setup_kpoints_chi_eps_W keeps
+      ! nkp_orig = n1*n2*n3/2 points of an n1 x n2 x n3 mesh, one per +-k pair, and for an odd
+      ! n > 1 that integer division drops the self-paired Gamma point: a 3x3 mesh is sampled
+      ! at its 8 non-Gamma points. Only MAX(1/2, 1) = 1 keeps Gamma, as the single point.
       DO i_dim = 1, 3
-         IF (bs_env%periodic(i_dim) == 0) CYCLE
-         IF (MODULO(bs_env%nkp_grid_chi_eps_W_orig(i_dim), 2) == 0) RETURN
+         IF (bs_env%nkp_grid_chi_eps_W_orig(i_dim) /= 1) RETURN
       END DO
 
       do_corr = .TRUE.
@@ -465,6 +484,7 @@ CONTAINS
       IF (norm_c <= 0.0_dp) &
          CPABORT('Gamma-point correction: the RI_AUX basis carries no charge at all')
       gc%charge(:) = gc%charge/norm_c
+      gc%charge_norm = norm_c
 
       ALLOCATE (projector(n_RI, n_RI))
       DO i = 1, n_RI
@@ -773,62 +793,273 @@ CONTAINS
    END SUBROUTINE gamma_corr_init
 
 ! **************************************************************************************************
-!> \brief Nearest atom to every grid point, under the minimum image convention.
+!> \brief Grid coefficients Z_ℓ0 of the normalized constant function from the GLOBAL normal
+!>        equations, gwp42 Eq. 61:
 !>
-!>        The RI-RS grid is atom centered, but the integration spheres overlap, so a grid point
-!>        r_l lies inside the sphere of several atoms P and the local fit of the single global
-!>        charge channel produces a value for it once per sphere. Exactly one of them has to be
-!>        kept, and the natural choice is the sphere in which r_l sits deepest, i.e. the one
-!>        centered on the nearest atom, because that is where truncating the couplings D_ll' at
-!>        the sphere boundary does the least damage. Ties go to the lowest atom index, which
-!>        makes the assignment deterministic and rank independent.
+!>          Σ_ℓ' D_ℓℓ'(0) Z_ℓ'0 = d_ℓ0 ,     D_ℓℓ' = [Σ_µ Φ_µ(r_ℓ) Φ_µ(r_ℓ')]² ,
+!>
+!>        with the same Jacobi scaling j_ℓ = 1/max(D_ℓℓ, √floor) and Tikhonov shift λ as every
+!>        Z_ℓP (solve_ri_rs_fit), i.e. the scaled system [j D j + λ] z' = j d, Z = j z'.
+!>
+!>        **Why not one more right-hand side per sphere.** The sphere-local solves work for a
+!>        Gaussian ϕ_P because its right-hand side d_ℓP dies out inside the sphere of atom P, so
+!>        truncating D_ℓℓ' at the sphere boundary is harmless. The constant function has
+!>        d_ℓ0 ∝ ∫dr f_ℓ(r)² which does NOT decay: every grid point is a source. Solving it per
+!>        sphere and keeping one sphere's answer per point reproduces the global solution only
+!>        when a single sphere already covers the whole cell, which is why a 6 Å water cell
+!>        (7.5 Å RI spheres) passed and a 12 Å cell did not (gap 11.1 vs 23.3 eV, with the
+!>        response side identical).
+!>
+!>        **Matrix-free.** D is n_grid x n_grid and never formed. With Φ = mat_phi_mu_l,
+!>
+!>          (D v)_ℓ = Σ_ℓ' (Φ_ℓ·Φ_ℓ')² v_ℓ' = Φ_ℓᵀ G Φ_ℓ ,   G = Φᵀ diag(v) Φ   (n_AO x n_AO),
+!>
+!>        two sparse products per conjugate-gradient iteration (G, then Y = Φ G, then the row
+!>        quadratic forms Σ_µ Y_ℓµ Φ_ℓµ). G gets an explicit distribution with Φ's column
+!>        distribution on both indices, which is what dbcsr_multiply needs for Φᵀ(·)Φ products.
+!>        The scaled operator is symmetric positive definite, so plain CG converges; the Jacobi
+!>        scaling already makes its diagonal 1 + λ.
 !> \param bs_env ...
-!> \param owner owner(l) = index of the atom whose fit supplies Z_l0 for grid point l
+!> \param mat_phi Φ_µ(r_ℓ), the Γ-summed AO values on the grid, rows distributed
+!> \param d_l0 right-hand side (metric_head/√A) ϕ_ℓᵀ S ϕ_ℓ, replicated
 ! **************************************************************************************************
-   SUBROUTINE gamma_corr_grid_owner(bs_env, owner)
+   SUBROUTINE gamma_corr_fit_charge_channel(bs_env, mat_phi, d_l0)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      INTEGER, ALLOCATABLE, DIMENSION(:), INTENT(OUT)    :: owner
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_phi
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: d_l0
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_grid_owner'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_fit_charge_channel'
+      INTEGER, PARAMETER                                 :: max_iter = 5000
+      REAL(KIND=dp), PARAMETER                           :: eps_cg = 1.0E-8_dp, &
+                                                            jacobi_floor = 1.0E-16_dp
 
-      INTEGER                                            :: handle, i_atom, i_grid, n_atom, n_grid
-      REAL(KIND=dp)                                      :: best, dist
-      REAL(KIND=dp), DIMENSION(3)                        :: delta
-      TYPE(cell_type), POINTER                           :: cell
+      INTEGER                                            :: col, handle, i, iter, n_ao_blk, &
+                                                            n_grid, n_misplaced, npcols, nprows, &
+                                                            owner, row
+      INTEGER, DIMENSION(:), POINTER                     :: ao_blk_sizes, col_dist_G, row_dist_G
+      REAL(KIND=dp)                                      :: alpha, beta, pAp, rhs_norm, rr, &
+                                                            rr_new, start_time, sym_err
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: Ap, jac, p, r, rhs, z
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
+      TYPE(dbcsr_distribution_type)                      :: dist_G, dist_phi
+      TYPE(dbcsr_iterator_type)                          :: iter_blk
+      TYPE(dbcsr_type)                                   :: mat_G, mat_phi_own
+      TYPE(gamma_corr_type), POINTER                     :: gc
 
       CALL timeset(routineN, handle)
+      start_time = m_walltime()
 
-      cell => bs_env%ri_rs%cell
-      n_grid = bs_env%ri_rs%n_grid_points
-      n_atom = bs_env%n_atom
-      CPASSERT(n_grid > 0 .AND. n_atom > 0)
+      gc => bs_env%ri_rs%gamma_corr
+      n_grid = SIZE(d_l0)
+      CPASSERT(n_grid == bs_env%ri_rs%n_grid_points)
+      CPASSERT(gc%metric_head > 0.0_dp)
 
-      ALLOCATE (owner(n_grid))
-      owner(:) = 0
-
-      !$OMP PARALLEL DO DEFAULT(NONE) &
-      !$OMP SHARED(n_grid, n_atom, bs_env, cell, owner) &
-      !$OMP PRIVATE(i_grid, i_atom, delta, dist, best) &
-      !$OMP SCHEDULE(STATIC)
-      DO i_grid = 1, n_grid
-         best = HUGE(1.0_dp)
-         DO i_atom = 1, n_atom
-            delta = pbc(bs_env%ri_rs%grid_points(:, i_grid), &
-                        bs_env%ri_rs%particle_set(i_atom)%r(:), cell)
-            dist = SUM(delta*delta)
-            IF (dist < best) THEN
-               best = dist
-               owner(i_grid) = i_atom
-            END IF
-         END DO
+      ! ---------------------------------------------------------------------------------------
+      ! Φ as stored holds blocks on ranks that do not OWN them: build_phi_mu_l puts every grid
+      ! row block of its atoms' columns on the rank that evaluated them, not on the rank the
+      ! (row_dist, col_dist) assigns. Iterator-driven uses never notice; index lookups
+      ! (dbcsr_get_block_p) and products written into that pattern (retain_sparsity) are
+      ! undefined on it: measured as half the grid points wrong and a crash in DBCSR's hash
+      ! table. Everything below therefore works on a redistributed copy.
+      ! ---------------------------------------------------------------------------------------
+      n_misplaced = 0
+      CALL dbcsr_iterator_start(iter_blk, mat_phi)
+      DO WHILE (dbcsr_iterator_blocks_left(iter_blk))
+         CALL dbcsr_iterator_next_block(iter_blk, row, col, block)
+         CALL dbcsr_get_stored_coordinates(mat_phi, row, col, owner)
+         IF (owner /= bs_env%para_env%mepos) n_misplaced = n_misplaced + 1
       END DO
-      !$OMP END PARALLEL DO
+      CALL dbcsr_iterator_stop(iter_blk)
+      CALL bs_env%para_env%sum(n_misplaced)
 
-      CPASSERT(ALL(owner > 0))
+      CALL dbcsr_create(mat_phi_own, template=mat_phi)
+      CALL dbcsr_complete_redistribute(mat_phi, mat_phi_own)
+
+      ! G: n_AO x n_AO with Φ's AO blocking, freshly round-robined onto the process grid.
+      ! Reusing Φ's COLUMN distribution for the ROWS of G is wrong on a non-square grid (the
+      ! values range over npcols, not nprows) and dbcsr_multiply then returns a silently wrong
+      ! product; it redistributes internally, so any valid mapping works (create_product_matrix).
+      NULLIFY (ao_blk_sizes, row_dist_G, col_dist_G)
+      CALL dbcsr_get_info(mat_phi, col_blk_size=ao_blk_sizes, distribution=dist_phi)
+      CALL dbcsr_distribution_get(dist_phi, nprows=nprows, npcols=npcols)
+      n_ao_blk = SIZE(ao_blk_sizes)
+      ALLOCATE (row_dist_G(n_ao_blk), col_dist_G(n_ao_blk))
+      DO i = 1, n_ao_blk
+         row_dist_G(i) = MODULO(i - 1, nprows)
+         col_dist_G(i) = MODULO(i - 1, npcols)
+      END DO
+      CALL dbcsr_distribution_new(dist_G, template=dist_phi, row_dist=row_dist_G, &
+                                  col_dist=col_dist_G)
+      CALL dbcsr_create(mat_G, 'GAMMA_CORR_G', dist_G, dbcsr_type_no_symmetry, &
+                        ao_blk_sizes, ao_blk_sizes)
+      DEALLOCATE (row_dist_G, col_dist_G)
+
+      ! Jacobi scaling from the row norms D_ll = |Φ_l|^4, i.e. j_l = 1/max(|Φ_l|², √floor).
+      ALLOCATE (jac(n_grid), rhs(n_grid), z(n_grid), r(n_grid), p(n_grid), Ap(n_grid))
+      CALL gamma_corr_phi_row_norms(bs_env, mat_phi_own, jac)
+      DO i = 1, n_grid
+         jac(i) = 1.0_dp/MAX(jac(i), SQRT(jacobi_floor))
+      END DO
+
+      ! Symmetry check of the matrix-free operator, <u, D v> = <D u, v>: catches a wrong
+      ! distribution or a dropped block long before CG would (it would merely stagnate).
+      DO i = 1, n_grid
+         r(i) = SIN(1.0_dp*i)
+         p(i) = COS(0.37_dp*i)
+      END DO
+      CALL gamma_corr_apply_D(bs_env, mat_phi_own, mat_G, r, Ap)
+      sym_err = DOT_PRODUCT(p, Ap)
+      CALL gamma_corr_apply_D(bs_env, mat_phi_own, mat_G, p, Ap)
+      sym_err = ABS(sym_err - DOT_PRODUCT(r, Ap))/MAX(ABS(DOT_PRODUCT(r, Ap)), TINY(1.0_dp))
+
+      ! CG on [j D j + λ] z' = j d.
+      rhs(:) = jac*d_l0
+      rhs_norm = SQRT(DOT_PRODUCT(rhs, rhs))
+      z(:) = 0.0_dp
+      r(:) = rhs
+      p(:) = r
+      rr = DOT_PRODUCT(r, r)
+      iter = 0
+      DO WHILE (SQRT(rr) > eps_cg*rhs_norm .AND. iter < max_iter)
+         iter = iter + 1
+         CALL gamma_corr_apply_D(bs_env, mat_phi_own, mat_G, jac*p, Ap)
+         Ap(:) = jac*Ap + bs_env%ri_rs%tikhonov*p
+         pAp = DOT_PRODUCT(p, Ap)
+         CPASSERT(pAp > 0.0_dp)
+         alpha = rr/pAp
+         z(:) = z + alpha*p
+         r(:) = r - alpha*Ap
+         rr_new = DOT_PRODUCT(r, r)
+         beta = rr_new/rr
+         rr = rr_new
+         p(:) = r + beta*p
+      END DO
+      IF (SQRT(rr) > eps_cg*rhs_norm) &
+         CPABORT('Gamma-point correction: the charge-channel fit did not converge')
+
+      ! Z_l0 = j z', divided by the metric head that scaled d_l0 (see gamma_corr_charge_rhs).
+      IF (ALLOCATED(gc%Z_l0)) DEALLOCATE (gc%Z_l0)
+      ALLOCATE (gc%Z_l0(n_grid))
+      gc%Z_l0(:) = jac*z/gc%metric_head
+
+      IF (bs_env%unit_nr > 0) THEN
+         WRITE (bs_env%unit_nr, '(T2,A)') &
+            'Gamma-point correction: global fit of the charge channel Z_l0 (gwp42 Eq. 61)'
+         WRITE (bs_env%unit_nr, '(T4,A,T72,I10)') 'Blocks of phi_mu_l stored off their owner rank', &
+            n_misplaced
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Operator symmetry error', sym_err
+         WRITE (bs_env%unit_nr, '(T4,A,T72,I10)') 'Conjugate-gradient iterations', iter
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Relative residual', SQRT(rr)/rhs_norm
+         WRITE (bs_env%unit_nr, '(T4,A,T70,F12.1)') 'Wall time [s]', m_walltime() - start_time
+         WRITE (bs_env%unit_nr, '(A)') ' '
+      END IF
+
+      CALL dbcsr_release(mat_G)
+      CALL dbcsr_release(mat_phi_own)
+      CALL dbcsr_distribution_release(dist_G)
+      DEALLOCATE (jac, rhs, z, r, p, Ap)
 
       CALL timestop(handle)
 
-   END SUBROUTINE gamma_corr_grid_owner
+   END SUBROUTINE gamma_corr_fit_charge_channel
+
+
+
+
+! **************************************************************************************************
+!> \brief |Φ_ℓ|² = Σ_µ Φ_µ(r_ℓ)² for every grid point, replicated.
+!> \param bs_env ...
+!> \param mat_phi ...
+!> \param norm2 ...
+! **************************************************************************************************
+   SUBROUTINE gamma_corr_phi_row_norms(bs_env, mat_phi, norm2)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_phi
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: norm2
+
+      INTEGER                                            :: col, i, i_row, row
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
+      TYPE(dbcsr_iterator_type)                          :: iter
+
+      norm2(:) = 0.0_dp
+      CALL dbcsr_iterator_start(iter, mat_phi)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
+         CALL dbcsr_iterator_next_block(iter, row, col, block, row_offset=i_row)
+         DO i = 1, SIZE(block, 1)
+            norm2(i_row + i - 1) = norm2(i_row + i - 1) + SUM(block(i, :)**2)
+         END DO
+      END DO
+      CALL dbcsr_iterator_stop(iter)
+      CALL bs_env%para_env%sum(norm2)
+
+   END SUBROUTINE gamma_corr_phi_row_norms
+
+! **************************************************************************************************
+!> \brief (D v)_ℓ = Σ_ℓ' (Φ_ℓ·Φ_ℓ')² v_ℓ' = Φ_ℓᵀ G Φ_ℓ with G = Φᵀ diag(v) Φ, never forming D.
+!> \param bs_env ...
+!> \param mat_phi Φ
+!> \param mat_G work matrix n_AO x n_AO, created by the caller
+!> \param v input vector, replicated
+!> \param Dv output vector, replicated
+! **************************************************************************************************
+   SUBROUTINE gamma_corr_apply_D(bs_env, mat_phi, mat_G, v, Dv)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_phi, mat_G
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: v
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: Dv
+
+      INTEGER                                            :: col, col_phi, i, i_row, row, row_phi
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block, block_phi
+      TYPE(dbcsr_iterator_type)                          :: iter, iter_phi
+      TYPE(dbcsr_type)                                   :: mat_scaled, mat_Y
+
+      ! diag(v) Φ: scale the rows of a copy of Φ.
+      CALL dbcsr_create(mat_scaled, template=mat_phi)
+      CALL dbcsr_copy(mat_scaled, mat_phi)
+      CALL dbcsr_iterator_start(iter, mat_scaled)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
+         CALL dbcsr_iterator_next_block(iter, row, col, block, row_offset=i_row)
+         DO i = 1, SIZE(block, 1)
+            block(i, :) = block(i, :)*v(i_row + i - 1)
+         END DO
+      END DO
+      CALL dbcsr_iterator_stop(iter)
+
+      ! G = Φᵀ diag(v) Φ.
+      CALL dbcsr_multiply('T', 'N', 1.0_dp, mat_phi, mat_scaled, 0.0_dp, mat_G, &
+                          filter_eps=bs_env%eps_filter)
+      CALL dbcsr_release(mat_scaled)
+
+      ! Y = Φ G on Φ's OWN block pattern (retain_sparsity): only those blocks meet a nonzero
+      ! Φ_ℓµ in the row quadratic form below, and the identical pattern is what lets the two
+      ! matrices be walked in lockstep. (dbcsr_get_block_p on Φ from inside a Y iteration
+      ! returned wrong blocks for about half the grid points; never fetch by index here.)
+      CALL dbcsr_create(mat_Y, template=mat_phi)
+      CALL dbcsr_copy(mat_Y, mat_phi)
+      CALL dbcsr_set(mat_Y, 0.0_dp)
+      CALL dbcsr_multiply('N', 'N', 1.0_dp, mat_phi, mat_G, 0.0_dp, mat_Y, &
+                          retain_sparsity=.TRUE.)
+
+      ! (D v)_ℓ = Σ_µ Y_ℓµ Φ_ℓµ.
+      Dv(:) = 0.0_dp
+      CALL dbcsr_iterator_start(iter, mat_Y)
+      CALL dbcsr_iterator_start(iter_phi, mat_phi)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
+         CALL dbcsr_iterator_next_block(iter, row, col, block, row_offset=i_row)
+         CPASSERT(dbcsr_iterator_blocks_left(iter_phi))
+         CALL dbcsr_iterator_next_block(iter_phi, row_phi, col_phi, block_phi)
+         CPASSERT(row == row_phi .AND. col == col_phi)
+         DO i = 1, SIZE(block, 1)
+            Dv(i_row + i - 1) = Dv(i_row + i - 1) + SUM(block(i, :)*block_phi(i, :))
+         END DO
+      END DO
+      CPASSERT(.NOT. dbcsr_iterator_blocks_left(iter_phi))
+      CALL dbcsr_iterator_stop(iter_phi)
+      CALL dbcsr_iterator_stop(iter)
+      CALL dbcsr_release(mat_Y)
+      CALL bs_env%para_env%sum(Dv)
+
+   END SUBROUTINE gamma_corr_apply_D
 
 ! **************************************************************************************************
 !> \brief Optical transition dipoles µ^α_ai between occupied i and empty a at Γ.
@@ -1890,47 +2121,95 @@ CONTAINS
 
    END SUBROUTINE gamma_corr_add_block
 
-
 ! **************************************************************************************************
-!> \brief Project the charge channel out of V(k) in the REGULAR W path, V(k) <- Π V(k) Π.
+!> \brief Remove the divergent G = 0 constant from the real-space lattice sum V(q=0) used by the
+!>        REGULAR W path, and nothing else: V(0) <- V(0) - D_box c cᵀ.
 !>
-!>        This is the other half of separating the charge channel, and without it the correction
-!>        would double count: ΔW adds the analytically integrated head and wings back, so they
-!>        must not also be present in the V(k) that ε and W are built from. At q = 0 that term is
-!>        not merely double counted, it is the divergent one -- the whole reason the correction
-!>        exists -- so the projection is what makes a Γ-containing mesh well posed at all.
+!>        gwp42 Sec. II: the regular V_PQ(0) is Eq. 23 "with the singular G = 0 term omitted".
+!>        That term is (2π/(A q)) c_P c_Q with c_P = ∫dr ϕ_P, so omitting it is a RANK-ONE
+!>        subtraction along the unnormalized charge vector. It is NOT the projection Π V Π of
+!>        Eq. 65: Π V Π also deletes the charged direction's G ≠ 0 interactions, which are finite,
+!>        short-ranged, physical, and not restored by the head/wing model. Measured on the 6 Å
+!>        water test with the projection in this path: Σ^c of every state 5-9x too large.
 !>
-!>        The projector is rank one, Π = Id − c cᵀ with c normalized, so the triple product is a
-!>        rank-two update rather than two matrix multiplications. With u = V c,
+!>        For the finite real-space sum over the image box of lattice_sum, Poisson summation gives
 !>
-!>          (Π V Π)_PQ = V_PQ − c_P u_Q − u_P c_Q + (cᵀu) c_P c_Q .
+!>          Σ_{R∈box} (P0|QR) = (1/A) ∫_box d²r (P0|Q r) + [G ≠ 0 terms → V^reg]
 !>
-!>        V is Hermitian, so u is formed from the distributed matrix by one reduction and the
-!>        update is then purely local.
+!>        and for a box much larger than the Gaussians the first term is c_P c_Q D_box with
+!>
+!>          D_box = (1/A) ∫_box d²r / |r| = (1/A) ∮ (r × dr) / |r|
+!>
+!>        (the in-plane integral of 1/|r − d| over a large region does not depend on the
+!>        displacement d, so there is no finite multipole remainder; the −2π|z−z'| part of the 2D
+!>        kernel, which the ϕ_0 = 1/√A model does not carry, is deliberately left inside V^reg).
+!>        The box is the parallelogram ±F_1 a_1 ± F_2 a_2 covering the R set of
+!>        get_factor_and_xyz_min_max, F_α = 3^(s−1) n_α / 2 for the odd mesh, and the boundary
+!>        integral is done by Gauss-Legendre on its four edges with an area self-check.
+!>
+!>        Consistency: ΔW adds the cell integral of the singular model over the whole small BZ with
+!>        nothing subtracted, which is exactly the head that this routine takes out of V(0).
 !> \param bs_env ...
-!> \param cfm_V V(k), overwritten by Π V(k) Π
+!> \param cfm_V V(q=0), overwritten by V(0) − D_box c cᵀ
 ! **************************************************************************************************
-   SUBROUTINE gamma_corr_project_coulomb(bs_env, cfm_V)
+   SUBROUTINE gamma_corr_subtract_divergent_head(bs_env, cfm_V)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(cp_cfm_type), INTENT(INOUT)                   :: cfm_V
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_project_coulomb'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_subtract_divergent_head'
+      INTEGER, PARAMETER                                 :: n_gl = 32
 
       COMPLEX(KIND=dp)                                   :: c_dot_u
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)        :: u
-      INTEGER                                            :: col, handle, i_col, i_row, n_RI, row
+      INTEGER                                            :: col, handle, i_col, i_edge, i_node, &
+                                                            i_row, n_RI, row
       INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
+      REAL(KIND=dp)                                      :: area_check, d_box, weight
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: nodes, rule
+      REAL(KIND=dp), DIMENSION(2)                        :: f_half
+      REAL(KIND=dp), DIMENSION(3)                        :: dr, r
+      REAL(KIND=dp), DIMENSION(3, 4)                     :: corner
       TYPE(gamma_corr_type), POINTER                     :: gc
 
       CALL timeset(routineN, handle)
 
       gc => bs_env%ri_rs%gamma_corr
       CPASSERT(ALLOCATED(gc%charge))
+      CPASSERT(gc%charge_norm > 0.0_dp .AND. gc%area > 0.0_dp)
       n_RI = bs_env%n_RI
 
+      ! ---------------------------------------------------------------------------------------
+      ! 1. D_box = (1/A) ∮ (r × dr)/|r| around the image box, counterclockwise.
+      ! ---------------------------------------------------------------------------------------
+      f_half(1:2) = 0.5_dp*REAL(3**(bs_env%size_lattice_sum_V - 1), dp)* &
+                    REAL(bs_env%nkp_grid_chi_eps_W_orig(1:2), dp)
+      corner(:, 1) = -f_half(1)*bs_env%hmat(:, 1) - f_half(2)*bs_env%hmat(:, 2)
+      corner(:, 2) = +f_half(1)*bs_env%hmat(:, 1) - f_half(2)*bs_env%hmat(:, 2)
+      corner(:, 3) = +f_half(1)*bs_env%hmat(:, 1) + f_half(2)*bs_env%hmat(:, 2)
+      corner(:, 4) = -f_half(1)*bs_env%hmat(:, 1) + f_half(2)*bs_env%hmat(:, 2)
+
+      CALL gamma_corr_gauss_legendre(n_gl, nodes, rule)
+      d_box = 0.0_dp
+      area_check = 0.0_dp
+      DO i_edge = 1, 4
+         dr = 0.5_dp*(corner(:, MODULO(i_edge, 4) + 1) - corner(:, i_edge))
+         DO i_node = 1, n_gl
+            r = 0.5_dp*(corner(:, MODULO(i_edge, 4) + 1) + corner(:, i_edge)) + nodes(i_node)*dr
+            weight = rule(i_node)*(r(1)*dr(2) - r(2)*dr(1))
+            d_box = d_box + weight/SQRT(SUM(r(1:2)**2))
+            area_check = area_check + 0.5_dp*weight
+         END DO
+      END DO
+      DEALLOCATE (nodes, rule)
+      d_box = d_box/gc%area
+      IF (ABS(area_check/(4.0_dp*f_half(1)*f_half(2)*gc%area) - 1.0_dp) > 1.0E-8_dp) &
+         CPABORT('Gamma-point correction: the image-box boundary quadrature failed its area check')
+
+      ! ---------------------------------------------------------------------------------------
+      ! 2. Report the charge weight before and after, then V <- V − D_box ||c||² ĉ ĉᵀ.
+      ! ---------------------------------------------------------------------------------------
       CALL cp_cfm_get_info(cfm_V, row_indices=row_indices, col_indices=col_indices)
 
-      ! u_P = sum_Q V_PQ c_Q, accumulated from the local block and completed by one reduction.
       ALLOCATE (u(n_RI))
       u(:) = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       DO i_col = 1, SIZE(col_indices)
@@ -1941,37 +2220,36 @@ CONTAINS
          END DO
       END DO
       CALL bs_env%para_env%sum(u)
-
       c_dot_u = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       DO row = 1, n_RI
          c_dot_u = c_dot_u + gc%charge(row)*u(row)
       END DO
+      DEALLOCATE (u)
 
-      ! cᵀV(k)c is the charge-channel weight this projection removes. At q = 0 it is the piece
-      ! that diverges with SIZE_LATTICE_SUM, so reporting it once is the direct check that the
-      ! separation happened and how large the offending term was.
-      IF (bs_env%unit_nr > 0 .AND. .NOT. gc%reported_projection) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T68,ES14.6)') &
-            'Gamma-point correction: charge weight c^T V c removed from V(k)', REAL(c_dot_u, dp)
-         gc%reported_projection = .TRUE.
-      END IF
-
-      ! Rank-two update; purely local once u and c are replicated.
+      weight = d_box*gc%charge_norm**2
       DO i_col = 1, SIZE(col_indices)
          col = col_indices(i_col)
          DO i_row = 1, SIZE(row_indices)
             row = row_indices(i_row)
             cfm_V%local_data(i_row, i_col) = cfm_V%local_data(i_row, i_col) &
-                                             - gc%charge(row)*u(col) &
-                                             - u(row)*gc%charge(col) &
-                                             + c_dot_u*gc%charge(row)*gc%charge(col)
+                                             - weight*gc%charge(row)*gc%charge(col)
          END DO
       END DO
 
-      DEALLOCATE (u)
+      IF (bs_env%unit_nr > 0 .AND. .NOT. gc%reported_projection) THEN
+         WRITE (bs_env%unit_nr, '(T2,A)') &
+            'Gamma-point correction: divergent G = 0 constant removed from V(q=0)'
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Image box half-widths (cells)', f_half(1)
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'D_box = (1/A) int_box d^2r/|r|', d_box
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Charge weight c^T V c before', REAL(c_dot_u, dp)
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Charge weight c^T V c after', &
+            REAL(c_dot_u, dp) - weight
+         WRITE (bs_env%unit_nr, '(A)') ' '
+         gc%reported_projection = .TRUE.
+      END IF
 
       CALL timestop(handle)
 
-   END SUBROUTINE gamma_corr_project_coulomb
+   END SUBROUTINE gamma_corr_subtract_divergent_head
 
 END MODULE gw_gamma_correction

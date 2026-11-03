@@ -60,7 +60,7 @@ MODULE gw_compute_V_and_W
    USE input_section_types,             ONLY: section_vals_type
    USE kinds,                           ONLY: default_path_length,&
                                               dp
-   USE gw_gamma_correction,             ONLY: gamma_corr_project_coulomb
+   USE gw_gamma_correction,             ONLY: gamma_corr_subtract_divergent_head
    USE kpoint_coulomb_2c,               ONLY: build_2c_coulomb_matrix_kp
    USE libint_2c_3c,                    ONLY: libint_potential_type
    USE machine,                         ONLY: m_walltime
@@ -421,14 +421,14 @@ CONTAINS
          cfm_V_kp(ikp)%local_data = CMPLX(REAL(cfm_V_kp(ikp)%local_data, KIND=dp), &
                                           fm_V_kp_work%local_data, KIND=dp)
 
-         ! V(k) <- Pi V(k) Pi when the Gamma-point correction is active. The charge channel is
-         ! then carried analytically by the correction instead of by this lattice sum, which is
-         ! mandatory rather than cosmetic: at q = 0 the charged sum diverges with the summation
-         ! range, and leaving it in would also double count the head and wings that DeltaW adds
-         ! back. Between two neutral localized functions the interaction falls off as R^-3, so
-         ! what remains converges absolutely.
+         ! V(0) <- V(0) - D_box c c^T when the Gamma-point correction is active: the mesh is then
+         ! Gamma only, and at q = 0 the charged lattice sum carries a constant that grows with the
+         ! summation range. Only that constant goes; the head and wings DeltaW adds back are its
+         ! analytic replacement. NOT the projector Pi V Pi, which would also delete the finite
+         ! G /= 0 interactions of the charged direction.
          IF (bs_env%ri_rs%gamma_corr%enabled) THEN
-            CALL gamma_corr_project_coulomb(bs_env, cfm_V_kp(ikp))
+            CPASSERT(ALL(ABS(bs_env%kpoints_chi_eps_W%xkp(:, ikp)) < 1.0E-12_dp))
+            CALL gamma_corr_subtract_divergent_head(bs_env, cfm_V_kp(ikp))
          END IF
       END DO
       CALL cp_fm_release(fm_V_kp_work)
