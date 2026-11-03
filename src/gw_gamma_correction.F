@@ -825,7 +825,10 @@ CONTAINS
 !>        131712 grid points. The constant function is the smoothest target there is, so its
 !>        fit lives in the well-conditioned directions and the near-null components are noise:
 !>        raising λ to 1E-04 for this one column changes the water-test gaps by < 1 meV (scanned
-!>        1E-08 … 1E-03) and bounds the condition number by 1E+04.
+!>        1E-08 … 1E-03). The Jacobi scaling fixes the diagonal, not the largest eigenvalue, so
+!>        on 131712 points CG still needs ~1000 iterations (0.18 s each) to reach 1E-06; that
+!>        tolerance and 1E-05 reproduce the 1E-08 gaps to the meV on the water tests, so 1E-06 is
+!>        the stopping criterion.
 !> \param bs_env ...
 !> \param mat_phi Φ_µ(r_ℓ), the Γ-summed AO values on the grid, rows distributed
 !> \param d_l0 right-hand side (metric_head/√A) ϕ_ℓᵀ S ϕ_ℓ, replicated
@@ -836,8 +839,8 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: d_l0
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_fit_charge_channel'
-      INTEGER, PARAMETER                                 :: max_iter = 2000
-      REAL(KIND=dp), PARAMETER                           :: eps_cg = 1.0E-8_dp, &
+      INTEGER, PARAMETER                                 :: max_iter = 10000
+      REAL(KIND=dp), PARAMETER                           :: eps_cg = 1.0E-6_dp, &
                                                             jacobi_floor = 1.0E-16_dp, &
                                                             tikhonov_charge_min = 1.0E-4_dp
 
