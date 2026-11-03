@@ -819,6 +819,13 @@ CONTAINS
 !>        distribution on both indices, which is what dbcsr_multiply needs for Φᵀ(·)Φ products.
 !>        The scaled operator is symmetric positive definite, so plain CG converges; the Jacobi
 !>        scaling already makes its diagonal 1 + λ.
+!>
+!>        **Tikhonov for this column.** With the sphere solves' λ = 1E-08 the scaled system has
+!>        condition number ~1E+08 and CG needs ~1E+04 iterations: 5000 were not enough on
+!>        131712 grid points. The constant function is the smoothest target there is, so its
+!>        fit lives in the well-conditioned directions and the near-null components are noise:
+!>        raising λ to 1E-04 for this one column changes the water-test gaps by < 1 meV (scanned
+!>        1E-08 … 1E-03) and bounds the condition number by 1E+04.
 !> \param bs_env ...
 !> \param mat_phi Φ_µ(r_ℓ), the Γ-summed AO values on the grid, rows distributed
 !> \param d_l0 right-hand side (metric_head/√A) ϕ_ℓᵀ S ϕ_ℓ, replicated
@@ -829,9 +836,10 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: d_l0
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_fit_charge_channel'
-      INTEGER, PARAMETER                                 :: max_iter = 5000
+      INTEGER, PARAMETER                                 :: max_iter = 2000
       REAL(KIND=dp), PARAMETER                           :: eps_cg = 1.0E-8_dp, &
-                                                            jacobi_floor = 1.0E-16_dp
+                                                            jacobi_floor = 1.0E-16_dp, &
+                                                            tikhonov_charge_min = 1.0E-4_dp
 
       INTEGER                                            :: col, handle, i, iter, n_ao_blk, &
                                                             n_grid, n_misplaced, npcols, nprows, &
@@ -923,7 +931,7 @@ CONTAINS
       DO WHILE (SQRT(rr) > eps_cg*rhs_norm .AND. iter < max_iter)
          iter = iter + 1
          CALL gamma_corr_apply_D(bs_env, mat_phi_own, mat_G, jac*p, Ap)
-         Ap(:) = jac*Ap + bs_env%ri_rs%tikhonov*p
+         Ap(:) = jac*Ap + MAX(bs_env%ri_rs%tikhonov, tikhonov_charge_min)*p
          pAp = DOT_PRODUCT(p, Ap)
          CPASSERT(pAp > 0.0_dp)
          alpha = rr/pAp
@@ -933,6 +941,10 @@ CONTAINS
          beta = rr_new/rr
          rr = rr_new
          p(:) = r + beta*p
+         IF (bs_env%unit_nr > 0 .AND. MODULO(iter, 200) == 0) &
+            WRITE (bs_env%unit_nr, '(T4,A,I6,A,ES10.3,A,F10.1,A)') 'Charge-channel CG iteration', &
+            iter, ', relative residual', SQRT(rr)/rhs_norm, ', wall time', &
+            m_walltime() - start_time, ' s'
       END DO
       IF (SQRT(rr) > eps_cg*rhs_norm) &
          CPABORT('Gamma-point correction: the charge-channel fit did not converge')
