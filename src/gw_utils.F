@@ -949,9 +949,8 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'setup_kpoints_chi_eps_W'
 
-      INTEGER                                            :: i_batch
-      INTEGER                                            :: handle, i_dim, n_dim, nkp, nkp_extra, &
-                                                            nkp_orig, u
+      INTEGER                                            :: handle, i_batch, i_dim, n_dim, nkp, &
+                                                            nkp_extra, nkp_orig, u
       INTEGER, DIMENSION(3)                              :: nkp_grid, nkp_grid_extra, periodic
       REAL(KIND=dp)                                      :: exp_s_p, n_dim_inv
 

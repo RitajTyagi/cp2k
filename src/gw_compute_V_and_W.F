@@ -51,6 +51,7 @@ MODULE gw_compute_V_and_W
                                               cp_print_key_should_output,&
                                               cp_print_key_unit_nr
    USE distribution_2d_types,           ONLY: distribution_2d_type
+   USE gw_gamma_correction,             ONLY: gamma_corr_subtract_divergent_head
    USE gw_utils_fm,                     ONLY: cfm_contract_ABA,&
                                               fm_contract_ABA,&
                                               fm_invert,&
@@ -60,7 +61,6 @@ MODULE gw_compute_V_and_W
    USE input_section_types,             ONLY: section_vals_type
    USE kinds,                           ONLY: default_path_length,&
                                               dp
-   USE gw_gamma_correction,             ONLY: gamma_corr_subtract_divergent_head
    USE kpoint_coulomb_2c,               ONLY: build_2c_coulomb_matrix_kp
    USE libint_2c_3c,                    ONLY: libint_potential_type
    USE machine,                         ONLY: m_walltime

@@ -32,6 +32,9 @@ MODULE ri_rs_setup
    USE cp_output_handling,              ONLY: cp_p_file,&
                                               cp_print_key_should_output
    USE gw_auto_ri_types,                ONLY: auto_ri_type
+   USE gw_gamma_correction,             ONLY: gamma_corr_charge_rhs,&
+                                              gamma_corr_fit_charge_channel,&
+                                              gamma_corr_init
    USE gw_utils_compute_integrals,      ONLY: build_3c_integral_block_ctx,&
                                               gw_3c_ctx_create,&
                                               gw_3c_ctx_release,&
@@ -54,9 +57,6 @@ MODULE ri_rs_setup
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_kind_types,                   ONLY: qs_kind_type
-   USE gw_gamma_correction,             ONLY: gamma_corr_charge_rhs,&
-                                              gamma_corr_fit_charge_channel,&
-                                              gamma_corr_init
    USE ri_rs_fitting,                   ONLY: solve_ri_rs_fit,&
                                               store_Z_lP_columns
    USE ri_rs_grid_setup,                ONLY: setup_ri_rs_grid
@@ -232,11 +232,11 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: key = 'PROPERTIES%BANDSTRUCTURE%GW%PRINT%RESTART', &
          routineN = 'compute_Z_lP_standard'
 
-      INTEGER :: atom_j_mepos, atom_j_stride, atom_P, G, handle, i_blk, i_loc, iatom, idx, &
-         iphase, j, max_ao_size, my_group, n_big, n_done, n_groups, n_loc_ri, n_local_grid, &
-         n_my_atoms, n_small, natom, npcol_phi, num_grid_chunks, phase_hi
-      INTEGER, ALLOCATABLE, DIMENSION(:) :: ao_atoms, ao_col_start, big_list, &
-         local_grid_idx, my_atoms_A, my_atoms_B, n_local_grid_atom, row_offset, small_list
+      INTEGER :: atom_j_mepos, atom_j_stride, atom_P, G, handle, i_blk, iatom, idx, iphase, j, &
+         max_ao_size, my_group, n_big, n_done, n_groups, n_loc_ri, n_local_grid, n_my_atoms, &
+         n_small, natom, npcol_phi, num_grid_chunks, phase_hi
+      INTEGER, ALLOCATABLE, DIMENSION(:) :: ao_atoms, ao_col_start, big_list, local_grid_idx, &
+         my_atoms_A, my_atoms_B, n_local_grid_atom, row_offset, small_list
       INTEGER, DIMENSION(:), POINTER                     :: col_dist_ri, r_blk_sizes, ri_blk_sizes, &
                                                             row_dist_grid
       LOGICAL                                            :: do_gamma_corr, do_scatter, use_dist

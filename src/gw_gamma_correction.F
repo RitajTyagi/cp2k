@@ -56,46 +56,29 @@
 MODULE gw_gamma_correction
    USE atomic_kind_types,               ONLY: atomic_kind_type
    USE basis_set_types,                 ONLY: gto_basis_set_type
-   USE cell_types,                      ONLY: cell_type,&
-                                              pbc
-   USE constants_operator,              ONLY: operator_coulomb
+   USE cell_types,                      ONLY: cell_type
    USE commutator_rpnl,                 ONLY: build_com_mom_nl
-   USE cp_dbcsr_api,                    ONLY: dbcsr_add,&
-                                              dbcsr_complete_redistribute,&
-                                              dbcsr_copy,&
-                                              dbcsr_create,&
-                                              dbcsr_distribution_get,&
-                                              dbcsr_distribution_new,&
-                                              dbcsr_distribution_release,&
-                                              dbcsr_distribution_type,&
-                                                                                            dbcsr_get_info,&
-                                              dbcsr_get_stored_coordinates,&
-                                              dbcsr_iterator_blocks_left,&
-                                              dbcsr_iterator_next_block,&
-                                              dbcsr_iterator_start,&
-                                              dbcsr_iterator_stop,&
-                                              dbcsr_iterator_type,&
-                                              dbcsr_multiply,&
-                                              dbcsr_p_type,&
-                                              dbcsr_release,&
-                                              dbcsr_scale,&
-                                              dbcsr_set,&
-                                              dbcsr_type,&
-                                              dbcsr_type_antisymmetric,&
-                                              dbcsr_type_no_symmetry
+   USE constants_operator,              ONLY: operator_coulomb
+   USE cp_cfm_types,                    ONLY: cp_cfm_get_info,&
+                                              cp_cfm_type
+   USE cp_control_types,                ONLY: dft_control_type
+   USE cp_dbcsr_api,                    ONLY: &
+        dbcsr_add, dbcsr_complete_redistribute, dbcsr_copy, dbcsr_create, dbcsr_distribution_get, &
+        dbcsr_distribution_new, dbcsr_distribution_release, dbcsr_distribution_type, &
+        dbcsr_get_info, dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, &
+        dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_multiply, &
+        dbcsr_p_type, dbcsr_release, dbcsr_scale, dbcsr_set, dbcsr_type, dbcsr_type_antisymmetric, &
+        dbcsr_type_no_symmetry
    USE cp_dbcsr_contrib,                ONLY: dbcsr_reserve_all_blocks
-   USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale
-   USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
-                                              cp_fm_struct_release,&
-                                              cp_fm_struct_type
    USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
                                               copy_fm_to_dbcsr,&
                                               dbcsr_allocate_matrix_set,&
                                               dbcsr_deallocate_matrix_set
-   USE cp_cfm_types,                    ONLY: cp_cfm_get_info,&
-                                              cp_cfm_type
    USE cp_fm_cholesky,                  ONLY: cp_fm_cholesky_decompose
+   USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
+                                              cp_fm_struct_release,&
+                                              cp_fm_struct_type
    USE cp_fm_types,                     ONLY: cp_fm_create,&
                                               cp_fm_get_info,&
                                               cp_fm_get_submatrix,&
@@ -116,15 +99,14 @@ MODULE gw_gamma_correction
    USE orbital_pointers,                ONLY: indco,&
                                               ncoset
    USE parallel_gemm_api,               ONLY: parallel_gemm
-   USE qs_operators_ao,                 ONLY: build_lin_mom_matrix
-   USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE particle_types,                  ONLY: particle_type
-   USE cp_control_types,                ONLY: dft_control_type
    USE post_scf_bandstructure_types,    ONLY: post_scf_bandstructure_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_kind_types,                   ONLY: get_qs_kind,&
                                               qs_kind_type
+   USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
+   USE qs_operators_ao,                 ONLY: build_lin_mom_matrix
    USE ri_rs_types,                     ONLY: gamma_corr_type
 #include "./base/base_uses.f90"
 
@@ -284,9 +266,8 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_auxiliary_charges'
 
-      INTEGER                                            :: first, handle, i_atom, i_co, i_l, &
-                                                            i_pgf, i_set, i_sgf, l_max, n_cart, &
-                                                            offset
+      INTEGER                                            :: first, handle, i_atom, i_co, i_l, i_pgf, &
+                                                            i_set, i_sgf, l_max, n_cart, offset
       REAL(KIND=dp)                                      :: alpha
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: moments, primitive
       TYPE(gto_basis_set_type), POINTER                  :: basis
@@ -360,7 +341,7 @@ CONTAINS
 !> \param lambda_kept optional smallest retained eigenvalue, for reporting the conditioning
 ! **************************************************************************************************
    SUBROUTINE gamma_corr_symmetric_power(matrix, exponent, relative_eps, n_dropped, &
-                                        lambda_max, lambda_kept)
+                                         lambda_max, lambda_kept)
       REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: matrix
       REAL(KIND=dp), INTENT(IN)                          :: exponent, relative_eps
       INTEGER, INTENT(OUT), OPTIONAL                     :: n_dropped
@@ -680,12 +661,13 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_charge_rhs'
 
-      INTEGER                                            :: col, handle, i_col, i_row, info, &
-                                                            n_grid, row
+      INTEGER                                            :: col, handle, i_col, i_row, info, n_grid, &
+                                                            row
       INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
       REAL(KIND=dp)                                      :: prefactor
+      REAL(KIND=dp), CONTIGUOUS, DIMENSION(:, :), &
+         POINTER                                         :: local_data
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
-      REAL(KIND=dp), CONTIGUOUS, DIMENSION(:, :), POINTER :: local_data
       TYPE(cp_fm_type)                                   :: fm_U
       TYPE(dbcsr_iterator_type)                          :: iter
       TYPE(dbcsr_type)                                   :: mat_G, mat_U
@@ -840,15 +822,14 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_fit_charge_channel'
       INTEGER, PARAMETER                                 :: max_iter = 10000
-      REAL(KIND=dp), PARAMETER                           :: eps_cg = 1.0E-6_dp, &
-                                                            jacobi_floor = 1.0E-16_dp, &
-                                                            tikhonov_charge_min = 1.0E-4_dp
+      REAL(KIND=dp), PARAMETER :: eps_cg = 1.0E-6_dp, jacobi_floor = 1.0E-16_dp, &
+         tikhonov_charge_min = 1.0E-4_dp
 
       INTEGER                                            :: handle, i, iter, n_ao_blk, n_grid, &
                                                             npcols, nprows
       INTEGER, DIMENSION(:), POINTER                     :: ao_blk_sizes, col_dist_G, row_dist_G
-      REAL(KIND=dp)                                      :: alpha, beta, pAp, rhs_norm, rr, &
-                                                            rr_new, start_time
+      REAL(KIND=dp)                                      :: alpha, beta, pAp, rhs_norm, rr, rr_new, &
+                                                            start_time
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: Ap, jac, p, r, rhs, z
       TYPE(dbcsr_distribution_type)                      :: dist_G, dist_phi
       TYPE(dbcsr_type)                                   :: mat_G, mat_phi_own
@@ -1074,16 +1055,16 @@ CONTAINS
    SUBROUTINE gamma_corr_transition_dipoles(qs_env, bs_env, mu)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :), &
-         INTENT(OUT)                                     :: mu
+      REAL(KIND=dp), ALLOCATABLE, &
+         DIMENSION(:, :, :, :), INTENT(OUT)              :: mu
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_transition_dipoles'
 
       INTEGER                                            :: handle, i_dir, i_occ, i_spin, i_vir, &
                                                             n_ao, n_mo, n_occ, n_vir
       REAL(KIND=dp)                                      :: delta, n_elec
-      REAL(KIND=dp), DIMENSION(3)                        :: f_sum
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: mu_mo
+      REAL(KIND=dp), DIMENSION(3)                        :: f_sum
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_fm_struct_type), POINTER                   :: struct_mo_mo
       TYPE(cp_fm_type)                                   :: fm_mo_mo, fm_r_ao, fm_r_mo
@@ -1315,7 +1296,7 @@ CONTAINS
                                                             n_grid, n_occ, n_RI, n_t, n_vir
       REAL(KIND=dp)                                      :: spin_factor
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: chi_PQ, E_freq, work_RI
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: X_freq, X_time, Y_time, mu_spin
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: mu_spin, X_freq, X_time, Y_time
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: mu
       TYPE(cp_fm_type)                                   :: fm_chi
       TYPE(dbcsr_type)                                   :: mat_psi
@@ -1458,8 +1439,9 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_accumulate_response'
 
-      INTEGER :: col, col_start, handle, i_a, i_dir, i_i, i_local, i_t, j_dir, n_local, n_mo, &
-         n_occ, n_vir, row, row_start
+      INTEGER                                            :: col, col_start, handle, i_a, i_dir, i_i, &
+                                                            i_local, i_t, j_dir, n_local, n_mo, &
+                                                            n_occ, n_vir, row, row_start
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: local_of_global, row_global
       REAL(KIND=dp)                                      :: e_fermi, tau, weight
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: exp_occ, exp_vir
@@ -1642,8 +1624,8 @@ CONTAINS
          DO i_dir = 1, 3
             DO i_col = 1, SIZE(block, 2)
                X_RI(col_start + i_col - 1, i_dir) = X_RI(col_start + i_col - 1, i_dir) + &
-                  DOT_PRODUCT(block(:, i_col), &
-                              X_grid(row_start:row_start + SIZE(block, 1) - 1, i_dir))
+                                                    DOT_PRODUCT(block(:, i_col), &
+                                                                X_grid(row_start:row_start + SIZE(block, 1) - 1, i_dir))
             END DO
          END DO
       END DO
@@ -1766,9 +1748,10 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_tabulate'
       INTEGER, PARAMETER                                 :: n_face = 24, n_radial = 32
 
-      INTEGER                                            :: handle, i_dir, i_node, i_tab, i_u, &
-                                                            i_v, i_w, n_dir, n_t
-      REAL(KIND=dp) :: a_scalar, area_bz, denom, jac, proj, q, q_max, radial_w, start_time, t
+      INTEGER                                            :: handle, i_dir, i_node, i_tab, i_u, i_v, &
+                                                            i_w, n_dir, n_t
+      REAL(KIND=dp)                                      :: a_scalar, area_bz, denom, jac, proj, q, &
+                                                            q_max, radial_w, start_time
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: dir_radius, dir_weight, nodes, rule
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: dir_hat
       REAL(KIND=dp), DIMENSION(3)                        :: R_cart
@@ -2049,7 +2032,8 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: block
 
       INTEGER                                            :: i, i_u, i_v, j, k00, n_tab, n_u
-      REAL(KIND=dp) :: du, dv, f_u, f_v, fx_p, fy_p, scale, w00, w01, w10, w11
+      REAL(KIND=dp)                                      :: du, dv, f_u, f_v, fx_p, fy_p, scale, &
+                                                            w00, w01, w10, w11
       REAL(KIND=dp), DIMENSION(4)                        :: ker, u_l, u_p
 
       n_tab = gc%n_tab(1)

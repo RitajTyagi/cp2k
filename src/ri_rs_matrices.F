@@ -25,6 +25,7 @@ MODULE ri_rs_matrices
                                               cp_fm_to_fm,&
                                               cp_fm_type
    USE gw_auto_ri_types,                ONLY: auto_ri_type
+   USE gw_gamma_correction,             ONLY: gamma_corr_add_block
    USE gw_utils_dbcsr,                  ONLY: hadamard_product_inplace
    USE gw_utils_fm,                     ONLY: fm_contract_ABA
    USE kinds,                           ONLY: dp,&
@@ -35,9 +36,8 @@ MODULE ri_rs_matrices
    USE message_passing,                 ONLY: mp_mem_avail_per_rank_GB,&
                                               mp_para_env_type
    USE mp2_ri_2c,                       ONLY: RI_2c_integral_mat
-   USE qs_environment_types,            ONLY: qs_environment_type
-   USE gw_gamma_correction,             ONLY: gamma_corr_add_block
    USE post_scf_bandstructure_types,    ONLY: post_scf_bandstructure_type
+   USE qs_environment_types,            ONLY: qs_environment_type
    USE ri_rs_types,                     ONLY: ri_rs_env
    USE ri_rs_utils,                     ONLY: evaluate_ao_basis_on_points
 #include "./base/base_uses.f90"
@@ -1004,6 +1004,12 @@ CONTAINS
 !> \param centroids optional global grid-block centres, paired with a positive cutoff for truncation
 !> \param cutoff retain grid-block pairs within this centroid distance; nonpositive disables truncation
 !> \param grid_occupation allocated-element fraction of the first grid operand before the Hadamard product
+!> \param bs_env_gamma_corr present (and associated) only for the Gamma-point correction of W: the
+!>        grid-space term DeltaW_ll' is then added to each B panel before the Hadamard product,
+!>        because it cannot be expressed in the RI space that M_B lives in -- its cell integrals
+!>        depend on the minimum-image displacement r_l - r_l', a property of the pair of grid
+!>        points, not of the auxiliary indices
+!> \param i_t imaginary-time index of the panel, selects the DeltaW_ll'(i tau) table
 ! **************************************************************************************************
    SUBROUTINE contract_grid_panels(L_A, M_A, L_B, M_B, L_out, mat_out, scale, eps, para_env, &
                                    pan_first, pan_last, lb_eq_la, lout_eq_la, zero_out, &
@@ -1023,11 +1029,8 @@ CONTAINS
          OPTIONAL                                        :: centroids
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: cutoff
       REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: grid_occupation
-      ! Present only for the Gamma-point correction of W: the grid-space term DeltaW_ll' is added
-      ! to each B panel before the Hadamard product, because it cannot be expressed in the RI
-      ! space that M_B lives in -- its cell integrals depend on the minimum-image displacement
-      ! r_l - r_l', which is a property of the pair, not of the auxiliary indices.
-      TYPE(post_scf_bandstructure_type), OPTIONAL, POINTER :: bs_env_gamma_corr
+      TYPE(post_scf_bandstructure_type), OPTIONAL, &
+         POINTER                                         :: bs_env_gamma_corr
       INTEGER, INTENT(IN), OPTIONAL                      :: i_t
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'contract_grid_panels'
@@ -1237,8 +1240,8 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'add_gamma_corr_to_panel'
 
-      INTEGER                                            :: col, col_blk, handle, i_blk, n_blk, &
-                                                            row, row_blk
+      INTEGER                                            :: col, col_blk, handle, i_blk, n_blk, row, &
+                                                            row_blk
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: grid_offset
       INTEGER, DIMENSION(:), POINTER                     :: r_blk_sizes
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block

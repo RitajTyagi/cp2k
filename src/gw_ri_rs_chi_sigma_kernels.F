@@ -274,20 +274,20 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: blk_aux, dist_row_aux
       LOGICAL                                            :: retain_work
       REAL(KIND=dp)                                      :: t1, tau
-      ! Passed through to contract_grid_panels only when the Gamma-point correction is active, so
-      ! that W_ll' picks up DeltaW_ll' before it is contracted with G. Left NULL otherwise, which
-      ! makes the optional argument absent and the panel loop byte-identical to before.
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env_corr
       TYPE(dbcsr_distribution_type)                      :: dist_aux_aux
       TYPE(dbcsr_p_type)                                 :: mat_Sigma_tau(2)
       TYPE(dbcsr_type)                                   :: matrix_G_ao(2), matrix_W_aux
       TYPE(dbcsr_type), TARGET                           :: matrix_Sigma_tau(2)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env_corr
 
       CALL timeset(routineN, handle)
 
       retain_work = .FALSE.
       IF (PRESENT(keep_w_and_files)) retain_work = keep_w_and_files
 
+      ! bs_env_corr is passed through to contract_grid_panels only when the Gamma-point correction
+      ! is active, so that W_ll' picks up DeltaW_ll' before it is contracted with G. Left NULL
+      ! otherwise, which makes the optional argument absent and the panel loop byte-identical.
       NULLIFY (bs_env_corr)
       IF (bs_env%ri_rs%gamma_corr%enabled) THEN
          CPASSERT(bs_env%ri_rs%gamma_corr%ready)
