@@ -1342,9 +1342,12 @@ CONTAINS
                   delta = bs_env%eigenval_scf_Gamma(bs_env%n_occ(i_spin) + i_vir, i_spin) - &
                           bs_env%eigenval_scf_Gamma(i_occ, i_spin)
                   CPASSERT(delta > 0.0_dp)
-                  ! Stored element: mu_mo(i, a)/Δ_ia, row = occupied i, column = empty a.
+                  ! µ^α_ai = ⟨a|[H,r^α]|i⟩/(ε_a − ε_i) = ⟨a|r^α|i⟩: row = empty a, column =
+                  ! occupied i. The transposed element ⟨i|[H,r^α]|a⟩ is its NEGATIVE (the
+                  ! commutator matrix is antisymmetric), which would flip the sign of every
+                  ! wing while leaving the head and the sum rule, both quadratic in µ, unchanged.
                   mu(i_dir, i_occ, i_vir, i_spin) = &
-                     mu_mo(i_occ, bs_env%n_occ(i_spin) + i_vir)/delta
+                     mu_mo(bs_env%n_occ(i_spin) + i_vir, i_occ)/delta
                END DO
             END DO
          END DO
