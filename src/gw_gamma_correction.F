@@ -844,16 +844,13 @@ CONTAINS
                                                             jacobi_floor = 1.0E-16_dp, &
                                                             tikhonov_charge_min = 1.0E-4_dp
 
-      INTEGER                                            :: col, handle, i, iter, n_ao_blk, &
-                                                            n_grid, n_misplaced, npcols, nprows, &
-                                                            owner, row
+      INTEGER                                            :: handle, i, iter, n_ao_blk, n_grid, &
+                                                            npcols, nprows
       INTEGER, DIMENSION(:), POINTER                     :: ao_blk_sizes, col_dist_G, row_dist_G
       REAL(KIND=dp)                                      :: alpha, beta, pAp, rhs_norm, rr, &
-                                                            rr_new, start_time, sym_err
+                                                            rr_new, start_time
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: Ap, jac, p, r, rhs, z
-      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
       TYPE(dbcsr_distribution_type)                      :: dist_G, dist_phi
-      TYPE(dbcsr_iterator_type)                          :: iter_blk
       TYPE(dbcsr_type)                                   :: mat_G, mat_phi_own
       TYPE(gamma_corr_type), POINTER                     :: gc
 
@@ -873,16 +870,6 @@ CONTAINS
       ! undefined on it: measured as half the grid points wrong and a crash in DBCSR's hash
       ! table. Everything below therefore works on a redistributed copy.
       ! ---------------------------------------------------------------------------------------
-      n_misplaced = 0
-      CALL dbcsr_iterator_start(iter_blk, mat_phi)
-      DO WHILE (dbcsr_iterator_blocks_left(iter_blk))
-         CALL dbcsr_iterator_next_block(iter_blk, row, col, block)
-         CALL dbcsr_get_stored_coordinates(mat_phi, row, col, owner)
-         IF (owner /= bs_env%para_env%mepos) n_misplaced = n_misplaced + 1
-      END DO
-      CALL dbcsr_iterator_stop(iter_blk)
-      CALL bs_env%para_env%sum(n_misplaced)
-
       CALL dbcsr_create(mat_phi_own, template=mat_phi)
       CALL dbcsr_complete_redistribute(mat_phi, mat_phi_own)
 
@@ -911,17 +898,6 @@ CONTAINS
       DO i = 1, n_grid
          jac(i) = 1.0_dp/MAX(jac(i), SQRT(jacobi_floor))
       END DO
-
-      ! Symmetry check of the matrix-free operator, <u, D v> = <D u, v>: catches a wrong
-      ! distribution or a dropped block long before CG would (it would merely stagnate).
-      DO i = 1, n_grid
-         r(i) = SIN(1.0_dp*i)
-         p(i) = COS(0.37_dp*i)
-      END DO
-      CALL gamma_corr_apply_D(bs_env, mat_phi_own, mat_G, r, Ap)
-      sym_err = DOT_PRODUCT(p, Ap)
-      CALL gamma_corr_apply_D(bs_env, mat_phi_own, mat_G, p, Ap)
-      sym_err = ABS(sym_err - DOT_PRODUCT(r, Ap))/MAX(ABS(DOT_PRODUCT(r, Ap)), TINY(1.0_dp))
 
       ! CG on [j D j + λ] z' = j d.
       rhs(:) = jac*d_l0
@@ -960,9 +936,6 @@ CONTAINS
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A)') &
             'Gamma-point correction: global fit of the charge channel Z_l0 (gwp42 Eq. 61)'
-         WRITE (bs_env%unit_nr, '(T4,A,T72,I10)') 'Blocks of phi_mu_l stored off their owner rank', &
-            n_misplaced
-         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Operator symmetry error', sym_err
          WRITE (bs_env%unit_nr, '(T4,A,T72,I10)') 'Conjugate-gradient iterations', iter
          WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Relative residual', SQRT(rr)/rhs_norm
          WRITE (bs_env%unit_nr, '(T4,A,T70,F12.1)') 'Wall time [s]', m_walltime() - start_time
@@ -977,9 +950,6 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE gamma_corr_fit_charge_channel
-
-
-
 
 ! **************************************************************************************************
 !> \brief |Φ_ℓ|² = Σ_µ Φ_µ(r_ℓ)² for every grid point, replicated.
@@ -1860,11 +1830,9 @@ CONTAINS
       CALL gamma_corr_pack_hot_loop(bs_env)
 
       IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T60,I6,A,I6)') &
-            'Gamma-point correction: cell-integral table', n_tab, ' x', n_tab
-         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'K_head at R = 0, lowest frequency', &
-            gc%K_head(1 + (n_tab/2) + n_tab*(n_tab/2), 1)
-         WRITE (bs_env%unit_nr, '(T4,A,T70,F12.1)') 'Wall time [s]', m_walltime() - start_time
+         WRITE (bs_env%unit_nr, '(T2,A,I4,A,I4,A,T62,F10.1,A)') &
+            'Gamma-point correction: cell-integral tables (', n_tab, ' x', n_tab, &
+            '), Exec. time', m_walltime() - start_time, ' s'
          WRITE (bs_env%unit_nr, '(A)') ' '
       END IF
 
@@ -1976,26 +1944,22 @@ CONTAINS
    END SUBROUTINE gamma_corr_gauss_legendre
 
 ! **************************************************************************************************
-!> \brief ΔW^c_ℓℓ'(iτ_t) for one pair of grid points, by bilinear interpolation of the cell-integral
-!>        tables at the minimum-image in-plane displacement R = MIC(r_ℓ − r_ℓ').
+!> \brief Repack the correction for the Σ^c panel loop, which evaluates
 !>
-!>          ΔW^c_ℓℓ' = Z_ℓ0 Z_ℓ'0 K_h(R)
-!>                   + Σ_α [T^w_ℓα Z_ℓ'0 − Z_ℓ0 T^w_ℓ'α] K_w,α(R)
+!>          ΔW^c_ℓℓ'(iτ) = Z_ℓ0 Z_ℓ'0 K_h(R) + Σ_α [T^w_ℓα Z_ℓ'0 − Z_ℓ0 T^w_ℓ'α] K_w,α(R),
+!>          R = MIC(r_ℓ − r_ℓ'),
 !>
+!>        once per grid PAIR (gamma_corr_add_block). Three things are precomputed here so that
+!>        the per-pair work is a subtraction, an ANINT and a few contiguous loads:
+!>          K_time(1:4, i_R, i_t)  the four kernels (head, wing_x, wing_y, wing_z) cosine-
+!>                                 transformed from iω to iτ and interleaved per table point,
+!>          U_grid(1:4, ℓ, i_t)    the four grid-side factors (Z_ℓ0, T^w_ℓx, T^w_ℓy, T^w_ℓz),
+!>          frac(1:2, ℓ)           the in-plane fractional coordinates of every grid point.
 !>        K_h is even in R and the bracket is antisymmetric under ℓ ↔ ℓ', while K_w,α is odd, so
 !>        ΔW is symmetric, as a screened interaction must be. The tables are indexed in fractional
 !>        coordinates of the in-plane lattice vectors over [−1/2, 1/2], which is exactly the
 !>        minimum-image range, so no extrapolation can occur.
-!>
-!>        The tables hold the frequency-domain kernels; i_t selects an imaginary-TIME point and
-!>        the cosine transform back to time is applied here, which keeps the stored tables
-!>        frequency-indexed (as the response naturally produces them) while the caller, the Σ^c
-!>        panel loop, works in time.
 !> \param bs_env ...
-!> \param i_t imaginary-time index
-!> \param l_grid first grid index
-!> \param lp_grid second grid index
-!> \return ΔW^c_ℓℓ'(iτ_t)
 ! **************************************************************************************************
    SUBROUTINE gamma_corr_pack_hot_loop(bs_env)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
