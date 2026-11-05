@@ -116,6 +116,8 @@ CONTAINS
          ! Decide on the Gamma-point correction of W before fitting, because when it applies the
          ! fit carries one extra right-hand side: the grid representation of the constant
          ! function, which the correction needs for the separated charge channel.
+         ! Sets bs_env%ri_rs%gamma_corr%enabled (PERIODIC XY with a 1x1x1 W mesh) and, if so,
+         ! the layer area, the in-plane reciprocal vectors and the RI-metric head.
          CALL gamma_corr_init(bs_env)
          ! Fit Z_lP using the integration domains and RI basis described in compute_Z_lP below.
          CALL compute_Z_lP(qs_env, bs_env, bs_env%ri_rs%grid_points, &
@@ -302,6 +304,8 @@ CONTAINS
       !     it cannot ride along as one more column of the sphere-local solves: it is solved
       !     GLOBALLY, matrix-free, after the loop (gamma_corr_fit_charge_channel).
       ! =========================================================================
+      ! d_l0 (length n_grid, replicated) is built here, before the sphere loop, from S(Gamma)
+      ! and mat_phi_mu_l; it is consumed by the global fit after the loop and freed there.
       do_gamma_corr = bs_env%ri_rs%gamma_corr%enabled
       IF (do_gamma_corr) CALL gamma_corr_charge_rhs(bs_env, d_l0)
 
@@ -528,6 +532,7 @@ CONTAINS
       ! The charge channel of the Gamma-point correction: one global, matrix-free solve of the
       ! same normal equations (see 1b). Independent of the sphere loop, so a Z_lP restart gets
       ! it too.
+      ! Result: bs_env%ri_rs%gamma_corr%Z_l0(1:n_grid), replicated on every rank.
       IF (do_gamma_corr) THEN
          CALL gamma_corr_fit_charge_channel(bs_env, mat_phi_mu_l, d_l0)
          DEALLOCATE (d_l0)

@@ -443,6 +443,10 @@ CONTAINS
          ! summation range. Only that constant goes; the head and wings DeltaW adds back are its
          ! analytic replacement. NOT the projector Pi V Pi, which would also delete the finite
          ! G /= 0 interactions of the charged direction.
+         ! With the correction enabled the W mesh is Gamma only, so every ikp here must be q = 0;
+         ! the assertion guards against subtracting the q = 0 constant at a finite q. The charge
+         ! vector it needs was built in step 4b (gamma_corr_build_coulomb_maps), which runs
+         ! before get_W_MIC reaches this routine.
          IF (bs_env%ri_rs%gamma_corr%enabled) THEN
             CPASSERT(ALL(ABS(bs_env%kpoints_chi_eps_W%xkp(:, ikp)) < 1.0E-12_dp))
             CALL gamma_corr_subtract_divergent_head(bs_env, cfm_V_kp(ikp))

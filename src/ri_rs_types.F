@@ -45,10 +45,16 @@ MODULE ri_rs_types
    ! and the head/wing of eps in that extended basis is integrated over the whole small
    ! Brillouin zone of the supercell instead of being sampled. See GAMMA_W_CORRECTION_PLAN.md.
    TYPE gamma_corr_type
+      ! enabled: set by gamma_corr_init (PERIODIC XY and KPOINTS_W 1 1 1); every call site of
+      !          the correction tests it.
+      ! ready:   set once step 4b of the Gamma-only driver has built the maps, S_head, T_wing
+      !          and the tables; the Sigma^c loop asserts it before adding DeltaW.
+      ! reported_projection: the V(0) - D_box c c^T summary has been printed (print once).
       LOGICAL                                          :: enabled = .FALSE.
       LOGICAL                                          :: ready = .FALSE.
       LOGICAL                                          :: reported_projection = .FALSE.
       ! Layer area A = |a_1 x a_2| and the two in-plane reciprocal vectors b_1, b_2.
+      ! Units: bohr^2 and 1/bohr; b_recip(1:3, i) is b_i in Cartesian components.
       REAL(KIND=dp)                                    :: area = 0.0_dp
       REAL(KIND=dp), DIMENSION(3, 2)                   :: b_recip = 0.0_dp
       ! Zero-wavevector Fourier value of the RI metric kernel: pi/omega^2 (erfc) or
@@ -69,16 +75,21 @@ MODULE ri_rs_types
       ! Both n_RI x n_RI, replicated on every rank.
       REAL(KIND=dp), ALLOCATABLE                       :: F_density(:, :), F_extern(:, :)
       ! Z_l0: grid coefficients of the normalized constant function, all grid rows.
+      ! Length n_grid, replicated; the solution of gwp42 Eq. 61 (gamma_corr_fit_charge_channel).
       REAL(KIND=dp), ALLOCATABLE                       :: Z_l0(:)
       ! S_head(a,b,i_w): the Cartesian dielectric head with the body Schur complement already
       ! removed, S = Y - E^T B^-1 E. The whole directional dependence of the correction enters
       ! through the scalar a(q_hat,i_w) = q_hat^T S q_hat.
+      ! Shape (3, 3, n_freq), replicated.
       REAL(KIND=dp), ALLOCATABLE                       :: S_head(:, :, :)
       ! T_wing(l,a,i_w): the grid wing map, T^w_la = sum_Q Z_lQ [F_extern B^-1 E]_Qa. The wing
       ! of W is linear in the direction, t_l(q_hat) = sum_a q_hat_a T^w_la.
+      ! Shape (n_grid, 3, n_freq), replicated over all grid rows.
       REAL(KIND=dp), ALLOCATABLE                       :: T_wing(:, :, :)
       ! Cell-integral tables over the in-plane minimum-image displacement, see
-      ! gamma_corr_tabulate: K_head(i_R, i_t) and K_wing(i_R, a, i_t) on a regular R mesh.
+      ! gamma_corr_tabulate: K_head(i_R, i_w) and K_wing(i_R, a, i_w) on a regular R mesh.
+      ! The last index is the imaginary FREQUENCY; the time-domain copies are in K_time.
+      ! n_tab: table points along a_1 and a_2; i_R = 1 + i_u + n_tab(1) i_v over [-1/2, 1/2]^2.
       INTEGER, DIMENSION(2)                            :: n_tab = 0
       REAL(KIND=dp), ALLOCATABLE                       :: K_head(:, :), K_wing(:, :, :)
       ! Hot-loop layout of the same information, built once at the end of gamma_corr_tabulate.
@@ -212,6 +223,9 @@ CONTAINS
       ri_rs%V_grid_built = .FALSE.
       ri_rs%W0_grid_built = .FALSE.
 
+      ! Gamma-point correction: release the cached V(0), free every allocatable of
+      ! gamma_corr_type and clear ready, so a later GW run rebuilds the correction. enabled is
+      ! left alone; gamma_corr_init resets it.
       IF (ri_rs%gamma_corr%V_zero_cached) THEN
          CALL cp_fm_release(ri_rs%gamma_corr%fm_V_zero)
          ri_rs%gamma_corr%V_zero_cached = .FALSE.

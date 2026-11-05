@@ -97,9 +97,16 @@ CONTAINS
        !!     It has to run here, after χ_PQ(Γ,iτ) exists and before get_W_MIC consumes it.
        !!========================================================================
       IF (bs_env%ri_rs%gamma_corr%enabled) THEN
+         ! c, Pi, V_b^(+-1/2) and the maps F_density = M^-1 Pi V_b^(1/2),
+         ! F_extern = M^-1 V(0) Pi V_b^(-1/2) (gwp42 Eqs. 63-67), all replicated n_RI x n_RI.
          CALL gamma_corr_build_coulomb_maps(qs_env, bs_env)
+         ! Head S_ab(i omega) and grid wing map T^w_la(i omega) from the velocity-gauge dipoles
+         ! and chi_PQ(Gamma, i tau) (gwp42 Eqs. 48-49, 71-74).
          CALL gamma_corr_response(bs_env, qs_env, bs_env%mat_chi_Gamma_tau)
+         ! Cell integrals K_h(R), K_w(R) on a 128 x 128 mesh of in-plane minimum-image
+         ! displacements, transformed to i tau and packed for the per-pair kernel.
          CALL gamma_corr_tabulate(bs_env, n_tab=128)
+         ! From here on the Sigma^c panel loop may add DeltaW (it asserts this flag).
          bs_env%ri_rs%gamma_corr%ready = .TRUE.
       END IF
 

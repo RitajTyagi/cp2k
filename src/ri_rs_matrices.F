@@ -1177,6 +1177,10 @@ CONTAINS
          CALL dbcsr_release(LA_panC)
 
          ! W_ll' <- W_ll' + DeltaW_ll', the Gamma-point head-and-wing correction.
+         ! At this point B_pan = Z_pan W^MIC(i tau) Z_near^T, i.e. W on the grid pairs of this
+         ! panel (rows: the panel's grid blocks blk0.., columns: all or the near grid blocks).
+         ! DeltaW_ll'(i tau) is added element-wise BEFORE the Hadamard product with the G panels,
+         ! so Sigma^c = -G o (W + DeltaW) picks up the correction with the same sign and scale.
          ! A disassociated pointer actual argument is still PRESENT, so the association has to be
          ! tested separately; the caller leaves it NULL whenever the correction is off.
          IF (PRESENT(bs_env_gamma_corr)) THEN
@@ -1224,6 +1228,9 @@ CONTAINS
 !>        Only blocks already present are touched. The panel's sparsity was fixed by the A panels
 !>        and retain_sparsity, and the Hadamard product that follows would discard anything outside
 !>        it, so creating new blocks here would be wasted work.
+!>
+!>        Each rank processes only the B_pan blocks it holds locally; gamma_corr_add_block reads
+!>        replicated tables only, so no communication is needed.
 !> \param B_pan the W panel, modified in place
 !> \param bs_env band-structure environment carrying the correction tables
 !> \param i_t imaginary-time index
@@ -1250,6 +1257,8 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       ! Global element offset of every grid block, from the blocking of phi_mu_l.
+      ! grid_offset(b) = Σ_{b' < b} size(b') is the global grid index of the first point of
+      ! block b MINUS ONE, which is the offset convention gamma_corr_add_block expects.
       CALL dbcsr_get_info(bs_env%ri_rs%mat_phi_mu_l, row_blk_size=r_blk_sizes)
       n_blk = SIZE(r_blk_sizes)
       ALLOCATE (grid_offset(n_blk + 1))
@@ -1262,19 +1271,23 @@ CONTAINS
       ! disjoint set of blocks; dynamic scheduling balances the uneven near-block counts), and
       ! every block is updated by exactly one thread, so the result is independent of the thread
       ! count. The grid blocks are only 32 points, so a parallel region per block would cost as
-      ! much as the arithmetic; the kernel itself is serial.
+      ! much as the arithmetic; the kernel itself is serial. (row, col) are PANEL block indices.
 !$OMP PARALLEL DEFAULT(NONE) PRIVATE(iter, row, col, block, row_blk, col_blk) &
 !$OMP          SHARED(B_pan, bs_env, i_t, blk0, col_map, use_cutoff, grid_offset, n_blk)
       CALL dbcsr_iterator_start(iter, B_pan, dynamic=.TRUE., dynamic_byrows=.FALSE.)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, row, col, block)
 
+         ! Panel row block -> global grid block: the panel starts at grid block blk0.
+         ! Panel column block -> global grid block: identity, or through col_map when the
+         ! columns were compressed to the near set by the cutoff.
          row_blk = blk0 + row - 1
          IF (use_cutoff) THEN
             col_blk = col_map(col)
          ELSE
             col_blk = col
          END IF
+         ! Both must be valid grid blocks of mat_phi_mu_l's row blocking.
          CPASSERT(row_blk >= 1 .AND. row_blk <= n_blk)
          CPASSERT(col_blk >= 1 .AND. col_blk <= n_blk)
 
