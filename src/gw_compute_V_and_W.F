@@ -344,6 +344,7 @@ CONTAINS
 
       INTEGER                                            :: handle, ikp, ikp_end, ikp_start, &
                                                             nkp_chi_eps_W_batch, re_im
+      LOGICAL                                            :: use_cached_V
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_fm_type)                                   :: fm_V_kp_work
@@ -394,17 +395,25 @@ CONTAINS
 
       END IF
 
-      CALL build_2c_coulomb_matrix_kp(mat_V_kp, &
-                                      bs_env%kpoints_chi_eps_W, &
-                                      basis_type="RI_AUX", &
-                                      cell=cell, &
-                                      particle_set=particle_set, &
-                                      qs_kind_set=qs_kind_set, &
-                                      atomic_kind_set=atomic_kind_set, &
-                                      size_lattice_sum=bs_env%size_lattice_sum_V, &
-                                      operator_type=operator_coulomb, &
-                                      ikp_start=ikp_start, &
-                                      ikp_end=ikp_end)
+      ! With the Gamma-point correction active the mesh is Gamma only and the identical V(q=0)
+      ! lattice sum was already done by gamma_corr_coulomb_at_zero: reuse it (same operator,
+      ! same image box, same basis) instead of summing the images a second time.
+      use_cached_V = bs_env%ri_rs%gamma_corr%enabled .AND. bs_env%ri_rs%gamma_corr%V_zero_cached
+      IF (use_cached_V) THEN
+         CPASSERT(ikp_start == 1 .AND. ikp_end == 1)
+      ELSE
+         CALL build_2c_coulomb_matrix_kp(mat_V_kp, &
+                                         bs_env%kpoints_chi_eps_W, &
+                                         basis_type="RI_AUX", &
+                                         cell=cell, &
+                                         particle_set=particle_set, &
+                                         qs_kind_set=qs_kind_set, &
+                                         atomic_kind_set=atomic_kind_set, &
+                                         size_lattice_sum=bs_env%size_lattice_sum_V, &
+                                         operator_type=operator_coulomb, &
+                                         ikp_start=ikp_start, &
+                                         ikp_end=ikp_end)
+      END IF
 
       bs_env%kpoints_chi_eps_W%nkp_grid = bs_env%nkp_grid_chi_eps_W_orig
 
@@ -412,14 +421,22 @@ CONTAINS
       CALL cp_fm_create(fm_V_kp_work, bs_env%fm_RI_RI%matrix_struct)
       DO ikp = ikp_start, ikp_end
          CALL cp_cfm_create(cfm_V_kp(ikp), bs_env%fm_RI_RI%matrix_struct)
-         CALL cp_fm_set_all(fm_V_kp_work, 0.0_dp)
-         CALL copy_dbcsr_to_fm(mat_V_kp(ikp, 1)%matrix, fm_V_kp_work)
-         cfm_V_kp(ikp)%local_data = CMPLX(fm_V_kp_work%local_data, 0.0_dp, KIND=dp)
+         IF (use_cached_V) THEN
+            ! Real by construction at q = 0 (gamma_corr_coulomb_at_zero checks the imaginary part).
+            cfm_V_kp(ikp)%local_data = CMPLX(bs_env%ri_rs%gamma_corr%fm_V_zero%local_data, &
+                                             0.0_dp, KIND=dp)
+            CALL cp_fm_release(bs_env%ri_rs%gamma_corr%fm_V_zero)
+            bs_env%ri_rs%gamma_corr%V_zero_cached = .FALSE.
+         ELSE
+            CALL cp_fm_set_all(fm_V_kp_work, 0.0_dp)
+            CALL copy_dbcsr_to_fm(mat_V_kp(ikp, 1)%matrix, fm_V_kp_work)
+            cfm_V_kp(ikp)%local_data = CMPLX(fm_V_kp_work%local_data, 0.0_dp, KIND=dp)
 
-         CALL cp_fm_set_all(fm_V_kp_work, 0.0_dp)
-         CALL copy_dbcsr_to_fm(mat_V_kp(ikp, 2)%matrix, fm_V_kp_work)
-         cfm_V_kp(ikp)%local_data = CMPLX(REAL(cfm_V_kp(ikp)%local_data, KIND=dp), &
-                                          fm_V_kp_work%local_data, KIND=dp)
+            CALL cp_fm_set_all(fm_V_kp_work, 0.0_dp)
+            CALL copy_dbcsr_to_fm(mat_V_kp(ikp, 2)%matrix, fm_V_kp_work)
+            cfm_V_kp(ikp)%local_data = CMPLX(REAL(cfm_V_kp(ikp)%local_data, KIND=dp), &
+                                             fm_V_kp_work%local_data, KIND=dp)
+         END IF
 
          ! V(0) <- V(0) - D_box c c^T when the Gamma-point correction is active: the mesh is then
          ! Gamma only, and at q = 0 the charged lattice sum carries a constant that grows with the

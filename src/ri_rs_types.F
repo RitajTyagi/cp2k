@@ -13,6 +13,8 @@ MODULE ri_rs_types
    USE cell_types,                      ONLY: cell_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_release,&
                                               dbcsr_type
+   USE cp_fm_types,                     ONLY: cp_fm_release,&
+                                              cp_fm_type
    USE kinds,                           ONLY: dp
    USE particle_types,                  ONLY: particle_type
    USE physcon,                         ONLY: angstrom
@@ -54,6 +56,11 @@ MODULE ri_rs_types
       ! that the fixed Tikhonov parameter regularizes it on the same footing as the Gaussian
       ! columns, and the fitted coefficients are divided by it again.
       REAL(KIND=dp)                                    :: metric_head = 0.0_dp
+      ! V_PQ(q=0), the real-space lattice sum of the bare Coulomb operator, distributed. Built
+      ! once by gamma_corr_coulomb_at_zero and handed to compute_V_k_by_lattice_sum, which
+      ! would otherwise repeat the same lattice sum for the regular W path; released there.
+      LOGICAL                                          :: V_zero_cached = .FALSE.
+      TYPE(cp_fm_type)                                 :: fm_V_zero = cp_fm_type()
       ! Normalized auxiliary charge vector c_P / ||c||, n_RI entries, replicated, and ||c||.
       REAL(KIND=dp), ALLOCATABLE                       :: charge(:)
       REAL(KIND=dp)                                    :: charge_norm = 0.0_dp
@@ -76,14 +83,17 @@ MODULE ri_rs_types
       REAL(KIND=dp), ALLOCATABLE                       :: K_head(:, :), K_wing(:, :, :)
       ! Hot-loop layout of the same information, built once at the end of gamma_corr_tabulate.
       ! Sigma^c touches every grid PAIR, so the kernel evaluation has to cost a handful of
-      ! contiguous loads rather than a frequency transform and a pbc() call per pair:
-      !   K_time(1:4, i_R, i_t)   head and the three wing components already transformed to
-      !                           imaginary time, interleaved so one bilinear corner is one
-      !                           cache line
-      !   U_grid(1:4, l, i_t)     (Z_l0, T_wing(l,1:3)) packed per grid point
-      !   frac(1:2, l)            in-plane fractional coordinates of every grid point, so the
-      !                           minimum image is a subtraction and an ANINT
-      REAL(KIND=dp), ALLOCATABLE                       :: K_time(:, :, :), U_grid(:, :, :), &
+      ! contiguous loads rather than a frequency transform and a pbc() call per pair. With
+      ! n_c = 1 + 3 n_t channels (head, then three wing components per frequency):
+      !   K_time(1, i_R, i_t)            head kernel transformed to imaginary time
+      !   K_time(1+3(w-1)+a, i_R, i_t)   wing kernel K_w,a(R, i omega_w) times the cosine weight
+      !                                  w_(t,w), so the channel sum in the kernel performs the
+      !                                  i omega -> i tau transform of the product K_w T^w
+      !   U_grid(1, l)                   Z_l0
+      !   U_grid(1+3(w-1)+a, l)          T_wing(l, a, w), the wing map at frequency w
+      !   frac(1:2, l)                   in-plane fractional coordinates of every grid point, so
+      !                                  the minimum image is a subtraction and a rounding
+      REAL(KIND=dp), ALLOCATABLE                       :: K_time(:, :, :), U_grid(:, :), &
                                                           frac(:, :)
    END TYPE gamma_corr_type
 
@@ -202,6 +212,10 @@ CONTAINS
       ri_rs%V_grid_built = .FALSE.
       ri_rs%W0_grid_built = .FALSE.
 
+      IF (ri_rs%gamma_corr%V_zero_cached) THEN
+         CALL cp_fm_release(ri_rs%gamma_corr%fm_V_zero)
+         ri_rs%gamma_corr%V_zero_cached = .FALSE.
+      END IF
       IF (ALLOCATED(ri_rs%gamma_corr%charge)) DEALLOCATE (ri_rs%gamma_corr%charge)
       IF (ALLOCATED(ri_rs%gamma_corr%F_density)) DEALLOCATE (ri_rs%gamma_corr%F_density)
       IF (ALLOCATED(ri_rs%gamma_corr%F_extern)) DEALLOCATE (ri_rs%gamma_corr%F_extern)

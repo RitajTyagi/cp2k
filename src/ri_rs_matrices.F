@@ -1258,7 +1258,14 @@ CONTAINS
          grid_offset(i_blk) = grid_offset(i_blk - 1) + r_blk_sizes(i_blk - 1)
       END DO
 
-      CALL dbcsr_iterator_start(iter, B_pan)
+      ! Threads share the iterator (DBCSR's default inside a parallel region hands each thread a
+      ! disjoint set of blocks; dynamic scheduling balances the uneven near-block counts), and
+      ! every block is updated by exactly one thread, so the result is independent of the thread
+      ! count. The grid blocks are only 32 points, so a parallel region per block would cost as
+      ! much as the arithmetic; the kernel itself is serial.
+!$OMP PARALLEL DEFAULT(NONE) PRIVATE(iter, row, col, block, row_blk, col_blk) &
+!$OMP          SHARED(B_pan, bs_env, i_t, blk0, col_map, use_cutoff, grid_offset, n_blk)
+      CALL dbcsr_iterator_start(iter, B_pan, dynamic=.TRUE., dynamic_byrows=.FALSE.)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, row, col, block)
 
@@ -1271,12 +1278,13 @@ CONTAINS
          CPASSERT(row_blk >= 1 .AND. row_blk <= n_blk)
          CPASSERT(col_blk >= 1 .AND. col_blk <= n_blk)
 
-         ! Whole-block kernel: the per-pair work is 2 subtractions, 2 ANINTs and 4 contiguous
-         ! 4-vectors, which matters because this runs n_grid^2 times per time point.
+         ! Whole-block kernel: the per-pair work is 2 subtractions, 2 roundings and 4 contiguous
+         ! channel vectors, which matters because this runs n_grid^2 times per time point.
          CALL gamma_corr_add_block(bs_env%ri_rs%gamma_corr, i_t, grid_offset(row_blk), &
                                    grid_offset(col_blk), block)
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
 
       DEALLOCATE (grid_offset)
 
