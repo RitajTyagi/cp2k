@@ -92,8 +92,8 @@ CONTAINS
        !!     B_PQ = δ_PQ + F_densityᵀ χ_PQ(Γ) F_density   -- the regular body, reused as is
        !!     S_αβ = Y - Eᵀ B⁻¹ E,  T^w_lα                 -- block inversion in closed form
        !!     K_h(R), K_w(R)                               -- Brillouin-zone cell integrals
-       !!     ΔW^c_ll' is then added to W_ll' inside the Σ^c panel loop, since its cell integrals
-       !!     depend on the minimum-image displacement r_l - r_l' and so cannot live in RI space.
+       !!     ΔW^c_PQ(iτ) is then added to W^MIC_PQ(iτ) in RI space inside get_W_MIC (atom-pair
+       !!     minimum-image cell integrals, gamma_corr_add_to_W), before M⁻¹ W M⁻¹.
        !!     It has to run here, after χ_PQ(Γ,iτ) exists and before get_W_MIC consumes it.
        !!========================================================================
       IF (bs_env%ri_rs%gamma_corr%enabled) THEN
@@ -103,10 +103,10 @@ CONTAINS
          ! Head S_ab(i omega) and grid wing map T^w_la(i omega) from the velocity-gauge dipoles
          ! and chi_PQ(Gamma, i tau) (gwp42 Eqs. 48-49, 71-74).
          CALL gamma_corr_response(bs_env, qs_env, bs_env%mat_chi_Gamma_tau)
-         ! Cell integrals K_h(R), K_w(R) on a 128 x 128 mesh of in-plane minimum-image
-         ! displacements, transformed to i tau and packed for the per-pair kernel.
+         ! Cell integrals K_h(R, i omega), K_w(R, i omega) on a 128 x 128 mesh of in-plane
+         ! minimum-image displacements; interpolated at atom-pair separations in get_W_MIC.
          CALL gamma_corr_tabulate(bs_env, n_tab=128)
-         ! From here on the Sigma^c panel loop may add DeltaW (it asserts this flag).
+         ! From here on get_W_MIC may add DeltaW to W^MIC (gamma_corr_add_to_W asserts this).
          bs_env%ri_rs%gamma_corr%ready = .TRUE.
       END IF
 

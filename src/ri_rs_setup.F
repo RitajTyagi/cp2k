@@ -32,9 +32,7 @@ MODULE ri_rs_setup
    USE cp_output_handling,              ONLY: cp_p_file,&
                                               cp_print_key_should_output
    USE gw_auto_ri_types,                ONLY: auto_ri_type
-   USE gw_gamma_correction,             ONLY: gamma_corr_charge_rhs,&
-                                              gamma_corr_fit_charge_channel,&
-                                              gamma_corr_init
+   USE gw_gamma_correction,             ONLY: gamma_corr_init
    USE gw_utils_compute_integrals,      ONLY: build_3c_integral_block_ctx,&
                                               gw_3c_ctx_create,&
                                               gw_3c_ctx_release,&
@@ -241,10 +239,10 @@ CONTAINS
          my_atoms_A, my_atoms_B, n_local_grid_atom, row_offset, small_list
       INTEGER, DIMENSION(:), POINTER                     :: col_dist_ri, r_blk_sizes, ri_blk_sizes, &
                                                             row_dist_grid
-      LOGICAL                                            :: do_gamma_corr, do_scatter, use_dist
+      LOGICAL                                            :: do_scatter, use_dist
       LOGICAL, ALLOCATABLE                               :: ao_nonzero(:, :)
       REAL(KIND=dp)                                      :: cutoff_ri, item_start_time, r_c, t1
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: cutoff_ri_per_atom, d_l0
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: cutoff_ri_per_atom
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: d_lp_local, phi_local
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_blacs_env_type), POINTER                   :: blacs_env_sub
@@ -292,22 +290,6 @@ CONTAINS
 
       CALL dbcsr_distribution_new(dist_Z, template=dist_phi, &
                                   row_dist=row_dist_grid, col_dist=col_dist_ri)
-
-      ! =========================================================================
-      ! 1b. CHARGE CHANNEL FOR THE GAMMA-POINT CORRECTION OF W
-      !     The correction needs the grid representation of the normalized constant function
-      !     1/sqrt(A), fitted through the same metric D_ll' as every Z_lP (gwp42 Eq. 61):
-      !
-      !       sum_l' D_ll' Z_l'0 = d_l0,   d_l0 = (metric_head/sqrt(A)) phi_l^T S phi_l.
-      !
-      !     Unlike every Z_lP column its right-hand side does not decay inside any sphere, so
-      !     it cannot ride along as one more column of the sphere-local solves: it is solved
-      !     GLOBALLY, matrix-free, after the loop (gamma_corr_fit_charge_channel).
-      ! =========================================================================
-      ! d_l0 (length n_grid, replicated) is built here, before the sphere loop, from S(Gamma)
-      ! and mat_phi_mu_l; it is consumed by the global fit after the loop and freed there.
-      do_gamma_corr = bs_env%ri_rs%gamma_corr%enabled
-      IF (do_gamma_corr) CALL gamma_corr_charge_rhs(bs_env, d_l0)
 
       IF (bs_env%ri_rs%Z_lP_exists) THEN
          CALL dbcsr_binary_read(filepath=TRIM(bs_env%prefix)//"Z_lP.matrix", &
@@ -527,15 +509,6 @@ CONTAINS
             CALL dbcsr_binary_write(matrix=mat_Z_lP, filepath=TRIM(bs_env%prefix)//"Z_lP.matrix")
          END IF
 
-      END IF
-
-      ! The charge channel of the Gamma-point correction: one global, matrix-free solve of the
-      ! same normal equations (see 1b). Independent of the sphere loop, so a Z_lP restart gets
-      ! it too.
-      ! Result: bs_env%ri_rs%gamma_corr%Z_l0(1:n_grid), replicated on every rank.
-      IF (do_gamma_corr) THEN
-         CALL gamma_corr_fit_charge_channel(bs_env, mat_phi_mu_l, d_l0)
-         DEALLOCATE (d_l0)
       END IF
 
       DEALLOCATE (row_offset, ri_blk_sizes, col_dist_ri)

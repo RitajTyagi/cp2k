@@ -47,7 +47,7 @@ MODULE ri_rs_types
    TYPE gamma_corr_type
       ! enabled: set by gamma_corr_init (PERIODIC XY and KPOINTS_W 1 1 1); every call site of
       !          the correction tests it.
-      ! ready:   set once step 4b of the Gamma-only driver has built the maps, S_head, T_wing
+      ! ready:   set once step 4b of the Gamma-only driver has built the maps, T_RI
       !          and the tables; the Sigma^c loop asserts it before adding DeltaW.
       ! reported_projection: the V(0) - D_box c c^T summary has been printed (print once).
       LOGICAL                                          :: enabled = .FALSE.
@@ -74,38 +74,24 @@ MODULE ri_rs_types
       ! F_extern  = M^-1(0) V(0) Pi V_b^(-1/2)  maps it to the external potential
       ! Both n_RI x n_RI, replicated on every rank.
       REAL(KIND=dp), ALLOCATABLE                       :: F_density(:, :), F_extern(:, :)
-      ! Z_l0: grid coefficients of the normalized constant function, all grid rows.
-      ! Length n_grid, replicated; the solution of gwp42 Eq. 61 (gamma_corr_fit_charge_channel).
-      REAL(KIND=dp), ALLOCATABLE                       :: Z_l0(:)
+      ! G_extern = V(0) Pi V_b^(-1/2): F_extern without its leading M^-1, i.e. the same map in
+      ! the RI projection representation that W^MIC_PQ uses before M^-1 W M^-1. Replicated.
+      REAL(KIND=dp), ALLOCATABLE                       :: G_extern(:, :)
+      ! T_RI(P,a,i_w): the wing vector in the RI projection representation,
+      ! T_Pa = sum_Q G_extern(P,Q) [B^-1 E]_Qa. Shape (n_RI, 3, n_freq), replicated.
+      REAL(KIND=dp), ALLOCATABLE                       :: T_RI(:, :, :)
       ! S_head(a,b,i_w): the Cartesian dielectric head with the body Schur complement already
       ! removed, S = Y - E^T B^-1 E. The whole directional dependence of the correction enters
       ! through the scalar a(q_hat,i_w) = q_hat^T S q_hat.
       ! Shape (3, 3, n_freq), replicated.
       REAL(KIND=dp), ALLOCATABLE                       :: S_head(:, :, :)
-      ! T_wing(l,a,i_w): the grid wing map, T^w_la = sum_Q Z_lQ [F_extern B^-1 E]_Qa. The wing
-      ! of W is linear in the direction, t_l(q_hat) = sum_a q_hat_a T^w_la.
-      ! Shape (n_grid, 3, n_freq), replicated over all grid rows.
-      REAL(KIND=dp), ALLOCATABLE                       :: T_wing(:, :, :)
       ! Cell-integral tables over the in-plane minimum-image displacement, see
       ! gamma_corr_tabulate: K_head(i_R, i_w) and K_wing(i_R, a, i_w) on a regular R mesh.
-      ! The last index is the imaginary FREQUENCY; the time-domain copies are in K_time.
+      ! The last index is the imaginary FREQUENCY; gamma_corr_add_to_W interpolates them at the
+      ! atom-pair separations and transforms the result to imaginary time.
       ! n_tab: table points along a_1 and a_2; i_R = 1 + i_u + n_tab(1) i_v over [-1/2, 1/2]^2.
       INTEGER, DIMENSION(2)                            :: n_tab = 0
       REAL(KIND=dp), ALLOCATABLE                       :: K_head(:, :), K_wing(:, :, :)
-      ! Hot-loop layout of the same information, built once at the end of gamma_corr_tabulate.
-      ! Sigma^c touches every grid PAIR, so the kernel evaluation has to cost a handful of
-      ! contiguous loads rather than a frequency transform and a pbc() call per pair. With
-      ! n_c = 1 + 3 n_t channels (head, then three wing components per frequency):
-      !   K_time(1, i_R, i_t)            head kernel transformed to imaginary time
-      !   K_time(1+3(w-1)+a, i_R, i_t)   wing kernel K_w,a(R, i omega_w) times the cosine weight
-      !                                  w_(t,w), so the channel sum in the kernel performs the
-      !                                  i omega -> i tau transform of the product K_w T^w
-      !   U_grid(1, l)                   Z_l0
-      !   U_grid(1+3(w-1)+a, l)          T_wing(l, a, w), the wing map at frequency w
-      !   frac(1:2, l)                   in-plane fractional coordinates of every grid point, so
-      !                                  the minimum image is a subtraction and a rounding
-      REAL(KIND=dp), ALLOCATABLE                       :: K_time(:, :, :), U_grid(:, :), &
-                                                          frac(:, :)
    END TYPE gamma_corr_type
 
    ! User input for the in-memory RI-RS grid optimization.
@@ -233,14 +219,11 @@ CONTAINS
       IF (ALLOCATED(ri_rs%gamma_corr%charge)) DEALLOCATE (ri_rs%gamma_corr%charge)
       IF (ALLOCATED(ri_rs%gamma_corr%F_density)) DEALLOCATE (ri_rs%gamma_corr%F_density)
       IF (ALLOCATED(ri_rs%gamma_corr%F_extern)) DEALLOCATE (ri_rs%gamma_corr%F_extern)
-      IF (ALLOCATED(ri_rs%gamma_corr%Z_l0)) DEALLOCATE (ri_rs%gamma_corr%Z_l0)
+      IF (ALLOCATED(ri_rs%gamma_corr%G_extern)) DEALLOCATE (ri_rs%gamma_corr%G_extern)
+      IF (ALLOCATED(ri_rs%gamma_corr%T_RI)) DEALLOCATE (ri_rs%gamma_corr%T_RI)
       IF (ALLOCATED(ri_rs%gamma_corr%S_head)) DEALLOCATE (ri_rs%gamma_corr%S_head)
-      IF (ALLOCATED(ri_rs%gamma_corr%T_wing)) DEALLOCATE (ri_rs%gamma_corr%T_wing)
       IF (ALLOCATED(ri_rs%gamma_corr%K_head)) DEALLOCATE (ri_rs%gamma_corr%K_head)
       IF (ALLOCATED(ri_rs%gamma_corr%K_wing)) DEALLOCATE (ri_rs%gamma_corr%K_wing)
-      IF (ALLOCATED(ri_rs%gamma_corr%K_time)) DEALLOCATE (ri_rs%gamma_corr%K_time)
-      IF (ALLOCATED(ri_rs%gamma_corr%U_grid)) DEALLOCATE (ri_rs%gamma_corr%U_grid)
-      IF (ALLOCATED(ri_rs%gamma_corr%frac)) DEALLOCATE (ri_rs%gamma_corr%frac)
       ri_rs%gamma_corr%ready = .FALSE.
 
       CALL timestop(handle)
