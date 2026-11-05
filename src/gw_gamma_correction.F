@@ -97,17 +97,17 @@ MODULE gw_gamma_correction
                                               copy_fm_to_dbcsr,&
                                               dbcsr_allocate_matrix_set,&
                                               dbcsr_deallocate_matrix_set
+   USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale,&
+                                              cp_fm_uplo_to_full
+   USE cp_fm_cholesky,                  ONLY: cp_fm_cholesky_decompose,&
+                                              cp_fm_cholesky_invert
+   USE cp_fm_diag,                      ONLY: cp_fm_syevd
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
                                               cp_fm_struct_release,&
                                               cp_fm_struct_type
-   USE cp_fm_types,                     ONLY: cp_fm_create,&
-                                              cp_fm_get_info,&
-                                              cp_fm_get_submatrix,&
-                                              cp_fm_maxabsval,&
-                                              cp_fm_release,&
-                                              cp_fm_set_all,&
-                                              cp_fm_set_submatrix,&
-                                              cp_fm_type
+   USE cp_fm_types,                     ONLY: &
+        cp_fm_create, cp_fm_get_info, cp_fm_get_submatrix, cp_fm_maxabsval, cp_fm_release, &
+        cp_fm_set_all, cp_fm_set_submatrix, cp_fm_to_fm, cp_fm_type
    USE input_constants,                 ONLY: do_potential_short,&
                                               do_potential_truncated
    USE kinds,                           ONLY: dp
@@ -118,6 +118,7 @@ MODULE gw_gamma_correction
    USE machine,                         ONLY: m_walltime
    USE mathconstants,                   ONLY: pi,&
                                               twopi
+   USE message_passing,                 ONLY: mp_mem_avail_per_rank_GB
    USE orbital_pointers,                ONLY: indco,&
                                               ncoset
    USE parallel_gemm_api,               ONLY: parallel_gemm
@@ -523,6 +524,13 @@ CONTAINS
       CALL gamma_corr_slab_geometry(bs_env, gc%area, gc%b_recip)
       gc%metric_head = gamma_corr_metric_head(bs_env)
 
+      ! Distributed path: the same construction on cp_fm matrices, nothing replicated.
+      IF (gc%distributed) THEN
+         CALL gamma_corr_build_coulomb_maps_fm(qs_env, bs_env)
+         CALL timestop(handle)
+         RETURN
+      END IF
+
       ! ---------------------------------------------------------------------------------------
       ! 1. V_PQ(0): the finite real-space 2D lattice sum of the bare Coulomb operator (Eq. 63).
       ! ---------------------------------------------------------------------------------------
@@ -584,12 +592,13 @@ CONTAINS
       CALL cp_fm_get_submatrix(bs_env%fm_Minv_Gamma, M_inv)
 
       ! ---------------------------------------------------------------------------------------
-      ! 5. F_density = M^-1 Π V_b^(1/2)  and  F_extern = M^-1 V(0) Π V_b^(-1/2)  (Eqs. 66, 67).
-      !    Both are stored replicated as F(Q, P): row Q is the RI fit index that Z_ℓQ contracts,
-      !    column P is the index of the symmetrized neutral body (P in Eqs. 66-67). Both have
-      !    rank n_RI − (number of discarded modes of V_b).
+      ! 5. F_density = M^-1 Π V_b^(1/2)  and  G_extern = V(0) Π V_b^(-1/2)  (Eqs. 66, 67; the
+      !    latter is M F_extern, the external-potential map in the RI projection representation
+      !    that W^MIC_PQ is in, which is where gamma_corr_add_to_W uses it).
+      !    Stored replicated as F(Q, P): row Q is the RI index, column P the index of the
+      !    symmetrized neutral body. Both have rank n_RI − (number of discarded modes of V_b).
       ! ---------------------------------------------------------------------------------------
-      ALLOCATE (gc%F_density(n_RI, n_RI), gc%F_extern(n_RI, n_RI))
+      ALLOCATE (gc%F_density(n_RI, n_RI))
 
       ! work = Π V_b^(1/2). The retained eigenvectors of V_b are orthogonal to ĉ, so this
       ! equals V_b^(1/2) up to rounding; Π is kept to follow Eq. 66 literally.
@@ -606,14 +615,9 @@ CONTAINS
       ! FULL V(0) on the left (not V_b): the charged test-function couplings are kept here.
       CALL dgemm('N', 'N', n_RI, n_RI, n_RI, 1.0_dp, V_zero, n_RI, work, n_RI, &
                  0.0_dp, V_b_sqrt, n_RI)
-      ! G_extern = V(0) Π V_b^(-1/2) is kept as well: it is F_extern in the RI projection
-      ! representation, the one W^MIC_PQ is in before the M^-1 W M^-1 contraction, which is where
-      ! gamma_corr_add_to_W adds the wing.
+      ! G_extern = V(0) Π V_b^(-1/2), i.e. F_extern without its leading M^-1.
       ALLOCATE (gc%G_extern(n_RI, n_RI))
       gc%G_extern(:, :) = V_b_sqrt
-      ! F_extern = M^-1 V(0) Π V_b^(-1/2)
-      CALL dgemm('N', 'N', n_RI, n_RI, n_RI, 1.0_dp, M_inv, n_RI, V_b_sqrt, n_RI, &
-                 0.0_dp, gc%F_extern, n_RI)
 
       ! Diagnostics: the null-mode count and the (λ_max, smallest kept λ) pair show whether
       ! eps_null_V_b cut inside a spectral gap (see gamma_corr_symmetric_power).
@@ -635,6 +639,128 @@ CONTAINS
    END SUBROUTINE gamma_corr_build_coulomb_maps
 
 ! **************************************************************************************************
+!> \brief gamma_corr_build_coulomb_maps on distributed cp_fm matrices (ScaLAPACK): the same
+!>        Π, V_b = Π V(0) Π, V_b^(±1/2), F_density = M⁻¹ Π V_b^(1/2) and G_extern = V(0) Π V_b^(-1/2),
+!>        without any replicated n_RI x n_RI array. The eigenvalue cut of V_b is the same relative
+!>        eps_null_V_b, applied to the spectrum of the distributed cp_fm_syevd.
+!> \param qs_env QS environment, for V(0) and the auxiliary charges
+!> \param bs_env band-structure environment; fills gc%fm_F_density, gc%fm_G_extern
+! **************************************************************************************************
+   SUBROUTINE gamma_corr_build_coulomb_maps_fm(qs_env, bs_env)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_build_coulomb_maps_fm'
+
+      INTEGER                                            :: col, handle, i, i_col, i_row, n_drop, &
+                                                            n_RI, ncol_local, nrow_local, row
+      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
+      REAL(KIND=dp)                                      :: cut, lambda_kept, lambda_max, norm_c
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalues, scaling
+      TYPE(cp_fm_type)                                   :: fm_inv_sqrt, fm_Pi, fm_sqrt, fm_Vb, &
+                                                            fm_vec, fm_work
+      TYPE(gamma_corr_type), POINTER                     :: gc
+
+      CALL timeset(routineN, handle)
+
+      gc => bs_env%ri_rs%gamma_corr
+      n_RI = bs_env%n_RI
+
+      ! 1. V_PQ(0), distributed in gc%fm_V_zero (Eq. 63); no replicated copy.
+      CALL gamma_corr_coulomb_at_zero(qs_env, bs_env)
+
+      ! 2. ĉ = c/|c| (Eq. 64), replicated (a vector).
+      ALLOCATE (gc%charge(n_RI))
+      CALL gamma_corr_auxiliary_charges(qs_env, gc%charge)
+      norm_c = SQRT(DOT_PRODUCT(gc%charge, gc%charge))
+      IF (norm_c <= 0.0_dp) &
+         CPABORT('Gamma-point correction: the RI_AUX basis carries no charge at all')
+      gc%charge(:) = gc%charge/norm_c
+      gc%charge_norm = norm_c
+
+      ! Π_PQ = δ_PQ − ĉ_P ĉ_Q, filled on the local block of a distributed matrix.
+      CALL cp_fm_create(fm_Pi, bs_env%fm_RI_RI%matrix_struct)
+      CALL cp_fm_get_info(fm_Pi, nrow_local=nrow_local, ncol_local=ncol_local, &
+                          row_indices=row_indices, col_indices=col_indices)
+      DO i_col = 1, ncol_local
+         col = col_indices(i_col)
+         DO i_row = 1, nrow_local
+            row = row_indices(i_row)
+            fm_Pi%local_data(i_row, i_col) = -gc%charge(row)*gc%charge(col)
+            IF (row == col) fm_Pi%local_data(i_row, i_col) = fm_Pi%local_data(i_row, i_col) + 1.0_dp
+         END DO
+      END DO
+
+      ! 3. V_b = Π V(0) Π (Eq. 65).
+      CALL cp_fm_create(fm_work, bs_env%fm_RI_RI%matrix_struct)
+      CALL cp_fm_create(fm_Vb, bs_env%fm_RI_RI%matrix_struct)
+      CALL parallel_gemm('N', 'N', n_RI, n_RI, n_RI, 1.0_dp, gc%fm_V_zero, fm_Pi, 0.0_dp, fm_work)
+      CALL parallel_gemm('N', 'N', n_RI, n_RI, n_RI, 1.0_dp, fm_Pi, fm_work, 0.0_dp, fm_Vb)
+
+      ! V_b = U diag(λ) Uᵀ, one distributed diagonalization for both powers; λ ≤ cut dropped.
+      CALL cp_fm_create(fm_vec, bs_env%fm_RI_RI%matrix_struct)
+      ALLOCATE (eigenvalues(n_RI), scaling(n_RI))
+      CALL cp_fm_syevd(fm_Vb, fm_vec, eigenvalues)
+      cut = MAX(eps_null_V_b*MAXVAL(eigenvalues), 0.0_dp)
+      n_drop = COUNT(eigenvalues <= cut)
+      lambda_max = eigenvalues(n_RI)
+      lambda_kept = 0.0_dp
+      DO i = 1, n_RI
+         IF (eigenvalues(i) > cut) THEN
+            lambda_kept = eigenvalues(i)
+            EXIT
+         END IF
+      END DO
+      ! V_b^(1/2) = (U diag(λ^(1/2))) Uᵀ
+      CALL cp_fm_create(fm_sqrt, bs_env%fm_RI_RI%matrix_struct)
+      scaling(:) = 0.0_dp
+      WHERE (eigenvalues > cut) scaling = SQRT(eigenvalues)
+      CALL cp_fm_to_fm(fm_vec, fm_work)
+      CALL cp_fm_column_scale(fm_work, scaling)
+      CALL parallel_gemm('N', 'T', n_RI, n_RI, n_RI, 1.0_dp, fm_work, fm_vec, 0.0_dp, fm_sqrt)
+      ! V_b^(-1/2) = (U diag(λ^(-1/2))) Uᵀ on the same retained subspace
+      CALL cp_fm_create(fm_inv_sqrt, bs_env%fm_RI_RI%matrix_struct)
+      scaling(:) = 0.0_dp
+      WHERE (eigenvalues > cut) scaling = 1.0_dp/SQRT(eigenvalues)
+      CALL cp_fm_to_fm(fm_vec, fm_work)
+      CALL cp_fm_column_scale(fm_work, scaling)
+      CALL parallel_gemm('N', 'T', n_RI, n_RI, n_RI, 1.0_dp, fm_work, fm_vec, 0.0_dp, fm_inv_sqrt)
+      CALL cp_fm_release(fm_vec)
+      CALL cp_fm_release(fm_Vb)
+      DEALLOCATE (eigenvalues, scaling)
+
+      ! 5. F_density = M⁻¹ Π V_b^(1/2) (Eq. 66), with the same M⁻¹(0) as the regular W path.
+      CALL cp_fm_create(gc%fm_F_density, bs_env%fm_RI_RI%matrix_struct)
+      CALL parallel_gemm('N', 'N', n_RI, n_RI, n_RI, 1.0_dp, fm_Pi, fm_sqrt, 0.0_dp, fm_work)
+      CALL parallel_gemm('N', 'N', n_RI, n_RI, n_RI, 1.0_dp, bs_env%fm_Minv_Gamma, fm_work, &
+                         0.0_dp, gc%fm_F_density)
+      ! G_extern = V(0) Π V_b^(-1/2) (Eq. 67 without the leading M⁻¹): the FULL V(0) on the left.
+      CALL cp_fm_create(gc%fm_G_extern, bs_env%fm_RI_RI%matrix_struct)
+      CALL parallel_gemm('N', 'N', n_RI, n_RI, n_RI, 1.0_dp, fm_Pi, fm_inv_sqrt, 0.0_dp, fm_work)
+      CALL parallel_gemm('N', 'N', n_RI, n_RI, n_RI, 1.0_dp, gc%fm_V_zero, fm_work, &
+                         0.0_dp, gc%fm_G_extern)
+
+      CALL cp_fm_release(fm_Pi)
+      CALL cp_fm_release(fm_work)
+      CALL cp_fm_release(fm_sqrt)
+      CALL cp_fm_release(fm_inv_sqrt)
+
+      IF (bs_env%unit_nr > 0) THEN
+         WRITE (bs_env%unit_nr, '(T2,A)') &
+            'Gamma-point correction of W (2D): charge channel separated from the RI basis'
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Layer area A (bohr^2)', gc%area
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'RI metric head int dr v(r)', gc%metric_head
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Norm of the charge vector |c|', norm_c
+         WRITE (bs_env%unit_nr, '(T4,A,T72,I10)') 'Null modes of the neutral body V_b', n_drop
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Largest eigenvalue of V_b', lambda_max
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Smallest retained eigenvalue of V_b', lambda_kept
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE gamma_corr_build_coulomb_maps_fm
+
+! **************************************************************************************************
 !> \brief V_PQ(q=0) from the real-space 2c Coulomb lattice sum (gwp42 Eq. 63).
 !>
 !>        Built with a one-point k-mesh at the origin but with nkp_grid kept at the mesh for
@@ -649,12 +775,13 @@ CONTAINS
    SUBROUTINE gamma_corr_coulomb_at_zero(qs_env, bs_env, V_zero)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)        :: V_zero
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT), &
+         OPTIONAL                                        :: V_zero
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_coulomb_at_zero'
 
       INTEGER                                            :: handle, re_im
-      REAL(KIND=dp)                                      :: max_imag
+      REAL(KIND=dp)                                      :: max_imag, max_real
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_fm_type)                                   :: fm_work
@@ -707,7 +834,9 @@ CONTAINS
       CALL cp_fm_set_all(gc%fm_V_zero, 0.0_dp)
       CALL copy_dbcsr_to_fm(mat_V(1, 1)%matrix, gc%fm_V_zero)
       gc%V_zero_cached = .TRUE.
-      CALL cp_fm_get_submatrix(gc%fm_V_zero, V_zero)
+      ! The replicated copy only for the replicated dense-algebra path.
+      IF (PRESENT(V_zero)) CALL cp_fm_get_submatrix(gc%fm_V_zero, V_zero)
+      CALL cp_fm_maxabsval(gc%fm_V_zero, max_real)
 
       ! The imaginary part, checked on the distributed matrix (no second replication).
       CALL cp_fm_create(fm_work, bs_env%fm_RI_RI%matrix_struct)
@@ -721,7 +850,7 @@ CONTAINS
 
       ! Im V(0) = 0 for a centrosymmetric image box; a nonzero value means the box is lopsided
       ! and the whole real-arithmetic argument of this module would be void.
-      IF (max_imag > 1.0E-10_dp*MAX(1.0_dp, MAXVAL(ABS(V_zero)))) THEN
+      IF (max_imag > 1.0E-10_dp*MAX(1.0_dp, max_real)) THEN
          CPABORT('Gamma-point correction: V(q=0) came back complex')
       END IF
 
@@ -741,6 +870,7 @@ CONTAINS
    SUBROUTINE gamma_corr_init(bs_env)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
 
+      REAL(KIND=dp)                                      :: mem_avail_GB, mem_need_GB
       TYPE(gamma_corr_type), POINTER                     :: gc
 
       gc => bs_env%ri_rs%gamma_corr
@@ -749,11 +879,28 @@ CONTAINS
       gc%enabled = gamma_corr_requested(bs_env)
       IF (.NOT. gc%enabled) RETURN
 
-      ! A, b_1, b_2 and ∫dr v_ω(r): needed by gamma_corr_charge_rhs inside compute_Z_lP.
+      ! A, b_1, b_2 and ∫dr v_ω(r).
       CALL gamma_corr_slab_geometry(bs_env, gc%area, gc%b_recip)
       gc%metric_head = gamma_corr_metric_head(bs_env)
 
-      ! Tell the user why the correction is switched on.
+      ! Replicated or distributed dense algebra (same philosophy as the Z_lP solves: an estimate
+      ! of the single-rank peak against the measured memory per rank decides, unless the input
+      ! forces a path). The replicated path holds up to ten n_RI x n_RI arrays at once
+      ! (gamma_corr_build_coulomb_maps: V, Π, V_b, its two powers, M⁻¹, two maps, and the
+      ! eigenvector/scaled buffers of the diagonalization); a quarter of the available memory
+      ! is the allowance, because the regular W path keeps its own distributed matrices alive.
+      mem_need_GB = 10.0_dp*8.0_dp*REAL(bs_env%n_RI, dp)**2*1.0E-9_dp
+      CALL mp_mem_avail_per_rank_GB(bs_env%para_env, mem_avail_GB)
+      SELECT CASE (bs_env%ri_rs%gamma_corr_dense)
+      CASE (1)
+         gc%distributed = .FALSE.
+      CASE (2)
+         gc%distributed = .TRUE.
+      CASE DEFAULT
+         gc%distributed = mem_need_GB > 0.25_dp*mem_avail_GB
+      END SELECT
+
+      ! Tell the user why the correction is switched on and how its dense algebra runs.
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A)') &
             'The mesh for chi, eps, W contains q = 0, where the real-space Coulomb lattice sum'
@@ -761,6 +908,17 @@ CONTAINS
             'over charged auxiliary functions diverges. Separating the charge channel and'
          WRITE (bs_env%unit_nr, '(T2,A)') &
             'adding the Gamma-point head-and-wing correction of W.'
+         WRITE (bs_env%unit_nr, '(T4,A,T62,F10.2,A)') &
+            'Replicated dense n_RI x n_RI algebra would need', mem_need_GB, ' GB'
+         WRITE (bs_env%unit_nr, '(T4,A,T62,F10.2,A)') &
+            'Available memory per MPI process', mem_avail_GB, ' GB'
+         IF (gc%distributed) THEN
+            WRITE (bs_env%unit_nr, '(T4,A)') &
+               'Dense algebra of the correction: distributed (ScaLAPACK, cp_fm)'
+         ELSE
+            WRITE (bs_env%unit_nr, '(T4,A)') &
+               'Dense algebra of the correction: replicated (LAPACK on every rank)'
+         END IF
          WRITE (bs_env%unit_nr, '(A)') ' '
       END IF
 
@@ -1149,8 +1307,22 @@ CONTAINS
       ! (first E, later reused for F_extern B⁻¹ E).
       ALLOCATE (gc%T_RI(n_RI, 3, n_t))
       gc%T_RI(:, :, :) = 0.0_dp
-      ALLOCATE (chi_PQ(n_RI, n_RI), work_RI(n_RI, n_RI), E_freq(n_RI, 3))
       CALL cp_fm_create(fm_chi, bs_env%fm_RI_RI%matrix_struct)
+
+      IF (gc%distributed) THEN
+         ! Same per-frequency algebra on distributed matrices; replicated arrays are only the
+         ! n_RI x 3 right-hand sides.
+         CALL gamma_corr_response_fm(bs_env, fm_chi, mat_chi_Gamma_tau, X_freq)
+         CALL cp_fm_release(fm_chi)
+         DEALLOCATE (X_freq)
+         CALL cp_fm_release(gc%fm_F_density)
+         CALL cp_fm_release(gc%fm_G_extern)
+         CALL gamma_corr_print_head(bs_env)
+         CALL timestop(handle)
+         RETURN
+      END IF
+
+      ALLOCATE (chi_PQ(n_RI, n_RI), work_RI(n_RI, n_RI), E_freq(n_RI, 3))
 
       DO i_w = 1, n_t
          ! χ_PQ(Γ,iω) from the stored χ(Γ,iτ): the same transform the regular W path uses.
@@ -1195,26 +1367,146 @@ CONTAINS
 
       CALL cp_fm_release(fm_chi)
       DEALLOCATE (chi_PQ, work_RI, E_freq, X_freq)
-      ! The three n_RI x n_RI maps are consumed; free them before W and Σ are built.
-      DEALLOCATE (gc%F_density, gc%F_extern, gc%G_extern)
+      ! The two n_RI x n_RI maps are consumed; free them before W and Σ are built.
+      DEALLOCATE (gc%F_density, gc%G_extern)
 
-      ! Print the diagonal of S(iω) per frequency: S_xx = S_yy is expected for a hexagonal
-      ! layer, and S_zz is the out-of-plane response, which does not enter a(q̂) = q̂ᵀ S q̂
-      ! for the in-plane directions q̂ of the cell integrals.
+      CALL gamma_corr_print_head(bs_env)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE gamma_corr_response
+
+! **************************************************************************************************
+!> \brief Print the diagonal of S(iω) per frequency: S_xx = S_yy is expected for a hexagonal
+!>        layer, and S_zz is the out-of-plane response, which does not enter a(q̂) = q̂ᵀ S q̂
+!>        for the in-plane directions q̂ of the cell integrals.
+!> \param bs_env ...
+! **************************************************************************************************
+   SUBROUTINE gamma_corr_print_head(bs_env)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      INTEGER                                            :: i_w
+      TYPE(gamma_corr_type), POINTER                     :: gc
+
+      gc => bs_env%ri_rs%gamma_corr
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A)') &
             'Gamma-point correction: Cartesian dielectric head S_ab(i*omega) [a.u.]'
          WRITE (bs_env%unit_nr, '(T4,A)') 'i_w           S_xx           S_yy           S_zz'
-         DO i_w = 1, n_t
+         DO i_w = 1, bs_env%num_time_freq_points
             WRITE (bs_env%unit_nr, '(T4,I3,3ES15.6)') i_w, gc%S_head(1, 1, i_w), &
                gc%S_head(2, 2, i_w), gc%S_head(3, 3, i_w)
          END DO
          WRITE (bs_env%unit_nr, '(A)') ' '
       END IF
 
+   END SUBROUTINE gamma_corr_print_head
+
+! **************************************************************************************************
+!> \brief The per-frequency body, wings, Schur complement and wing vector of gamma_corr_response
+!>        on distributed matrices: B = 1 + F_dᵀ χ F_d (cp_fm), E = F_dᵀ Zᵀ X (n_RI x 3),
+!>        x = B⁻¹ E by a distributed Cholesky inverse, S −= Eᵀ x, T = G_extern x.
+!> \param bs_env ...
+!> \param fm_chi work matrix in the RI x RI layout
+!> \param mat_chi_Gamma_tau χ_PQ(Γ, iτ)
+!> \param X_freq X_ℓα(iω), replicated over grid rows
+! **************************************************************************************************
+   SUBROUTINE gamma_corr_response_fm(bs_env, fm_chi, mat_chi_Gamma_tau, X_freq)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(cp_fm_type), INTENT(INOUT)                    :: fm_chi
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: mat_chi_Gamma_tau
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: X_freq
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_response_fm'
+
+      INTEGER                                            :: col, handle, i_col, i_dir, i_row, i_w, &
+                                                            info, j_dir, n_RI, ncol_local, &
+                                                            nrow_local, row
+      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: E_rep, x_rep
+      TYPE(cp_fm_struct_type), POINTER                   :: struct_RI_3
+      TYPE(cp_fm_type)                                   :: fm_B, fm_E, fm_T, fm_work, fm_x, fm_ZX
+      TYPE(gamma_corr_type), POINTER                     :: gc
+
+      CALL timeset(routineN, handle)
+
+      gc => bs_env%ri_rs%gamma_corr
+      n_RI = bs_env%n_RI
+
+      NULLIFY (struct_RI_3)
+      CALL cp_fm_struct_create(struct_RI_3, context=bs_env%fm_RI_RI%matrix_struct%context, &
+                               para_env=bs_env%fm_RI_RI%matrix_struct%para_env, &
+                               nrow_global=n_RI, ncol_global=3)
+      CALL cp_fm_create(fm_ZX, struct_RI_3)
+      CALL cp_fm_create(fm_E, struct_RI_3)
+      CALL cp_fm_create(fm_x, struct_RI_3)
+      CALL cp_fm_create(fm_T, struct_RI_3)
+      CALL cp_fm_create(fm_B, bs_env%fm_RI_RI%matrix_struct)
+      CALL cp_fm_create(fm_work, bs_env%fm_RI_RI%matrix_struct)
+      CALL cp_fm_get_info(fm_B, nrow_local=nrow_local, ncol_local=ncol_local, &
+                          row_indices=row_indices, col_indices=col_indices)
+      ALLOCATE (E_rep(n_RI, 3), x_rep(n_RI, 3))
+
+      DO i_w = 1, bs_env%num_time_freq_points
+         ! χ_PQ(Γ, iω) distributed in fm_chi.
+         CALL gamma_corr_chi_PQ_at_freq(bs_env, fm_chi, i_w, mat_chi_Gamma_tau)
+
+         ! B = 1 + F_dᵀ χ F_d (Eq. 72): work = χ F_d, B = F_dᵀ work, then the identity on the
+         ! local diagonal elements.
+         CALL parallel_gemm('N', 'N', n_RI, n_RI, n_RI, 1.0_dp, fm_chi, gc%fm_F_density, &
+                            0.0_dp, fm_work)
+         CALL parallel_gemm('T', 'N', n_RI, n_RI, n_RI, 1.0_dp, gc%fm_F_density, fm_work, &
+                            0.0_dp, fm_B)
+         DO i_col = 1, ncol_local
+            col = col_indices(i_col)
+            DO i_row = 1, nrow_local
+               row = row_indices(i_row)
+               IF (row == col) fm_B%local_data(i_row, i_col) = fm_B%local_data(i_row, i_col) + 1.0_dp
+            END DO
+         END DO
+
+         ! E = F_dᵀ (Zᵀ X) (Eq. 71): the n_RI x 3 right-hand side Zᵀ X is replicated and
+         ! scattered into fm_ZX, the product is distributed.
+         CALL gamma_corr_project_grid_to_RI(bs_env, X_freq(:, :, i_w), E_rep)
+         CALL cp_fm_set_submatrix(fm_ZX, E_rep)
+         CALL parallel_gemm('T', 'N', n_RI, 3, n_RI, 1.0_dp, gc%fm_F_density, fm_ZX, 0.0_dp, fm_E)
+         CALL cp_fm_get_submatrix(fm_E, E_rep)
+
+         ! x = B⁻¹ E: B is symmetric positive definite (1 + a Gram matrix), so a distributed
+         ! Cholesky factorization, inversion and expansion of the upper triangle give B⁻¹.
+         CALL cp_fm_cholesky_decompose(fm_B, info_out=info)
+         IF (info /= 0) CPABORT('Gamma-point correction: Cholesky of the dielectric body failed')
+         CALL cp_fm_cholesky_invert(fm_B, info_out=info)
+         IF (info /= 0) CPABORT('Gamma-point correction: inversion of the dielectric body failed')
+         CALL cp_fm_uplo_to_full(fm_B, fm_work)
+         CALL parallel_gemm('N', 'N', n_RI, 3, n_RI, 1.0_dp, fm_B, fm_E, 0.0_dp, fm_x)
+         CALL cp_fm_get_submatrix(fm_x, x_rep)
+
+         ! S_αβ = Y_αβ − Σ_P E_Pα x_Pβ (Eq. ST).
+         DO j_dir = 1, 3
+            DO i_dir = 1, 3
+               gc%S_head(i_dir, j_dir, i_w) = gc%S_head(i_dir, j_dir, i_w) - &
+                                              DOT_PRODUCT(E_rep(:, i_dir), x_rep(:, j_dir))
+            END DO
+         END DO
+
+         ! T_Pα(iω) = [G_extern x]_Pα, the wing vector in the RI projection representation.
+         CALL parallel_gemm('N', 'N', n_RI, 3, n_RI, 1.0_dp, gc%fm_G_extern, fm_x, 0.0_dp, fm_T)
+         CALL cp_fm_get_submatrix(fm_T, gc%T_RI(:, :, i_w))
+      END DO
+
+      DEALLOCATE (E_rep, x_rep)
+      CALL cp_fm_release(fm_ZX)
+      CALL cp_fm_release(fm_E)
+      CALL cp_fm_release(fm_x)
+      CALL cp_fm_release(fm_T)
+      CALL cp_fm_release(fm_B)
+      CALL cp_fm_release(fm_work)
+      CALL cp_fm_struct_release(struct_RI_3)
+
       CALL timestop(handle)
 
-   END SUBROUTINE gamma_corr_response
+   END SUBROUTINE gamma_corr_response_fm
 
 ! **************************************************************************************************
 !> \brief Accumulate one spin channel's contribution to the head tensor Y_αβ(iτ) and the wing grid
@@ -1390,7 +1682,8 @@ CONTAINS
       TYPE(cp_fm_type), INTENT(INOUT)                    :: fm_chi
       INTEGER, INTENT(IN)                                :: j_w
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: mat_chi_Gamma_tau
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)        :: chi_PQ
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT), &
+         OPTIONAL                                        :: chi_PQ
 
       INTEGER                                            :: i_t
       REAL(KIND=dp)                                      :: weight
@@ -1403,7 +1696,7 @@ CONTAINS
       END DO
       ! DBCSR -> block-cyclic full matrix -> dense copy on every rank.
       CALL copy_dbcsr_to_fm(bs_env%mat_RI_RI%matrix, fm_chi)
-      CALL cp_fm_get_submatrix(fm_chi, chi_PQ)
+      IF (PRESENT(chi_PQ)) CALL cp_fm_get_submatrix(fm_chi, chi_PQ)
 
    END SUBROUTINE gamma_corr_chi_PQ_at_freq
 

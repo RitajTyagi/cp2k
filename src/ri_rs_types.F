@@ -52,6 +52,10 @@ MODULE ri_rs_types
       ! reported_projection: the V(0) - D_box c c^T summary has been printed (print once).
       LOGICAL                                          :: enabled = .FALSE.
       LOGICAL                                          :: ready = .FALSE.
+      ! distributed: the dense n_RI x n_RI algebra (maps, dielectric body) runs on cp_fm /
+      !          ScaLAPACK matrices instead of replicated LAPACK arrays (gamma_corr_init decides
+      !          from GAMMA_CORR_DENSE_ALGEBRA and the memory estimate).
+      LOGICAL                                          :: distributed = .FALSE.
       LOGICAL                                          :: reported_projection = .FALSE.
       ! Layer area A = |a_1 x a_2| and the two in-plane reciprocal vectors b_1, b_2.
       ! Units: bohr^2 and 1/bohr; b_recip(1:3, i) is b_i in Cartesian components.
@@ -71,12 +75,14 @@ MODULE ri_rs_types
       REAL(KIND=dp), ALLOCATABLE                       :: charge(:)
       REAL(KIND=dp)                                    :: charge_norm = 0.0_dp
       ! F_density = M^-1(0) Pi V_b^(1/2)   maps a fitted grid density to the response basis
-      ! F_extern  = M^-1(0) V(0) Pi V_b^(-1/2)  maps it to the external potential
-      ! Both n_RI x n_RI, replicated on every rank.
-      REAL(KIND=dp), ALLOCATABLE                       :: F_density(:, :), F_extern(:, :)
-      ! G_extern = V(0) Pi V_b^(-1/2): F_extern without its leading M^-1, i.e. the same map in
-      ! the RI projection representation that W^MIC_PQ uses before M^-1 W M^-1. Replicated.
-      REAL(KIND=dp), ALLOCATABLE                       :: G_extern(:, :)
+      ! G_extern  = V(0) Pi V_b^(-1/2)      maps the body response to the external potential, in
+      !             the RI projection representation that W^MIC_PQ is in before M^-1 W M^-1
+      !             (it is M times the F_extern of the equations)
+      ! Both n_RI x n_RI, replicated on every rank (replicated dense-algebra path).
+      REAL(KIND=dp), ALLOCATABLE                       :: F_density(:, :), G_extern(:, :)
+      ! The same two maps as distributed cp_fm matrices on the distributed path.
+      TYPE(cp_fm_type)                                 :: fm_F_density = cp_fm_type()
+      TYPE(cp_fm_type)                                 :: fm_G_extern = cp_fm_type()
       ! T_RI(P,a,i_w): the wing vector in the RI projection representation,
       ! T_Pa = sum_Q G_extern(P,Q) [B^-1 E]_Qa. Shape (n_RI, 3, n_freq), replicated.
       REAL(KIND=dp), ALLOCATABLE                       :: T_RI(:, :, :)
@@ -107,6 +113,8 @@ MODULE ri_rs_types
       ! Input parameters for RI-RS
       INTEGER                                          :: grid_select = 1
       REAL(KIND=dp)                                    :: tikhonov = 1.0E-08_dp
+      ! GAMMA_CORR_DENSE_ALGEBRA: 0 auto, 1 replicated LAPACK, 2 distributed ScaLAPACK.
+      INTEGER                                          :: gamma_corr_dense = 0
       REAL(KIND=dp)                                    :: cutoff_radius_ri_ao = -1.0_dp
       REAL(KIND=dp)                                    :: cutoff_radius_v_w = -1.0_dp
       TYPE(ri_rs_grid_opt_type)                        :: grid_opt = ri_rs_grid_opt_type()
@@ -218,8 +226,9 @@ CONTAINS
       END IF
       IF (ALLOCATED(ri_rs%gamma_corr%charge)) DEALLOCATE (ri_rs%gamma_corr%charge)
       IF (ALLOCATED(ri_rs%gamma_corr%F_density)) DEALLOCATE (ri_rs%gamma_corr%F_density)
-      IF (ALLOCATED(ri_rs%gamma_corr%F_extern)) DEALLOCATE (ri_rs%gamma_corr%F_extern)
       IF (ALLOCATED(ri_rs%gamma_corr%G_extern)) DEALLOCATE (ri_rs%gamma_corr%G_extern)
+      CALL cp_fm_release(ri_rs%gamma_corr%fm_F_density)
+      CALL cp_fm_release(ri_rs%gamma_corr%fm_G_extern)
       IF (ALLOCATED(ri_rs%gamma_corr%T_RI)) DEALLOCATE (ri_rs%gamma_corr%T_RI)
       IF (ALLOCATED(ri_rs%gamma_corr%S_head)) DEALLOCATE (ri_rs%gamma_corr%S_head)
       IF (ALLOCATED(ri_rs%gamma_corr%K_head)) DEALLOCATE (ri_rs%gamma_corr%K_head)

@@ -2829,6 +2829,23 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="GAMMA_CORR_DENSE_ALGEBRA", &
+                          description="How the dense N_RI x N_RI matrices of the Gamma-point "// &
+                          "head-and-wing correction of W (Coulomb maps, dielectric body) are "// &
+                          "held and factorized. AUTO keeps them replicated on every rank "// &
+                          "(LAPACK, no communication) while they fit into a quarter of the "// &
+                          "available memory per rank and switches to ScaLAPACK-distributed "// &
+                          "matrices otherwise; the other values force one of the two paths.", &
+                          usage="GAMMA_CORR_DENSE_ALGEBRA AUTO", &
+                          enum_c_vals=s2a("AUTO", "REPLICATED", "DISTRIBUTED"), &
+                          enum_i_vals=[0, 1, 2], &
+                          enum_desc=s2a("Decide from the memory estimate", &
+                                        "Replicated LAPACK on every rank", &
+                                        "Distributed ScaLAPACK (cp_fm)"), &
+                          default_i_val=0)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="GRID_SELECT", &
                           description="Selection of the atom-centered grid type used "// &
                           "in RI-RS optimized by Duchemin and Blase. "// &

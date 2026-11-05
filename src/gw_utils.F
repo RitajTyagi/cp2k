@@ -323,6 +323,7 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       CALL section_vals_val_get(ri_rs_sec, "TIKHONOV", r_val=ri_rs%tikhonov)
+      CALL section_vals_val_get(ri_rs_sec, "GAMMA_CORR_DENSE_ALGEBRA", i_val=ri_rs%gamma_corr_dense)
       CALL section_vals_val_get(ri_rs_sec, "GRID_SELECT", i_val=ri_rs%grid_select)
       CALL section_vals_val_get(ri_rs_sec, "CUTOFF_RADIUS_RL_AO", r_val=ri_rs%cutoff_radius_ri_ao)
       CALL section_vals_val_get(ri_rs_sec, "CUTOFF_RADIUS_RL_W", r_val=ri_rs%cutoff_radius_v_w)
