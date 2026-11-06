@@ -2693,6 +2693,9 @@ CONTAINS
                                      K_h0)/gc%measure
       END DO
 
+      ! Largest radius of the BZ cell: the small-q expansion of the pair phase holds only for
+      ! |q·d_nm| < 1, which gamma_corr_add_to_sigma enforces by clipping |d_nm| at 1/q_max.
+      gc%q_max = MAXVAL(gc%dir_radius)
       ! The direction data are consumed; T_RI, A_wing, B_hd and head_pot_time are kept for
       ! gamma_corr_add_to_sigma.
       DEALLOCATE (gc%S_head, dir_weight, gc%head_coef, gc%wing_coef, gc%dir_hat, gc%dir_radius, &
@@ -2782,7 +2785,12 @@ CONTAINS
 !>        with d_nm = ⟨n|r|m⟩ = ⟨n|[H,r]|m⟩/(ε_n − ε_m) the velocity-gauge dipole between ANY two
 !>        orbitals (zero between folded states of different crystal momentum, where the
 !>        commutator vanishes, and set to zero inside degenerate manifolds, where it is not
-!>        defined). Collecting ⟨nm|ΔW(q)|mn⟩ and averaging over the cell gives the real kernel
+!>        defined). The expansion holds only while |q·d_nm| < 1 for every q of the cell, i.e.
+!>        |d_nm| < 1/q_max: nearly degenerate pairs with a finite coupling (a numerically split
+!>        manifold, an avoided crossing) have d = p/Δε far beyond that, where the true matrix
+!>        element |⟨m|e^{iq·r}|n⟩| saturates at one. Such dipoles are clipped to 1/q_max along
+!>        their direction, which bounds their O(q²) contribution instead of letting it diverge
+!>        (the 128-atom diamond cell had single states shifted by 2 eV before the clip). Collecting ⟨nm|ΔW(q)|mn⟩ and averaging over the cell gives the real kernel
 !>
 !>          Ŵ_nm(iω) = w(iω) δ_nm + Σ_αβ B_αβ(iω) d_nm,α d_nm,β
 !>                   + 2√Ω Σ_αβ A_αβ(iω) V_nm,α(iω) d_nm,β ,
@@ -2826,8 +2834,9 @@ CONTAINS
       INTEGER :: col, handle, i_col, i_dir, i_row, i_sector, i_spin, i_t, i_w, j_dir, m, n, &
          n_ao, n_grid, n_mo, n_occ, n_RI, n_t, ncol_local, nrow_local, row
       INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
-      REAL(KIND=dp)                                      :: delta, sqrt_V, start_time, tau, &
-                                                            tau_E, w_hat
+      INTEGER                                            :: n_clipped
+      REAL(KIND=dp)                                      :: d_max, d_norm, delta, sqrt_V, &
+                                                            start_time, tau, tau_E, w_hat
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: g_branch, scaling, y_loc
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: u_RI, w_grid
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: dSigma
@@ -2898,7 +2907,8 @@ CONTAINS
          n_occ = bs_env%n_occ(i_spin)
 
          ! ---------------------------------------------------------------------------------
-         ! 1. Dipoles d_nm = ⟨n|[H,r^α]|m⟩/(ε_n − ε_m) for all pairs of retained MOs.
+         ! 1. Dipoles d_nm = ⟨n|[H,r^α]|m⟩/(ε_n − ε_m) for all pairs of retained MOs, clipped
+         !    to |d_nm| ≤ 1/q_max (see above).
          ! ---------------------------------------------------------------------------------
          DO i_dir = 1, 3
             CALL cp_fm_set_all(fm_ao_ao, 0.0_dp)
@@ -2920,6 +2930,22 @@ CONTAINS
                END DO
             END DO
          END DO
+         ! Clip |d_nm| at d_max = 1/q_max along the direction of d_nm.
+         d_max = 1.0_dp/gc%q_max
+         n_clipped = 0
+         DO i_col = 1, ncol_local
+            DO i_row = 1, nrow_local
+               d_norm = SQRT(fm_d(1)%local_data(i_row, i_col)**2 + fm_d(2)%local_data(i_row, i_col)**2 + &
+                             fm_d(3)%local_data(i_row, i_col)**2)
+               IF (d_norm > d_max) THEN
+                  n_clipped = n_clipped + 1
+                  DO i_dir = 1, 3
+                     fm_d(i_dir)%local_data(i_row, i_col) = fm_d(i_dir)%local_data(i_row, i_col)*d_max/d_norm
+                  END DO
+               END IF
+            END DO
+         END DO
+         CALL bs_env%para_env%sum(n_clipped)
 
          dSigma(:, :, :) = 0.0_dp
          DO i_w = 1, n_t
@@ -3018,6 +3044,8 @@ CONTAINS
          IF (bs_env%unit_nr > 0) THEN
             WRITE (bs_env%unit_nr, '(T2,A,I2,A)') 'Gamma-point correction of Sigma^c (3D), spin', i_spin, &
                ': orbital-diagonal shifts at tau_1 (eV), VBM / CBM'
+            WRITE (bs_env%unit_nr, '(T4,A,T62,F10.3,I10)') 'Dipole clip 1/q_max (bohr), pairs clipped', &
+               d_max, n_clipped
             WRITE (bs_env%unit_nr, '(T4,A,T62,2F10.3)') 'negative branch (occupied), VBM, CBM', &
                dSigma(n_occ, 1, 2)*evolt, dSigma(MIN(n_occ + 1, n_mo), 1, 2)*evolt
             WRITE (bs_env%unit_nr, '(T4,A,T62,2F10.3)') 'positive branch (empty),    VBM, CBM', &

@@ -127,6 +127,8 @@ MODULE ri_rs_types
       ! B_hd(a,b,i_w): the cell-averaged wing and head-dipole tensors (1/Omega), see
       ! gamma_corr_add_to_sigma (3D only).
       REAL(KIND=dp), ALLOCATABLE                       :: head_pot_freq(:)
+      ! q_max: largest radius of the BZ cell (1/bohr); dipoles are clipped at 1/q_max.
+      REAL(KIND=dp)                                    :: q_max = 0.0_dp
       REAL(KIND=dp), ALLOCATABLE                       :: A_wing(:, :, :), B_hd(:, :, :)
    END TYPE gamma_corr_type
 
