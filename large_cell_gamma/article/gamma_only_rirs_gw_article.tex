@@ -1148,8 +1148,9 @@ manifold are preserved to 3~meV. With the full kernel the $\Gamma$-only gap conv
 $9.041\to9.782\to9.934$~eV (54, 128, 250 atoms), the PR as $9.200\to9.444\to9.511$~eV
 ($4^3$, $6^3$, $8^3$ meshes); both exchange series converge to the same 15.3~eV, so the
 remaining $0.4$~eV at convergence is in $\Sigma^c$. The standard tensor $k$-point $GW$ of CP2K
-on the primitive cell is the independent arbiter: \textit{(values to be inserted when the
-$6\times6\times6$ and $8\times8\times8$ runs finish)}.
+on the primitive cell is the independent arbiter; its $6\times6\times6$ and $8\times8\times8$
+runs (\texttt{KPOINTS\_W} set explicitly, 12071 cells of three-centre integrals) were still
+running when this version was written and will be added in a follow-up.
 
 \begin{table}[h]
 \caption{Diamond, SZV basis: indirect $G_0W_0$ gap over the folded $\Gamma$ manifold (eV) for
@@ -1363,8 +1364,8 @@ to 15--75~meV for h-BN (two bases), SiC and h-GaN, with a 0.25~eV deviation for 
 nearly-free-electron conduction state of h-AlN. For diamond the exchange of the $\Gamma$-only
 RI-RS code is identical to the exact-RI tensor result, the dipole terms of the bulk kernel
 scale as $1/\Omega$ as derived, and the gap converges with the cell to within 0.1~eV by 250
-atoms; the 0.4~eV that separates the two codes at convergence lies in $\Sigma^c$ and is being
-arbitrated by the standard tensor $k$-point $GW$. The correction costs about 1~\% of a
+atoms; the 0.4~eV that separates the two codes at convergence lies in $\Sigma^c$; the standard
+tensor $k$-point $GW$ reference that arbitrates it is pending. The correction costs about 1~\% of a
 128-atom run.
 
 \begin{acknowledgments}
