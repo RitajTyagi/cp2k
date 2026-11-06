@@ -6,7 +6,8 @@
 !--------------------------------------------------------------------------------------------------!
 
 ! **************************************************************************************************
-!> \brief Γ-point head-and-wing correction of W for the Γ-only large-cell RI-RS GW code (2D slabs).
+!> \brief Γ-point head-and-wing correction of W for the Γ-only large-cell RI-RS GW code (2D slabs
+!>        and 3D bulk cells).
 !>
 !>        **Why this exists.** The large-cell code reconstructs χ(k), ε(k) and W(k) from Γ on a
 !>        k-mesh of the supercell's own small Brillouin zone, and takes V(k) from a finite
@@ -47,18 +48,33 @@
 !>        Sec. VI; equation numbers below refer to that manuscript. The derivation of the Γ-only
 !>        specialization is in GAMMA_W_CORRECTION_PLAN.md.
 !>
-!>        **Scope.** 2D slabs (PERIODIC XY) with the Γ-only RI-RS implementation. χ, ε and W stay
-!>        at one real k-point, so none of this needs complex arithmetic, and the minimum-image
-!>        clipping of χ (cp_cfm_power) has nothing to repair: χ(Γ) is a Gram matrix of
-!>        occupied-virtual products and exactly positive semidefinite.
+!>        **Scope.** 2D slabs (PERIODIC XY) and 3D bulk cells (PERIODIC XYZ) with the Γ-only
+!>        RI-RS implementation. χ, ε and W stay at one real k-point, so none of this needs
+!>        complex arithmetic, and the minimum-image clipping of χ (cp_cfm_power) has nothing to
+!>        repair: χ(Γ) is a Gram matrix of occupied-virtual products and exactly positive
+!>        semidefinite.
+!>
+!>        **2D versus 3D.** The slab head is v(q) = 2π/q with the layer area A as the measure;
+!>        the bulk head is v(q) = 4π/q² with the cell volume Ω. In 3D the finite real-space
+!>        image sum of V(0) cannot be used, not even projected: the sum of 1/r between neutral
+!>        (dipolar) functions is conditionally convergent with a shape-dependent surface term.
+!>        V(0) is therefore the Ewald sum with the G = 0 Fourier coefficient of 1/r omitted
+!>        (gamma_corr_coulomb_at_zero, add_ewald_reciprocal_fm): finite in the charge channel,
+!>        so no projector Π is needed, F_density = M⁻¹ V^(1/2) and G_extern = V^(1/2) (the
+!>        same as the 3D branch of cp2k#6447), and the charge mode ϕ_0 = 1/√Ω carries only the
+!>        omitted G = 0 term. The screening denominator 1 + 4π a(q̂) of the bulk head is
+!>        independent of |q|, so the radial integrals of the cell integrals are analytic and the
+!>        kernels are evaluated per atom pair (gamma_corr_add_to_W_bulk) instead of being
+!>        tabulated. Everything else -- dipoles, response, block inverse, iω → iτ -- is shared.
 !>
 !>        **Call sequence.** Read the routines in the order in which the GW driver calls them:
 !>
-!>          ri_rs_setup              gamma_corr_init                 decide, set A, b_1, b_2
-!>          gw_ri_rs_large_cell_     gamma_corr_build_coulomb_maps   c, Π, V_b, F_density, F_extern
+!>          ri_rs_setup              gamma_corr_init                 decide, set A or Ω, b_i
+!>          gw_ri_rs_large_cell_     gamma_corr_build_coulomb_maps   c, Π, V_b, F_density, G_extern
 !>          gamma, step 4b           gamma_corr_response             S_αβ(iω), T_Pα(iω)
-!>                                   gamma_corr_tabulate             K_h(R), K_w(R) tables
-!>          gw_compute_V_and_W       gamma_corr_subtract_divergent_head   V(0) − D_box c cᵀ
+!>                                   gamma_corr_tabulate             2D: K_h(R), K_w(R) tables
+!>                                                                   3D: per-direction coefficients
+!>          gw_compute_V_and_W       gamma_corr_subtract_divergent_head   2D only: V(0) − D_box c cᵀ
 !>          (compute_W_MIC)          gamma_corr_add_to_W             W^MIC_PQ(iτ) += ΔW_PQ(iτ)
 !>
 !>        **Where the correction is applied.** In the RI basis, on the auxiliary charges c_P and
@@ -82,7 +98,8 @@ MODULE gw_gamma_correction
    USE basis_set_types,                 ONLY: gto_basis_set_type
    USE cell_types,                      ONLY: cell_type
    USE commutator_rpnl,                 ONLY: build_com_mom_nl
-   USE constants_operator,              ONLY: operator_coulomb
+   USE constants_operator,              ONLY: operator_coulomb,&
+                                              operator_verfc
    USE cp_cfm_types,                    ONLY: cp_cfm_get_info,&
                                               cp_cfm_type
    USE cp_control_types,                ONLY: dft_control_type
@@ -111,13 +128,17 @@ MODULE gw_gamma_correction
    USE input_constants,                 ONLY: do_potential_short,&
                                               do_potential_truncated
    USE kinds,                           ONLY: dp
-   USE kpoint_coulomb_2c,               ONLY: build_2c_coulomb_matrix_kp
+   USE kpoint_coulomb_2c,               ONLY: add_ewald_reciprocal_fm,&
+                                              build_2c_coulomb_matrix_kp
    USE kpoint_types,                    ONLY: kpoint_create,&
                                               kpoint_release,&
                                               kpoint_type
    USE machine,                         ONLY: m_walltime
-   USE mathconstants,                   ONLY: pi,&
+   USE mathconstants,                   ONLY: fourpi,&
+                                              pi,&
                                               twopi
+   USE mathlib,                         ONLY: det_3x3,&
+                                              inv_3x3
    USE message_passing,                 ONLY: mp_mem_avail_per_rank_GB
    USE orbital_pointers,                ONLY: indco,&
                                               ncoset
@@ -159,7 +180,7 @@ MODULE gw_gamma_correction
              gamma_corr_subtract_divergent_head, &
              gamma_corr_auxiliary_charges, &
              gamma_corr_metric_head, &
-             gamma_corr_slab_geometry, &
+             gamma_corr_cell_geometry, &
              gamma_corr_symmetric_power
 
 CONTAINS
@@ -169,8 +190,8 @@ CONTAINS
 !>
 !>        It is meaningful only when the mesh for χ, ε, W actually samples q = 0, which with the
 !>        ±k pairing of setup_kpoints_chi_eps_W happens for the 1x1x1 mesh alone (see below), and
-!>        only for a 2D slab, which is the only geometry whose head/wing construction is
-!>        implemented here.
+!>        only for a 2D slab (PERIODIC XY) or a 3D bulk cell (PERIODIC XYZ), the two geometries
+!>        whose head/wing construction is implemented here.
 !> \param bs_env band-structure environment; reads periodic and nkp_grid_chi_eps_W_orig only
 !> \return TRUE if the correction should be built
 ! **************************************************************************************************
@@ -183,8 +204,9 @@ CONTAINS
       ! Default: no correction. Each test below returns early with this value.
       do_corr = .FALSE.
 
-      ! Only PERIODIC XY: the 3D construction needs the Ewald ΔV and the 1/q² head instead.
-      IF (.NOT. ALL(bs_env%periodic == [1, 1, 0])) RETURN
+      ! PERIODIC XY (slab, head 2π/q) or PERIODIC XYZ (bulk, head 4π/q²). Wires and slabs with
+      ! a vacuum direction other than z are not implemented.
+      IF (.NOT. (ALL(bs_env%periodic == [1, 1, 0]) .OR. ALL(bs_env%periodic == [1, 1, 1]))) RETURN
 
       ! q = 0 is actually SAMPLED only for the 1x1x1 mesh. setup_kpoints_chi_eps_W keeps
       ! nkp_orig = n1*n2*n3/2 points of an n1 x n2 x n3 mesh, one per +-k pair, and for an odd
@@ -194,28 +216,47 @@ CONTAINS
          IF (bs_env%nkp_grid_chi_eps_W_orig(i_dim) /= 1) RETURN
       END DO
 
-      ! PERIODIC XY and the 1x1x1 mesh: the regular path samples q = 0 only, so correct it.
+      ! The 1x1x1 mesh: the regular path samples q = 0 only, so correct it.
       do_corr = .TRUE.
 
    END FUNCTION gamma_corr_requested
 
 ! **************************************************************************************************
-!> \brief Layer area A = |a_1 × a_2| and the two in-plane reciprocal vectors b_1, b_2 with
-!>        b_i · a_j = 2π δ_ij, for an arbitrary (possibly non-orthogonal) XY cell.
+!> \brief Measure and reciprocal vectors of the periodic cell, for an arbitrary (possibly
+!>        non-orthogonal) cell matrix.
 !>
-!>        The vacuum height never enters: a slab's Fourier transform averages over a layer cell,
-!>        not over a 3D cell that mostly contains vacuum. This is the single substitution that
-!>        turns the 3D formulas into the 2D ones, 1/√Ω → 1/√A (gwp42 Eqs. 61, 62).
+!>        Slab: the layer area A = |a_1 × a_2| and the two in-plane reciprocal vectors b_1, b_2
+!>        with b_i · a_j = 2π δ_ij. The vacuum height never enters: a slab's Fourier transform
+!>        averages over a layer cell, not over a 3D cell that mostly contains vacuum. This is the
+!>        single substitution that turns the 3D formulas into the 2D ones, 1/√Ω → 1/√A (gwp42
+!>        Eqs. 61, 62).
+!>
+!>        Bulk: the cell volume Ω = |det h| and the three reciprocal vectors b_i = 2π (h⁻¹)ᵀ e_i.
 !> \param bs_env band-structure environment; only the cell matrix hmat is read
-!> \param area |a_1 × a_2| in bohr²
-!> \param b_recip the two in-plane reciprocal vectors, b_recip(1:3, 1:2), Cartesian, in 1/bohr
+!> \param slab .TRUE. for PERIODIC XY, .FALSE. for PERIODIC XYZ
+!> \param measure A in bohr² (slab) or Ω in bohr³ (bulk)
+!> \param b_recip reciprocal vectors b_recip(1:3, i), Cartesian, 1/bohr; column 3 is zero for a slab
 ! **************************************************************************************************
-   SUBROUTINE gamma_corr_slab_geometry(bs_env, area, b_recip)
+   SUBROUTINE gamma_corr_cell_geometry(bs_env, slab, measure, b_recip)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(KIND=dp), INTENT(OUT)                         :: area
-      REAL(KIND=dp), DIMENSION(3, 2), INTENT(OUT)        :: b_recip
+      LOGICAL, INTENT(IN)                                :: slab
+      REAL(KIND=dp), INTENT(OUT)                         :: measure
+      REAL(KIND=dp), DIMENSION(3, 3), INTENT(OUT)        :: b_recip
 
+      REAL(KIND=dp)                                      :: area
       REAL(KIND=dp), DIMENSION(3)                        :: a_1, a_2, normal
+      REAL(KIND=dp), DIMENSION(3, 3)                     :: h_inv
+
+      b_recip(:, :) = 0.0_dp
+
+      IF (.NOT. slab) THEN
+         ! Ω = |det h|; b_i are the rows of 2π h⁻¹ (b_i · a_j = 2π δ_ij by construction).
+         measure = ABS(det_3x3(bs_env%hmat))
+         CPASSERT(measure > 0.0_dp)
+         h_inv = inv_3x3(bs_env%hmat)
+         b_recip(:, :) = twopi*TRANSPOSE(h_inv)
+         RETURN
+      END IF
 
       ! The columns of hmat are the Cartesian cell vectors (bohr); a_1, a_2 span the layer.
       a_1 = bs_env%hmat(:, 1)
@@ -237,8 +278,9 @@ CONTAINS
       b_recip(:, 2) = twopi*[normal(2)*a_1(3) - normal(3)*a_1(2), &
                              normal(3)*a_1(1) - normal(1)*a_1(3), &
                              normal(1)*a_1(2) - normal(2)*a_1(1)]/area
+      measure = area
 
-   END SUBROUTINE gamma_corr_slab_geometry
+   END SUBROUTINE gamma_corr_cell_geometry
 
 ! **************************************************************************************************
 !> \brief Zero-wavevector Fourier value of the RI metric kernel,
@@ -521,7 +563,7 @@ CONTAINS
       n_RI = bs_env%n_RI
 
       ! Same values gamma_corr_init already set; recomputed so this routine is self-contained.
-      CALL gamma_corr_slab_geometry(bs_env, gc%area, gc%b_recip)
+      CALL gamma_corr_cell_geometry(bs_env, gc%slab, gc%measure, gc%b_recip)
       gc%metric_head = gamma_corr_metric_head(bs_env)
 
       ! Distributed path: the same construction on cp_fm matrices, nothing replicated.
@@ -532,7 +574,8 @@ CONTAINS
       END IF
 
       ! ---------------------------------------------------------------------------------------
-      ! 1. V_PQ(0): the finite real-space 2D lattice sum of the bare Coulomb operator (Eq. 63).
+      ! 1. V_PQ(0): the finite real-space 2D lattice sum of the bare Coulomb operator (Eq. 63),
+      !    or in 3D the Ewald sum with the G = 0 term omitted (gamma_corr_coulomb_at_zero).
       ! ---------------------------------------------------------------------------------------
       ! V_zero(P, Q) = V_PQ(0) in Hartree, dense n_RI x n_RI, replicated on every rank.
       ALLOCATE (V_zero(n_RI, n_RI))
@@ -556,9 +599,14 @@ CONTAINS
 
       ! Dense projector, column by column: Π(:, i) = e_i − ĉ ĉ_i. Symmetric and idempotent,
       ! with ĉ as its only null vector.
+      ! 3D: Π = 1. The Ewald V(0) already lacks exactly the G = 0 term that the charge mode
+      ! ϕ_0 = 1/√Ω carries, and is finite and positive on the charge direction, so nothing has to
+      ! be projected out (the 3D branch of cp2k#6447 does the same: its external map equals its
+      ! density map).
       ALLOCATE (projector(n_RI, n_RI))
+      projector(:, :) = 0.0_dp
       DO i = 1, n_RI
-         projector(:, i) = -gc%charge(:)*gc%charge(i)
+         IF (gc%slab) projector(:, i) = -gc%charge(:)*gc%charge(i)
          projector(i, i) = projector(i, i) + 1.0_dp
       END DO
 
@@ -621,16 +669,8 @@ CONTAINS
 
       ! Diagnostics: the null-mode count and the (λ_max, smallest kept λ) pair show whether
       ! eps_null_V_b cut inside a spectral gap (see gamma_corr_symmetric_power).
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A)') &
-            'Gamma-point correction of W (2D): charge channel separated from the RI basis'
-         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Layer area A (bohr^2)', gc%area
-         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'RI metric head int dr v(r)', gc%metric_head
-         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Norm of the charge vector |c|', norm_c
-         WRITE (bs_env%unit_nr, '(T4,A,T72,I10)') 'Null modes of the neutral body V_b', n_drop_sqrt
-         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Largest eigenvalue of V_b', lambda_max
-         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Smallest retained eigenvalue of V_b', lambda_kept
-      END IF
+      CALL gamma_corr_print_maps(bs_env, norm_c, n_drop_sqrt, lambda_max, lambda_kept, &
+                                 DOT_PRODUCT(gc%charge, MATMUL(V_zero, gc%charge)))
 
       DEALLOCATE (V_zero, projector, work, V_b_sqrt, V_b_inv_sqrt, M_inv)
 
@@ -678,7 +718,8 @@ CONTAINS
       gc%charge(:) = gc%charge/norm_c
       gc%charge_norm = norm_c
 
-      ! Π_PQ = δ_PQ − ĉ_P ĉ_Q, filled on the local block of a distributed matrix.
+      ! Π_PQ = δ_PQ − ĉ_P ĉ_Q, filled on the local block of a distributed matrix; Π = 1 in 3D
+      ! (see gamma_corr_build_coulomb_maps).
       CALL cp_fm_create(fm_Pi, bs_env%fm_RI_RI%matrix_struct)
       CALL cp_fm_get_info(fm_Pi, nrow_local=nrow_local, ncol_local=ncol_local, &
                           row_indices=row_indices, col_indices=col_indices)
@@ -686,7 +727,8 @@ CONTAINS
          col = col_indices(i_col)
          DO i_row = 1, nrow_local
             row = row_indices(i_row)
-            fm_Pi%local_data(i_row, i_col) = -gc%charge(row)*gc%charge(col)
+            fm_Pi%local_data(i_row, i_col) = 0.0_dp
+            IF (gc%slab) fm_Pi%local_data(i_row, i_col) = -gc%charge(row)*gc%charge(col)
             IF (row == col) fm_Pi%local_data(i_row, i_col) = fm_Pi%local_data(i_row, i_col) + 1.0_dp
          END DO
       END DO
@@ -745,29 +787,80 @@ CONTAINS
       CALL cp_fm_release(fm_sqrt)
       CALL cp_fm_release(fm_inv_sqrt)
 
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A)') &
-            'Gamma-point correction of W (2D): charge channel separated from the RI basis'
-         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Layer area A (bohr^2)', gc%area
-         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'RI metric head int dr v(r)', gc%metric_head
-         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Norm of the charge vector |c|', norm_c
-         WRITE (bs_env%unit_nr, '(T4,A,T72,I10)') 'Null modes of the neutral body V_b', n_drop
-         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Largest eigenvalue of V_b', lambda_max
-         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Smallest retained eigenvalue of V_b', lambda_kept
-      END IF
+      CALL gamma_corr_print_maps(bs_env, norm_c, n_drop, lambda_max, lambda_kept)
 
       CALL timestop(handle)
 
    END SUBROUTINE gamma_corr_build_coulomb_maps_fm
 
 ! **************************************************************************************************
-!> \brief V_PQ(q=0) from the real-space 2c Coulomb lattice sum (gwp42 Eq. 63).
+!> \brief Summary of the Coulomb maps: geometry, charge norm and the spectrum cut of V_b. The
+!>        null-mode count and the (λ_max, smallest kept λ) pair show whether eps_null_V_b cut
+!>        inside a spectral gap (see gamma_corr_symmetric_power).
+!> \param bs_env ...
+!> \param norm_c |c|
+!> \param n_drop number of discarded modes of V_b
+!> \param lambda_max largest eigenvalue of V_b
+!> \param lambda_kept smallest retained eigenvalue of V_b
+! **************************************************************************************************
+   SUBROUTINE gamma_corr_print_maps(bs_env, norm_c, n_drop, lambda_max, lambda_kept, c_V_c)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(KIND=dp), INTENT(IN)                          :: norm_c
+      INTEGER, INTENT(IN)                                :: n_drop
+      REAL(KIND=dp), INTENT(IN)                          :: lambda_max, lambda_kept
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: c_V_c
+
+      TYPE(gamma_corr_type), POINTER                     :: gc
+
+      gc => bs_env%ri_rs%gamma_corr
+      IF (bs_env%unit_nr <= 0) RETURN
+
+      IF (gc%slab) THEN
+         WRITE (bs_env%unit_nr, '(T2,A)') &
+            'Gamma-point correction of W (2D slab): charge channel separated from the RI basis'
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Layer area A (bohr^2)', gc%measure
+      ELSE
+         WRITE (bs_env%unit_nr, '(T2,A)') &
+            'Gamma-point correction of W (3D bulk): Ewald V(0) without its G = 0 term'
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Cell volume Omega (bohr^3)', gc%measure
+      END IF
+      WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'RI metric head int dr v(r)', gc%metric_head
+      WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Norm of the charge vector |c|', norm_c
+      IF (PRESENT(c_V_c)) &
+         WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Charge weight c^T V(0) c / |c|^2', c_V_c
+      WRITE (bs_env%unit_nr, '(T4,A,T72,I10)') 'Null modes of the body V_b', n_drop
+      WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Largest eigenvalue of V_b', lambda_max
+      WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Smallest retained eigenvalue of V_b', lambda_kept
+
+   END SUBROUTINE gamma_corr_print_maps
+
+! **************************************************************************************************
+!> \brief V_PQ(q=0) of the RI basis.
 !>
-!>        Built with a one-point k-mesh at the origin but with nkp_grid kept at the mesh for
-!>        χ, ε, W, because get_factor_and_xyz_min_max takes the summation box from nkp_grid, not
-!>        from the number of k-points: the box is ±(factor·n−1)/2 cells with factor = 3^(S−1) for
-!>        odd n. The result is real; the imaginary part returned by the sum is zero at q = 0 for a
-!>        centrosymmetric box and is asserted to be so.
+!>        2D slab: the finite real-space 2c Coulomb lattice sum (gwp42 Eq. 63). Built with a
+!>        one-point k-mesh at the origin but with nkp_grid kept at the mesh for χ, ε, W, because
+!>        get_factor_and_xyz_min_max takes the summation box from nkp_grid, not from the number
+!>        of k-points: the box is ±(factor·n−1)/2 cells with factor = 3^(S−1) for odd n.
+!>
+!>        3D bulk: the Ewald sum with the G = 0 Fourier coefficient of 1/r omitted,
+!>
+!>          V_PQ(0) = Σ_{L∈box} (P0|erfc(ωr)/r|QL)
+!>                  + (4π/Ω) Σ_{G≠0} exp(−G²/4ω²)/G² ρ_P(G) ρ_Q(G)* − π/(Ωω²) c_P c_Q ,
+!>
+!>        the real-space half through the same lattice-sum machinery with the erfc operator, the
+!>        reciprocal half added to the distributed matrix by add_ewald_reciprocal_fm. The finite
+!>        box sum of 1/r itself is NOT usable in 3D: between neutral (dipolar) functions it is
+!>        conditionally convergent with a shape-dependent surface term (the Lorentz depolarization
+!>        of a finite sample), whereas the Ewald sum is the tin-foil (G = 0 omitted) limit that
+!>        the head-and-wing model assumes. The splitting parameter is set from the image box so
+!>        that the real-space erfc tail is negligible for every pair the box contains:
+!>        erfc(ω r_c) with r_c = ((N−1)/2)·h_min, N = 3^(S−1) images per direction and h_min the
+!>        smallest cell height, is below 1e-28 for ω r_c = 8; the Gaussian extents of the
+!>        auxiliary functions eat a few bohr of that margin. The sum is independent of ω
+!>        (SIZE_LATTICE_SUM 2 versus 3 is a check on both halves).
+!>
+!>        The result is real; the imaginary part returned by the lattice sum is zero at q = 0 for
+!>        a centrosymmetric box and is asserted to be so.
 !> \param qs_env QS environment, for cell, particles and the RI_AUX basis
 !> \param bs_env band-structure environment, for the k-mesh, SIZE_LATTICE_SUM and RI templates
 !> \param V_zero V_PQ(0), replicated on every rank
@@ -780,8 +873,8 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_coulomb_at_zero'
 
-      INTEGER                                            :: handle, re_im
-      REAL(KIND=dp)                                      :: max_imag, max_real
+      INTEGER                                            :: handle, n_images, n_wave, re_im
+      REAL(KIND=dp)                                      :: height_min, max_imag, max_real, r_c
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_fm_type)                                   :: fm_work
@@ -819,20 +912,52 @@ CONTAINS
          CALL dbcsr_set(mat_V(1, re_im)%matrix, 0.0_dp)
       END DO
 
-      ! V_PQ(0) = Σ_{R ∈ box} (P0|QR), the bare Coulomb lattice sum with unit phases (Eq. 63).
-      CALL build_2c_coulomb_matrix_kp(mat_V, kpoints_zero, basis_type="RI_AUX", cell=cell, &
-                                      particle_set=particle_set, qs_kind_set=qs_kind_set, &
-                                      atomic_kind_set=atomic_kind_set, &
-                                      size_lattice_sum=bs_env%size_lattice_sum_V, &
-                                      operator_type=operator_coulomb, &
-                                      ikp_start=1, ikp_end=1)
+      gc => bs_env%ri_rs%gamma_corr
+      IF (gc%slab) THEN
+         ! V_PQ(0) = Σ_{R ∈ box} (P0|QR), the bare Coulomb lattice sum with unit phases (Eq. 63).
+         CALL build_2c_coulomb_matrix_kp(mat_V, kpoints_zero, basis_type="RI_AUX", cell=cell, &
+                                         particle_set=particle_set, qs_kind_set=qs_kind_set, &
+                                         atomic_kind_set=atomic_kind_set, &
+                                         size_lattice_sum=bs_env%size_lattice_sum_V, &
+                                         operator_type=operator_coulomb, &
+                                         ikp_start=1, ikp_end=1)
+      ELSE
+         ! Ewald splitting parameter from the image box: N = 3^(S−1) images per direction (odd
+         ! mesh, get_factor_and_xyz_min_max), coverage radius r_c = ((N−1)/2) h_min with the
+         ! cell heights h_α = 2π/|b_α|, and ω r_c = 8.
+         n_images = 3**(bs_env%size_lattice_sum_V - 1)
+         IF (n_images < 3) CPABORT('3D Gamma-point correction: SIZE_LATTICE_SUM must be at least 2')
+         height_min = twopi/MAXVAL(NORM2(gc%b_recip, DIM=1))
+         r_c = 0.5_dp*REAL(n_images - 1, dp)*height_min
+         gc%ewald_omega = 8.0_dp/r_c
+         ! Real-space half: Σ_{R ∈ box} (P0|erfc(ωr)/r|QR), absolutely convergent.
+         CALL build_2c_coulomb_matrix_kp(mat_V, kpoints_zero, basis_type="RI_AUX", cell=cell, &
+                                         particle_set=particle_set, qs_kind_set=qs_kind_set, &
+                                         atomic_kind_set=atomic_kind_set, &
+                                         size_lattice_sum=bs_env%size_lattice_sum_V, &
+                                         operator_type=operator_verfc, &
+                                         ikp_start=1, ikp_end=1, omega=gc%ewald_omega)
+      END IF
 
       ! The real part is kept distributed in gc%fm_V_zero: compute_V_k_by_lattice_sum needs the
       ! identical matrix for the regular W path and reuses it instead of repeating the lattice sum.
-      gc => bs_env%ri_rs%gamma_corr
       CALL cp_fm_create(gc%fm_V_zero, bs_env%fm_RI_RI%matrix_struct)
       CALL cp_fm_set_all(gc%fm_V_zero, 0.0_dp)
       CALL copy_dbcsr_to_fm(mat_V(1, 1)%matrix, gc%fm_V_zero)
+      IF (.NOT. gc%slab) THEN
+         ! Reciprocal half, G = 0 omitted, added to the local block of the distributed matrix.
+         CALL add_ewald_reciprocal_fm(gc%fm_V_zero, qs_env, "RI_AUX", gc%ewald_omega, n_wave)
+         IF (bs_env%unit_nr > 0) THEN
+            WRITE (bs_env%unit_nr, '(T2,A)') &
+               'Gamma-point correction (3D): V(q=0) as an Ewald sum without its G = 0 term'
+            WRITE (bs_env%unit_nr, '(T4,A,T72,I10)') 'Real-space images per direction', n_images
+            WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Coverage radius r_c (bohr)', r_c
+            WRITE (bs_env%unit_nr, '(T4,A,T72,ES10.3)') 'Splitting parameter omega (1/bohr)', &
+               gc%ewald_omega
+            WRITE (bs_env%unit_nr, '(T4,A,T72,I10)') 'Reciprocal lattice vectors summed', n_wave
+            WRITE (bs_env%unit_nr, '(A)') ' '
+         END IF
+      END IF
       gc%V_zero_cached = .TRUE.
       ! The replicated copy only for the replicated dense-algebra path.
       IF (PRESENT(V_zero)) CALL cp_fm_get_submatrix(gc%fm_V_zero, V_zero)
@@ -879,35 +1004,34 @@ CONTAINS
       gc%enabled = gamma_corr_requested(bs_env)
       IF (.NOT. gc%enabled) RETURN
 
-      ! A, b_1, b_2 and ∫dr v_ω(r).
-      CALL gamma_corr_slab_geometry(bs_env, gc%area, gc%b_recip)
+      ! Slab (2π/q head over the layer area) or bulk (4π/q² head over the cell volume).
+      gc%slab = ALL(bs_env%periodic == [1, 1, 0])
+      ! A or Ω, the reciprocal vectors and ∫dr v(r) of the RI metric.
+      CALL gamma_corr_cell_geometry(bs_env, gc%slab, gc%measure, gc%b_recip)
       gc%metric_head = gamma_corr_metric_head(bs_env)
 
       ! Replicated or distributed dense algebra (same philosophy as the Z_lP solves: an estimate
-      ! of the single-rank peak against the measured memory per rank decides, unless the input
-      ! forces a path). The replicated path holds up to ten n_RI x n_RI arrays at once
+      ! of the single-rank peak against the measured memory per rank decides). The replicated path holds up to ten n_RI x n_RI arrays at once
       ! (gamma_corr_build_coulomb_maps: V, Π, V_b, its two powers, M⁻¹, two maps, and the
       ! eigenvector/scaled buffers of the diagonalization); a quarter of the available memory
       ! is the allowance, because the regular W path keeps its own distributed matrices alive.
       mem_need_GB = 10.0_dp*8.0_dp*REAL(bs_env%n_RI, dp)**2*1.0E-9_dp
       CALL mp_mem_avail_per_rank_GB(bs_env%para_env, mem_avail_GB)
-      SELECT CASE (bs_env%ri_rs%gamma_corr_dense)
-      CASE (1)
-         gc%distributed = .FALSE.
-      CASE (2)
-         gc%distributed = .TRUE.
-      CASE DEFAULT
-         gc%distributed = mem_need_GB > 0.25_dp*mem_avail_GB
-      END SELECT
+      gc%distributed = mem_need_GB > 0.25_dp*mem_avail_GB
 
       ! Tell the user why the correction is switched on and how its dense algebra runs.
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A)') &
-            'The mesh for chi, eps, W contains q = 0, where the real-space Coulomb lattice sum'
+            'The mesh for chi, eps, W contains q = 0, where the Coulomb operator between charged'
          WRITE (bs_env%unit_nr, '(T2,A)') &
-            'over charged auxiliary functions diverges. Separating the charge channel and'
-         WRITE (bs_env%unit_nr, '(T2,A)') &
-            'adding the Gamma-point head-and-wing correction of W.'
+            'auxiliary functions is singular. Separating the charge channel and adding the'
+         IF (gc%slab) THEN
+            WRITE (bs_env%unit_nr, '(T2,A)') &
+               'Gamma-point head-and-wing correction of W (2D slab, head 2 pi/q).'
+         ELSE
+            WRITE (bs_env%unit_nr, '(T2,A)') &
+               'Gamma-point head-and-wing correction of W (3D bulk, head 4 pi/q^2).'
+         END IF
          WRITE (bs_env%unit_nr, '(T4,A,T62,F10.2,A)') &
             'Replicated dense n_RI x n_RI algebra would need', mem_need_GB, ' GB'
          WRITE (bs_env%unit_nr, '(T4,A,T62,F10.2,A)') &
@@ -1597,9 +1721,9 @@ CONTAINS
       CALL dbcsr_copy(mat_Y, mat_phi)
 
       ! Per-τ work arrays: exponential factors per band, D for one direction, and the partial X
-      ! of this rank; prefactor = (2/n_spin)/√A of Eq. 48.
+      ! of this rank; prefactor = (2/n_spin)/√A of Eq. 48 (1/√Ω for a bulk cell).
       ALLOCATE (exp_occ(n_occ), exp_vir(n_vir), d_ov(n_occ, n_vir), x_partial(n_grid))
-      prefactor = spin_factor/SQRT(bs_env%ri_rs%gamma_corr%area)
+      prefactor = spin_factor/SQRT(bs_env%ri_rs%gamma_corr%measure)
 
       DO i_t = 1, bs_env%num_time_freq_points
          ! τ_k of the minimax grid (Hartree⁻¹).
@@ -1614,11 +1738,11 @@ CONTAINS
             exp_vir(i_a) = EXP(-ABS(bs_env%eigenval_scf_Gamma(n_occ + i_a, i_spin) - e_fermi)*tau)
          END DO
 
-         ! Y_αβ(iτ) = (2/n_spin/A) Σ_ia µ^α_ai µ^β_ai e^(-Δ_ia τ)                      [Eq. 49]
+         ! Y_αβ(iτ) = (2/n_spin/A) Σ_ia µ^α_ai µ^β_ai e^(-Δ_ia τ)   (1/Ω in 3D)        [Eq. 49]
          DO i_a = 1, n_vir
             DO i_i = 1, n_occ
                ! weight = (2/n_spin) e^(−Δ_ia τ) / A
-               weight = spin_factor*exp_occ(i_i)*exp_vir(i_a)/bs_env%ri_rs%gamma_corr%area
+               weight = spin_factor*exp_occ(i_i)*exp_vir(i_a)/bs_env%ri_rs%gamma_corr%measure
                ! Y_αβ += weight · µ^α_ai µ^β_ai (all nine components, symmetric in α, β)
                DO j_dir = 1, 3
                   DO i_dir = 1, 3
@@ -1839,8 +1963,16 @@ CONTAINS
       start_time = m_walltime()
       gc => bs_env%ri_rs%gamma_corr
       n_t = bs_env%num_time_freq_points
+
+      ! Bulk cell: no tables; per-direction coefficients for the analytic radial integrals.
+      IF (.NOT. gc%slab) THEN
+         CALL gamma_corr_direction_coefficients(bs_env)
+         CALL timestop(handle)
+         RETURN
+      END IF
+
       ! Area of the small Brillouin zone, (2π)²/A; dividing by it gives the A/(2π)² prefactor.
-      area_bz = twopi**2/gc%area
+      area_bz = twopi**2/gc%measure
 
       ! Angular quadrature (q̂, w(q̂), q_max(q̂)) and the radial Gauss-Legendre rule on [−1, 1].
       CALL gamma_corr_bz_boundary(bs_env, n_face, dir_hat, dir_weight, dir_radius)
@@ -1979,13 +2111,21 @@ CONTAINS
 
       gc => bs_env%ri_rs%gamma_corr
       CPASSERT(gc%ready)
+
+      ! Bulk cell: kernels per atom pair instead of interpolated tables.
+      IF (.NOT. gc%slab) THEN
+         CALL gamma_corr_add_to_W_bulk(bs_env, qs_env, fm_W_MIC_time)
+         CALL timestop(handle)
+         RETURN
+      END IF
+
       n_RI = bs_env%n_RI
       n_t = bs_env%num_time_freq_points
       n_tab = gc%n_tab(1)
       ! n_tab − 1 table intervals per unit fractional length (bilinear interpolation below).
       scale = REAL(n_tab - 1, dp)
-      inv_A = 1.0_dp/gc%area
-      inv_sqrt_A = 1.0_dp/SQRT(gc%area)
+      inv_A = 1.0_dp/gc%measure
+      inv_sqrt_A = 1.0_dp/SQRT(gc%measure)
 
       ! Unnormalized auxiliary charges c_P = ∫ϕ_P (gc%charge is the unit vector ĉ).
       ALLOCATE (c(n_RI))
@@ -2104,9 +2244,9 @@ CONTAINS
       REAL(KIND=dp)                                      :: area, area_check
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: nodes, rule
       REAL(KIND=dp), DIMENSION(3)                        :: cross, dq, q
-      REAL(KIND=dp), DIMENSION(3, 2)                     :: b
+      REAL(KIND=dp), DIMENSION(3, 3)                     :: b
 
-      CALL gamma_corr_slab_geometry(bs_env, area, b)
+      CALL gamma_corr_cell_geometry(bs_env, .TRUE., area, b)
       CALL gamma_corr_gauss_legendre(n_face, nodes, rule)
 
       ALLOCATE (dir_hat(3, 4*n_face), dir_weight(4*n_face), dir_radius(4*n_face))
@@ -2244,8 +2384,10 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       gc => bs_env%ri_rs%gamma_corr
+      ! 2D only: the 3D V(0) is an Ewald sum that never contained the singular term.
+      CPASSERT(gc%slab)
       CPASSERT(ALLOCATED(gc%charge))
-      CPASSERT(gc%charge_norm > 0.0_dp .AND. gc%area > 0.0_dp)
+      CPASSERT(gc%charge_norm > 0.0_dp .AND. gc%measure > 0.0_dp)
       n_RI = bs_env%n_RI
 
       ! ---------------------------------------------------------------------------------------
@@ -2285,9 +2427,9 @@ CONTAINS
       END DO
       DEALLOCATE (nodes, rule)
       ! D_box = (1/A) ∫_box d²r/|r|, in bohr⁻¹ (same units as V_PQ/(c_P c_Q)).
-      d_box = d_box/gc%area
+      d_box = d_box/gc%measure
       ! The box area must come out as (2F_1)(2F_2)·A; a sign or orientation error fails here.
-      IF (ABS(area_check/(4.0_dp*f_half(1)*f_half(2)*gc%area) - 1.0_dp) > 1.0E-8_dp) &
+      IF (ABS(area_check/(4.0_dp*f_half(1)*f_half(2)*gc%measure) - 1.0_dp) > 1.0E-8_dp) &
          CPABORT('Gamma-point correction: the image-box boundary quadrature failed its area check')
 
       ! ---------------------------------------------------------------------------------------
@@ -2344,5 +2486,414 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE gamma_corr_subtract_divergent_head
+
+! **************************************************************************************************
+!> \brief Cubature of the 3D Brillouin-zone cell around Γ over its six faces: directions q̂, the
+!>        radius L(q̂) to the cell boundary along each, and the solid-angle weights.
+!>
+!>        The cell is the parallelepiped {Σ_i s_i b_i/2, |s_i| ≤ 1}, i.e. the single BZ cell of
+!>        the supercell around Γ. Face pair i sits at s_i = ±1 and is parametrized by (s_j, s_k)
+!>        with a Gauss-Legendre n_face x n_face rule; a point on it is q = ±b_i/2 + s_j b_j/2 +
+!>        s_k b_k/2, and its solid-angle element seen from Γ is
+!>
+!>          dΩ = |q · (∂q/∂s_j × ∂q/∂s_k)| ds_j ds_k / |q|³ = |q · (b_j × b_k)|/(4 |q|³) ds_j ds_k ,
+!>
+!>        so that ∫_cell d³q f(q̂) g(|q|) = Σ_dir w(q̂) ∫_0^{L(q̂)} dq q² f(q̂) g(q). Both signs
+!>        of every face are included, which makes the direction set symmetric under q̂ → −q̂ and
+!>        the cos/sin split of the kernels exact. The volume check Σ w L³/3 = (2π)³/Ω verifies
+!>        that the cubature closes on the cell.
+!> \param bs_env band-structure environment, for the cell (via gamma_corr_cell_geometry)
+!> \param n_face Gauss-Legendre points per face edge (n_face² points per face)
+!> \param dir_hat unit directions, 3 x n_dir, Cartesian, n_dir = 6·n_face²
+!> \param dir_weight solid-angle weights (steradian); they sum to 4π
+!> \param dir_radius distance to the cell boundary along each direction (1/bohr)
+! **************************************************************************************************
+   SUBROUTINE gamma_corr_bz_faces(bs_env, n_face, dir_hat, dir_weight, dir_radius)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      INTEGER, INTENT(IN)                                :: n_face
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT)                                     :: dir_hat
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:), &
+         INTENT(OUT)                                     :: dir_weight, dir_radius
+
+      INTEGER                                            :: i_axis, i_dir, i_sign, j_axis, j_node, &
+                                                            k_axis, k_node
+      REAL(KIND=dp)                                      :: triple, volume, volume_check
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: nodes, rule
+      REAL(KIND=dp), DIMENSION(3)                        :: cross, q
+      REAL(KIND=dp), DIMENSION(3, 3)                     :: b
+
+      CALL gamma_corr_cell_geometry(bs_env, .FALSE., volume, b)
+      CALL gamma_corr_gauss_legendre(n_face, nodes, rule)
+
+      ALLOCATE (dir_hat(3, 6*n_face**2), dir_weight(6*n_face**2), dir_radius(6*n_face**2))
+      i_dir = 0
+      DO i_axis = 1, 3
+         j_axis = MODULO(i_axis, 3) + 1
+         k_axis = MODULO(i_axis + 1, 3) + 1
+         ! (b_j/2) × (b_k/2): the vector area element of the face pair ±b_i/2.
+         cross = 0.25_dp*[b(2, j_axis)*b(3, k_axis) - b(3, j_axis)*b(2, k_axis), &
+                          b(3, j_axis)*b(1, k_axis) - b(1, j_axis)*b(3, k_axis), &
+                          b(1, j_axis)*b(2, k_axis) - b(2, j_axis)*b(1, k_axis)]
+         DO i_sign = -1, 1, 2
+            DO j_node = 1, n_face
+               DO k_node = 1, n_face
+                  i_dir = i_dir + 1
+                  ! Boundary point q = ±b_i/2 + s_j b_j/2 + s_k b_k/2 at the Gauss-Legendre nodes.
+                  q = REAL(i_sign, dp)*0.5_dp*b(:, i_axis) + &
+                      0.5_dp*nodes(j_node)*b(:, j_axis) + 0.5_dp*nodes(k_node)*b(:, k_axis)
+                  dir_radius(i_dir) = SQRT(SUM(q*q))
+                  dir_hat(:, i_dir) = q/dir_radius(i_dir)
+                  ! dΩ = |q · dS| / |q|³ with the Gauss-Legendre weights of the face parameters.
+                  triple = ABS(DOT_PRODUCT(q, cross))
+                  dir_weight(i_dir) = rule(j_node)*rule(k_node)*triple/dir_radius(i_dir)**3
+               END DO
+            END DO
+         END DO
+      END DO
+
+      ! Cell volume from the cubature, Σ w L³/3, must equal (2π)³/Ω.
+      volume_check = SUM(dir_weight*dir_radius**3)/3.0_dp
+      IF (ABS(volume_check*volume/twopi**3 - 1.0_dp) > 1.0E-8_dp) &
+         CPABORT('Gamma-point correction: the BZ cell cubature failed its volume check')
+
+      DEALLOCATE (nodes, rule)
+
+   END SUBROUTINE gamma_corr_bz_faces
+
+! **************************************************************************************************
+!> \brief Bulk cell: the directional coefficients of the head and wing cell integrals.
+!>
+!>        In the extended basis {ϕ_0 = e^{iq·r}/√Ω, ϕ_P} with v_00 = 4π/q², the Schur complement
+!>        of the symmetrized dielectric matrix is
+!>
+!>          ε̃_00(q̂, iω) = 1 + 4π a(q̂, iω),   a = q̂ᵀ S q̂,   S = Y − Eᵀ B⁻¹ E ,
+!>
+!>        INDEPENDENT of |q| (the q² of the dipole response cancels the 1/q² of v_00; in 2D the
+!>        analogous product leaves 2πq a). The block inverse then gives the head and wing of the
+!>        correlation part W^c = v^(1/2)(ε̃⁻¹ − 1)v^(1/2):
+!>
+!>          W^c_00(q) = (4π/q²)(1/ε̃_00 − 1) = −(4π/q²)·4πa/(1 + 4πa)
+!>          W^c_P0(q) = i (4π/q) (q̂·T_P)/(1 + 4πa),   T = V(0) V^(-1/2) B⁻¹ E = V^(1/2) B⁻¹ E ,
+!>
+!>        and their averages over the small BZ cell, with the atom-pair phase e^{iq·R},
+!>
+!>          K_h(R, iω) = (Ω/(2π)³) ∫_cell d³q W^c_00(q) cos(q·R)
+!>                     = −(Ω/(2π)³) Σ_q̂ w(q̂) [16π² a/(1 + 4πa)] ∫_0^{L(q̂)} dq cos(q q̂·R)
+!>          K_w(R, iω) = (Ω/(2π)³) ∫_cell d³q (4π/q)/(1 + 4πa) q̂ sin(q·R)
+!>                     = (Ω/(2π)³) Σ_q̂ w(q̂) [4π/(1 + 4πa)] q̂ ∫_0^{L(q̂)} dq q sin(q q̂·R) ,
+!>
+!>        where q² dq of the volume element has cancelled the 1/q² (head) or combined with 1/q
+!>        (wing). The radial integrals are elementary and are evaluated per atom pair in
+!>        gamma_corr_kernel_bulk; this routine stores the bracketed coefficients times the
+!>        cubature weight and the (Ω/(2π)³) prefactor,
+!>
+!>          head_coef(q̂, iω) = −(Ω/(2π)³) w(q̂) 16π² a/(1 + 4πa)
+!>          wing_coef(q̂, iω) =  (Ω/(2π)³) w(q̂) 4π/(1 + 4πa) ,
+!>
+!>        together with q̂ and L(q̂). The screening denominator must be positive: a(q̂) is a
+!>        quadratic form of the positive head Y minus the body correction, and 1 + 4πa is the
+!>        macroscopic dielectric constant ε_∞(q̂, iω) ≥ 1 of the cell.
+!> \param bs_env band-structure environment; consumes gc%S_head, fills gc%dir_*, gc%*_coef
+! **************************************************************************************************
+   SUBROUTINE gamma_corr_direction_coefficients(bs_env)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_direction_coefficients'
+      INTEGER, PARAMETER                                 :: n_face = 8
+
+      INTEGER                                            :: handle, i_dir, i_w, n_dir, n_t
+      REAL(KIND=dp)                                      :: a_scalar, denom, prefactor, &
+                                                            start_time
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: dir_weight
+      TYPE(gamma_corr_type), POINTER                     :: gc
+
+      CALL timeset(routineN, handle)
+      start_time = m_walltime()
+
+      gc => bs_env%ri_rs%gamma_corr
+      n_t = bs_env%num_time_freq_points
+      ! Ω/(2π)³: the inverse of the small-BZ volume, i.e. the cell average.
+      prefactor = gc%measure/twopi**3
+
+      CALL gamma_corr_bz_faces(bs_env, n_face, gc%dir_hat, dir_weight, gc%dir_radius)
+      n_dir = SIZE(dir_weight)
+      ALLOCATE (gc%head_coef(n_dir, n_t), gc%wing_coef(n_dir, n_t))
+
+      DO i_w = 1, n_t
+         DO i_dir = 1, n_dir
+            ! a(q̂, iω) = q̂ᵀ S q̂ and the macroscopic denominator 1 + 4π a.
+            a_scalar = DOT_PRODUCT(gc%dir_hat(:, i_dir), &
+                                   MATMUL(gc%S_head(:, :, i_w), gc%dir_hat(:, i_dir)))
+            denom = 1.0_dp + fourpi*a_scalar
+            IF (denom <= 0.0_dp) &
+               CPABORT('Gamma-point correction: the dielectric head 1 + 4 pi a is not positive')
+            ! head: −(Ω/(2π)³) w · 16π² a/(1 + 4πa);  wing: (Ω/(2π)³) w · 4π/(1 + 4πa)
+            gc%head_coef(i_dir, i_w) = -prefactor*dir_weight(i_dir)*16.0_dp*pi**2*a_scalar/denom
+            gc%wing_coef(i_dir, i_w) = prefactor*dir_weight(i_dir)*fourpi/denom
+         END DO
+      END DO
+
+      ! The coefficients and T_RI are consumed by gamma_corr_add_to_W_bulk.
+      DEALLOCATE (gc%S_head, dir_weight)
+
+      IF (bs_env%unit_nr > 0) THEN
+         WRITE (bs_env%unit_nr, '(T2,A,I5,A,T62,F10.1,A)') &
+            'Gamma-point correction: 3D cell cubature with', n_dir, ' directions, Exec. time', &
+            m_walltime() - start_time, ' s'
+         WRITE (bs_env%unit_nr, '(A)') ' '
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE gamma_corr_direction_coefficients
+
+! **************************************************************************************************
+!> \brief Bulk cell: head and wing kernels at one separation R, by the analytic radial integrals
+!>
+!>          ∫_0^L dq cos(q t)   = sin(L t)/t                         → L            for t → 0
+!>          ∫_0^L dq q sin(q t) = (sin(L t) − L t cos(L t))/t²       → L² (L t)/3   for t → 0
+!>
+!>        with t = q̂·R and L = L(q̂), summed over the cubature directions with the coefficients
+!>        of gamma_corr_direction_coefficients. Both are Taylor expanded below |L t| = 0.02,
+!>        where the closed forms cancel (the next omitted term is of relative size 1e-13).
+!> \param gc correction data: dir_hat, dir_radius, head_coef, wing_coef
+!> \param n_t number of frequency points
+!> \param R separation vector (bohr)
+!> \param K_h K_h(R, iω) per frequency
+!> \param K_w K_w,α(R, iω) per Cartesian direction and frequency
+! **************************************************************************************************
+   PURE SUBROUTINE gamma_corr_kernel_bulk(gc, n_t, R, K_h, K_w)
+      TYPE(gamma_corr_type), INTENT(IN)                  :: gc
+      INTEGER, INTENT(IN)                                :: n_t
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: R
+      REAL(KIND=dp), DIMENSION(n_t), INTENT(OUT)         :: K_h
+      REAL(KIND=dp), DIMENSION(3, n_t), INTENT(OUT)      :: K_w
+
+      INTEGER                                            :: i_dir, i_w
+      REAL(KIND=dp)                                      :: f_head, f_wing, L, Lt, t
+
+      K_h(:) = 0.0_dp
+      K_w(:, :) = 0.0_dp
+      DO i_dir = 1, SIZE(gc%dir_radius)
+         L = gc%dir_radius(i_dir)
+         t = DOT_PRODUCT(gc%dir_hat(:, i_dir), R)
+         Lt = L*t
+         IF (ABS(Lt) < 0.02_dp) THEN
+            ! sin(Lt)/t = L (1 − (Lt)²/6 + (Lt)⁴/120 − …)
+            f_head = L*(1.0_dp - Lt**2/6.0_dp + Lt**4/120.0_dp)
+            ! (sin(Lt) − Lt cos(Lt))/t² = L² ((Lt)/3 − (Lt)³/30 + (Lt)⁵/840 − …)
+            f_wing = L*L*(Lt/3.0_dp - Lt**3/30.0_dp + Lt**5/840.0_dp)
+         ELSE
+            f_head = SIN(Lt)/t
+            f_wing = (SIN(Lt) - Lt*COS(Lt))/(t*t)
+         END IF
+         DO i_w = 1, n_t
+            K_h(i_w) = K_h(i_w) + gc%head_coef(i_dir, i_w)*f_head
+            K_w(:, i_w) = K_w(:, i_w) + gc%wing_coef(i_dir, i_w)*f_wing*gc%dir_hat(:, i_dir)
+         END DO
+      END DO
+
+   END SUBROUTINE gamma_corr_kernel_bulk
+
+! **************************************************************************************************
+!> \brief Bulk cell: add the Γ-point head-and-wing correction to W^MIC_PQ(iτ) in the RI basis,
+!>
+!>          (ϕ_P|ΔW|ϕ_Q)(iω) = (c_P c_Q / Ω) K_h(R_PQ, iω)
+!>                           + (1/√Ω) Σ_α [T_Pα c_Q − c_P T_Qα] K_w,α(R_PQ, iω) ,
+!>
+!>        the same expression as the slab one of gamma_corr_add_to_W with A → Ω and the 3D
+!>        kernels of gamma_corr_kernel_bulk, at the minimum-image separation R_PQ of the atoms
+!>        carrying P and Q (fractional difference folded into [−1/2, 1/2)³, the convention of
+!>        cp2k#6447's add_gamma_corr_pair_cell; for strongly skewed cells this is not always the
+!>        shortest image, but it is the one the regular W^MIC uses too). The kernels are
+!>        evaluated once per atom pair that this rank's local block of W touches (row atoms x
+!>        column atoms, OpenMP over the pairs), then read for every local RI element; the
+!>        result is transformed to iτ with the cosine weights of the minimax grid and added to
+!>        W^MIC_PQ(iτ) BEFORE the M⁻¹ W M⁻¹ contraction.
+!> \param bs_env band-structure environment: the correction data, the cell, the RI-atom map
+!> \param qs_env QS environment, for the atomic positions
+!> \param fm_W_MIC_time W^MIC_PQ(iτ) in the projection representation, one fm per time point
+! **************************************************************************************************
+   SUBROUTINE gamma_corr_add_to_W_bulk(bs_env, qs_env, fm_W_MIC_time)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(cp_fm_type), DIMENSION(:), INTENT(INOUT)      :: fm_W_MIC_time
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_add_to_W_bulk'
+
+      INTEGER                                            :: atom_P, atom_Q, handle, i_atom, i_col, &
+                                                            i_pair, i_ra, i_row, i_t, i_w, &
+                                                            n_atom, n_ca, n_pair, n_ra, n_RI, &
+                                                            n_t, ncol_local, nrow_local, P, Q
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_of_RI, col_atom_index, &
+                                                            col_atom_list, row_atom_index, &
+                                                            row_atom_list
+      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
+      INTEGER                                            :: env_len, env_stat
+      CHARACTER(LEN=32)                                  :: env_val
+      REAL(KIND=dp)                                      :: c_P, c_Q, inv_sqrt_V, inv_V, start_time, &
+                                                            scale_head, scale_wing, max_head, &
+                                                            max_wing, d_head, d_wing
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: c, dW_freq, K_h0
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: frac_atom, K_w0
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: K_h_pair
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: K_w_pair
+      REAL(KIND=dp), DIMENSION(3)                        :: d_frac, R_cart
+      TYPE(gamma_corr_type), POINTER                     :: gc
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+
+      CALL timeset(routineN, handle)
+      start_time = m_walltime()
+
+      gc => bs_env%ri_rs%gamma_corr
+      CPASSERT(gc%ready .AND. ALLOCATED(gc%head_coef))
+      n_RI = bs_env%n_RI
+      n_t = bs_env%num_time_freq_points
+      inv_V = 1.0_dp/gc%measure
+      inv_sqrt_V = 1.0_dp/SQRT(gc%measure)
+
+      ! Unnormalized auxiliary charges c_P = ∫ϕ_P (gc%charge is the unit vector ĉ).
+      ALLOCATE (c(n_RI))
+      c(:) = gc%charge_norm*gc%charge
+
+      ! Atom of every auxiliary function and the fractional coordinates of the atoms (unfolded;
+      ! the minimum image is taken on the difference).
+      NULLIFY (particle_set)
+      CALL get_qs_env(qs_env, particle_set=particle_set)
+      n_atom = SIZE(particle_set)
+      ALLOCATE (frac_atom(3, n_atom), atom_of_RI(n_RI))
+      DO i_atom = 1, n_atom
+         frac_atom(:, i_atom) = MATMUL(bs_env%ri_rs%cell%h_inv, particle_set(i_atom)%r)
+         atom_of_RI(bs_env%i_RI_start_from_atom(i_atom):bs_env%i_RI_end_from_atom(i_atom)) = i_atom
+      END DO
+
+      ! Local block of the distributed W^MIC(iτ): every time point shares one layout. The atoms
+      ! behind the local rows and columns, as compact lists plus the inverse maps.
+      CALL cp_fm_get_info(fm_W_MIC_time(1), nrow_local=nrow_local, ncol_local=ncol_local, &
+                          row_indices=row_indices, col_indices=col_indices)
+      ALLOCATE (row_atom_index(n_atom), col_atom_index(n_atom))
+      row_atom_index(:) = 0
+      col_atom_index(:) = 0
+      DO i_row = 1, nrow_local
+         row_atom_index(atom_of_RI(row_indices(i_row))) = 1
+      END DO
+      DO i_col = 1, ncol_local
+         col_atom_index(atom_of_RI(col_indices(i_col))) = 1
+      END DO
+      n_ra = SUM(row_atom_index)
+      n_ca = SUM(col_atom_index)
+      ALLOCATE (row_atom_list(n_ra), col_atom_list(n_ca))
+      n_ra = 0
+      n_ca = 0
+      DO i_atom = 1, n_atom
+         IF (row_atom_index(i_atom) == 1) THEN
+            n_ra = n_ra + 1
+            row_atom_list(n_ra) = i_atom
+            row_atom_index(i_atom) = n_ra
+         END IF
+         IF (col_atom_index(i_atom) == 1) THEN
+            n_ca = n_ca + 1
+            col_atom_list(n_ca) = i_atom
+            col_atom_index(i_atom) = n_ca
+         END IF
+      END DO
+
+      ! Kernels for every local (row atom, column atom) pair at its minimum-image separation.
+      n_pair = n_ra*n_ca
+      ALLOCATE (K_h_pair(n_t, n_ra, n_ca), K_w_pair(3, n_t, n_ra, n_ca))
+!$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(dynamic) &
+!$OMP          PRIVATE(i_pair, i_ra, atom_P, atom_Q, d_frac, R_cart) &
+!$OMP          SHARED(n_pair, n_ra, row_atom_list, col_atom_list, frac_atom, bs_env, gc, n_t, &
+!$OMP                 K_h_pair, K_w_pair)
+      DO i_pair = 1, n_pair
+         i_ra = MODULO(i_pair - 1, n_ra) + 1
+         atom_P = row_atom_list(i_ra)
+         atom_Q = col_atom_list((i_pair - 1)/n_ra + 1)
+         ! R_PQ = h (s_P − s_Q − ANINT(s_P − s_Q)): the fractional difference folded into
+         ! [−1/2, 1/2)³, then back to Cartesian coordinates.
+         d_frac = frac_atom(:, atom_P) - frac_atom(:, atom_Q)
+         d_frac = d_frac - ANINT(d_frac)
+         R_cart = MATMUL(bs_env%hmat, d_frac)
+         CALL gamma_corr_kernel_bulk(gc, n_t, R_cart, K_h_pair(:, i_ra, (i_pair - 1)/n_ra + 1), &
+                                     K_w_pair(:, :, i_ra, (i_pair - 1)/n_ra + 1))
+      END DO
+!$OMP END PARALLEL DO
+
+      ! TEMPORARY DIAGNOSTICS: GAMMA_CORR_SCALE_HEAD / GAMMA_CORR_SCALE_WING scale the two terms.
+      scale_head = 1.0_dp
+      scale_wing = 1.0_dp
+      CALL GET_ENVIRONMENT_VARIABLE('GAMMA_CORR_SCALE_HEAD', env_val, env_len, env_stat)
+      IF (env_stat == 0 .AND. env_len > 0) READ (env_val, *) scale_head
+      CALL GET_ENVIRONMENT_VARIABLE('GAMMA_CORR_SCALE_WING', env_val, env_len, env_stat)
+      IF (env_stat == 0 .AND. env_len > 0) READ (env_val, *) scale_wing
+      ALLOCATE (K_h0(n_t), K_w0(3, n_t))
+      CALL gamma_corr_kernel_bulk(gc, n_t, [0.0_dp, 0.0_dp, 0.0_dp], K_h0, K_w0)
+      max_head = 0.0_dp
+      max_wing = 0.0_dp
+
+      ALLOCATE (dW_freq(n_t))
+      DO i_col = 1, ncol_local
+         Q = col_indices(i_col)
+         atom_Q = col_atom_index(atom_of_RI(Q))
+         c_Q = c(Q)
+         DO i_row = 1, nrow_local
+            P = row_indices(i_row)
+            atom_P = row_atom_index(atom_of_RI(P))
+            c_P = c(P)
+
+            ! (ϕ_P|ΔW|ϕ_Q)(iω) per frequency: head c_P c_Q K_h/Ω and wing
+            ! (1/√Ω) Σ_α [T_Pα c_Q − c_P T_Qα] K_w,α. Symmetric in P <-> Q: K_h is even and K_w
+            ! odd in R, the wing bracket is antisymmetric.
+            DO i_w = 1, n_t
+               d_head = inv_V*c_P*c_Q*K_h_pair(i_w, atom_P, atom_Q)
+               d_wing = inv_sqrt_V*SUM(K_w_pair(:, i_w, atom_P, atom_Q)* &
+                                       (gc%T_RI(P, :, i_w)*c_Q - c_P*gc%T_RI(Q, :, i_w)))
+               IF (i_w == 1) THEN
+                  max_head = MAX(max_head, ABS(d_head))
+                  max_wing = MAX(max_wing, ABS(d_wing))
+               END IF
+               dW_freq(i_w) = scale_head*d_head + scale_wing*d_wing
+            END DO
+
+            ! iω -> iτ with the cosine weights of the minimax grid (the transform W^MIC uses),
+            ! accumulated straight into the local element of every W^MIC(iτ).
+            DO i_t = 1, n_t
+               fm_W_MIC_time(i_t)%local_data(i_row, i_col) = &
+                  fm_W_MIC_time(i_t)%local_data(i_row, i_col) + &
+                  SUM(bs_env%time_frequency_grid%cosine_frequency_to_time(i_t, :)*dW_freq)
+            END DO
+         END DO
+      END DO
+
+      CALL bs_env%para_env%max(max_head)
+      CALL bs_env%para_env%max(max_wing)
+      IF (bs_env%unit_nr > 0) THEN
+         WRITE (bs_env%unit_nr, '(T2,A)') 'Gamma-point correction (3D) diagnostics:'
+         WRITE (bs_env%unit_nr, '(T4,A,T62,2F10.3)') 'Head potential K_h(0)/Omega, w=1, w=n (eV)', &
+            K_h0(1)/gc%measure*27.211386_dp, K_h0(n_t)/gc%measure*27.211386_dp
+         WRITE (bs_env%unit_nr, '(T4,A,T62,2ES10.2)') 'max |head|, |wing| of DeltaW_PQ at w=1 (Ha)', &
+            max_head, max_wing
+         WRITE (bs_env%unit_nr, '(T4,A,T62,2F10.3)') 'Scale factors head, wing (diagnostic)', &
+            scale_head, scale_wing
+         WRITE (bs_env%unit_nr, '(T4,A,T62,ES10.2)') 'max |T_RI| (w=1)', MAXVAL(ABS(gc%T_RI(:, :, 1)))
+         WRITE (bs_env%unit_nr, '(T4,A,T62,ES10.2)') 'max |c_P|', MAXVAL(ABS(c))
+      END IF
+
+      DEALLOCATE (c, frac_atom, atom_of_RI, dW_freq, K_h_pair, K_w_pair, row_atom_list, &
+                  col_atom_list, row_atom_index, col_atom_index, K_h0, K_w0)
+      ! The correction is now inside W^MIC; its ingredients are dead.
+      DEALLOCATE (gc%head_coef, gc%wing_coef, gc%dir_hat, gc%dir_radius, gc%T_RI)
+
+      IF (bs_env%unit_nr > 0) THEN
+         WRITE (bs_env%unit_nr, '(T2,A,T62,F10.1,A)') &
+            'Gamma-point correction added to W^MIC_PQ(itau) in RI space, Exec. time', &
+            m_walltime() - start_time, ' s'
+         WRITE (bs_env%unit_nr, '(A)') ' '
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE gamma_corr_add_to_W_bulk
 
 END MODULE gw_gamma_correction

@@ -17,6 +17,7 @@ MODULE kpoint_coulomb_2c
                                               get_atomic_kind_set
    USE basis_set_types,                 ONLY: gto_basis_set_type
    USE cell_types,                      ONLY: cell_type,&
+                                              pbc,&
                                               get_cell,&
                                               pbc
    USE constants_operator,              ONLY: operator_coulomb
@@ -27,13 +28,19 @@ MODULE kpoint_coulomb_2c
    USE cp_dbcsr_contrib,                ONLY: dbcsr_reserve_all_blocks
    USE generic_shg_integrals,           ONLY: int_operators_r12_ab_shg
    USE generic_shg_integrals_init,      ONLY: contraction_matrix_shg
+   USE cp_fm_types,                     ONLY: cp_fm_get_info,&
+                                              cp_fm_type
    USE kinds,                           ONLY: dp
    USE kpoint_types,                    ONLY: get_kpoint_info,&
                                               kpoint_type
-   USE mathconstants,                   ONLY: gaussi,&
+   USE mathconstants,                   ONLY: fourpi,&
+                                              gaussi,&
+                                              pi,&
                                               twopi,&
                                               z_one
    USE message_passing,                 ONLY: mp_para_env_type
+   USE orbital_pointers,                ONLY: indco,&
+                                              ncoset
    USE particle_types,                  ONLY: particle_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
@@ -47,7 +54,13 @@ MODULE kpoint_coulomb_2c
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'kpoint_coulomb_2c'
 
-   PUBLIC :: build_2c_coulomb_matrix_kp, build_2c_coulomb_matrix_kp_small_cell
+   PUBLIC :: build_2c_coulomb_matrix_kp, build_2c_coulomb_matrix_kp_small_cell, &
+             add_ewald_reciprocal_fm, gaussian_basis_fourier
+
+   ! Reciprocal-space cutoff of the Ewald sum: exp(-G^2/(4 omega^2)) is kept down to
+   ! exp(-ewald_tail_exponent), with ewald_lmax_margin more e-folds per unit of angular momentum
+   ! for the polynomial prefactors of the Fourier-transformed Gaussians (as in cp2k#6447).
+   REAL(KIND=dp), PARAMETER, PRIVATE :: ewald_tail_exponent = 50.0_dp, ewald_lmax_margin = 4.0_dp
 
 ! **************************************************************************************************
 
@@ -70,9 +83,11 @@ CONTAINS
 !> \param operator_type ...
 !> \param ikp_start ...
 !> \param ikp_end ...
+!> \param omega range-separation parameter for the erf/erfc operators (operator_verf, operator_verfc)
 ! **************************************************************************************************
    SUBROUTINE build_2c_coulomb_matrix_kp(matrix_v_kp, kpoints, basis_type, cell, particle_set, qs_kind_set, &
-                                         atomic_kind_set, size_lattice_sum, operator_type, ikp_start, ikp_end)
+                                         atomic_kind_set, size_lattice_sum, operator_type, ikp_start, ikp_end, &
+                                         omega)
 
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_v_kp
       TYPE(kpoint_type), POINTER                         :: kpoints
@@ -83,6 +98,7 @@ CONTAINS
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       INTEGER                                            :: size_lattice_sum, operator_type, &
                                                             ikp_start, ikp_end
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: omega
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_2c_coulomb_matrix_kp'
 
@@ -95,7 +111,7 @@ CONTAINS
 
       CALL lattice_sum(matrix_v_kp, kpoints, basis_type, cell, particle_set, &
                        qs_kind_set, atomic_kind_set, size_lattice_sum, matrix_v_L_tmp, &
-                       operator_type, ikp_start, ikp_end)
+                       operator_type, ikp_start, ikp_end, omega)
 
       CALL deallocate_tmp(matrix_v_L_tmp)
 
@@ -120,7 +136,7 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE lattice_sum(matrix_v_kp, kpoints, basis_type, cell, particle_set, &
                           qs_kind_set, atomic_kind_set, size_lattice_sum, matrix_v_L_tmp, &
-                          operator_type, ikp_start, ikp_end)
+                          operator_type, ikp_start, ikp_end, omega)
 
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_v_kp
       TYPE(kpoint_type), POINTER                         :: kpoints
@@ -132,6 +148,7 @@ CONTAINS
       INTEGER                                            :: size_lattice_sum
       TYPE(dbcsr_type), POINTER                          :: matrix_v_L_tmp
       INTEGER                                            :: operator_type, ikp_start, ikp_end
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: omega
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'lattice_sum'
 
@@ -177,7 +194,7 @@ CONTAINS
                         ! Compute (P 0 | Q vec_L) and store it in matrix_v_L_tmp
                         CALL compute_v_transl(matrix_v_L_tmp, blocks_v_L, vec_L, particle_set, &
                                               qs_kind_set, atomic_kind_set, basis_type, cell, &
-                                              operator_type)
+                                              operator_type, omega)
 
 !$OMP PARALLEL DO DEFAULT(NONE) &
 !$OMP             SHARED(blocks_v_L, blocks_v_L_store) &
@@ -297,7 +314,7 @@ CONTAINS
 !> \param operator_type ...
 ! **************************************************************************************************
    SUBROUTINE compute_v_transl(matrix_v_L_tmp, blocks_v_L, vec_L, particle_set, &
-                               qs_kind_set, atomic_kind_set, basis_type, cell, operator_type)
+                               qs_kind_set, atomic_kind_set, basis_type, cell, operator_type, omega)
 
       TYPE(dbcsr_type), POINTER                          :: matrix_v_L_tmp
       TYPE(two_d_util_type), ALLOCATABLE, DIMENSION(:)   :: blocks_v_L
@@ -308,6 +325,7 @@ CONTAINS
       CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
       TYPE(cell_type), POINTER                           :: cell
       INTEGER                                            :: operator_type
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: omega
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_v_transl'
 
@@ -353,7 +371,7 @@ CONTAINS
 
          CALL int_operators_r12_ab_shg(operator_type, blocks_v_L(i_block)%block, rab=rab_L, &
                                        fba=basis_set_a, fbb=basis_set_b, scona_shg=contr_a, sconb_shg=contr_b, &
-                                       calculate_forces=.FALSE.)
+                                       omega=omega, calculate_forces=.FALSE.)
 
          i_block = i_block + 1
 
@@ -948,5 +966,253 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE add_V_L
+
+! **************************************************************************************************
+!> \brief Adds the reciprocal-space part of the Ewald sum for the 3D periodic Coulomb matrix at
+!>        q = 0 to a distributed full matrix, with the G = 0 Fourier coefficient of 1/r omitted:
+!>
+!>          V_PQ(0) <- V_PQ(0) + (4π/Ω) Σ_{G≠0} exp(−G²/4ω²)/G² ρ_P(G) ρ_Q(G)* − π/(Ω ω²) ρ_P(0) ρ_Q(0)
+!>
+!>        with ρ_P(G) = ∫dr ϕ_P(r) exp(iG·r) (gaussian_basis_fourier). If the matrix holds the
+!>        real-space lattice sum Σ_L (P0|erfc(ωr)/r|QL) on entry, it holds the periodic Coulomb
+!>        matrix "with the singular G = 0 term omitted" on exit: 1/r = erfc(ωr)/r + erf(ωr)/r, the
+!>        erf part has the Fourier transform (4π/G²) exp(−G²/4ω²) = 4π/G² − π/ω² + O(G²), and
+!>        dropping its 4π/G² singularity leaves −π/ω² at G = 0 (same construction as the 3D
+!>        Γ-point Coulomb matrix of cp2k#6447, there on a replicated matrix). The result is
+!>        independent of ω, which is a check on both halves.
+!>
+!>        Every rank adds the sum over ALL G to its own local block, from ρ(G) evaluated for the
+!>        atoms that own one of its local rows or columns only: no replicated n_bf x n_bf array and
+!>        no communication. Σ_G over ±G makes the sum real, so Re(ρ_P ρ_Q*) is accumulated per G.
+!> \param fm_V distributed n_bf x n_bf matrix of the basis `basis_type`, updated in place
+!> \param qs_env QS environment, for cell, particles and the basis
+!> \param basis_type basis of the matrix, e.g. "RI_AUX"
+!> \param omega Ewald splitting parameter (1/bohr)
+!> \param n_wave number of reciprocal lattice vectors inside the cutoff (diagnostic)
+! **************************************************************************************************
+   SUBROUTINE add_ewald_reciprocal_fm(fm_V, qs_env, basis_type, omega, n_wave)
+      TYPE(cp_fm_type), INTENT(IN)                       :: fm_V
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
+      REAL(KIND=dp), INTENT(IN)                          :: omega
+      INTEGER, INTENT(OUT)                               :: n_wave
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'add_ewald_reciprocal_fm'
+      INTEGER, PARAMETER                                 :: n_block = 128
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: fourier
+      INTEGER                                            :: handle, i_atom, i_col, i_g, i_row, &
+                                                            idim, ix, iy, iz, n_atom, n_bf, &
+                                                            n_col, ncol_local, nrow_local
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bf_end, bf_start
+      INTEGER, DIMENSION(3)                              :: bounds
+      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
+      LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: atom_needed
+      REAL(KIND=dp)                                      :: cutoff, p2
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: prefactor
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: cols_ri, p_batch, rows_ri
+      REAL(KIND=dp), DIMENSION(3, 3)                     :: reciprocal
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particles
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kinds
+
+      CALL timeset(routineN, handle)
+
+      NULLIFY (cell, particles, qs_kinds)
+      CALL get_qs_env(qs_env, cell=cell, particle_set=particles, qs_kind_set=qs_kinds)
+      CPASSERT(COUNT(cell%perd /= 0) == 3)
+      CALL get_basis_sizes(qs_env, n_atom, basis_type, bf_start, bf_end, n_bf)
+      CALL cp_fm_get_info(fm_V, nrow_local=nrow_local, ncol_local=ncol_local, &
+                          row_indices=row_indices, col_indices=col_indices)
+
+      ! Only the atoms carrying a local row or column need their ρ(G).
+      ALLOCATE (atom_needed(n_atom))
+      atom_needed(:) = .FALSE.
+      DO i_atom = 1, n_atom
+         IF (ANY(row_indices(1:nrow_local) >= bf_start(i_atom) .AND. &
+                 row_indices(1:nrow_local) <= bf_end(i_atom))) atom_needed(i_atom) = .TRUE.
+         IF (ANY(col_indices(1:ncol_local) >= bf_start(i_atom) .AND. &
+                 col_indices(1:ncol_local) <= bf_end(i_atom))) atom_needed(i_atom) = .TRUE.
+      END DO
+
+      ! b_i = 2π (h⁻¹)ᵀ columns; |G| ≤ cutoff with |n_i| ≤ cutoff |a_i|/2π from n_i = G·a_i/2π.
+      reciprocal = twopi*TRANSPOSE(cell%h_inv)
+      cutoff = 2.0_dp*omega*SQRT(ewald_tail_exponent + ewald_lmax_margin*basis_lmax(qs_kinds, basis_type))
+      DO idim = 1, 3
+         bounds(idim) = CEILING(cutoff*NORM2(cell%hmat(:, idim))/twopi)
+      END DO
+
+      ! Batches of n_block wave vectors: ρ(G) for all needed basis functions, then the local
+      ! rank-2n_block update  V_loc += [Re ρ_rows, Im ρ_rows] diag(w) [Re ρ_cols, Im ρ_cols]ᵀ.
+      ALLOCATE (fourier(n_bf, n_block), p_batch(3, n_block), prefactor(n_block))
+      ALLOCATE (rows_ri(nrow_local, 2*n_block), cols_ri(ncol_local, 2*n_block))
+      n_wave = 0
+      n_col = 0
+      DO ix = -bounds(1), bounds(1)
+         DO iy = -bounds(2), bounds(2)
+            DO iz = -bounds(3), bounds(3)
+               p_batch(:, n_col + 1) = MATMUL(reciprocal, REAL([ix, iy, iz], dp))
+               p2 = SUM(p_batch(:, n_col + 1)**2)
+               IF (p2 > cutoff**2) CYCLE
+               n_col = n_col + 1
+               n_wave = n_wave + 1
+               IF (p2 <= 0.0_dp) THEN
+                  ! G = 0: the finite remainder −π/(Ω ω²) of the erf part, its 4π/G² omitted.
+                  prefactor(n_col) = -pi/(cell%deth*omega**2)
+               ELSE
+                  ! G ≠ 0: (4π/Ω) exp(−G²/4ω²)/G².
+                  prefactor(n_col) = fourpi*EXP(-p2/(4.0_dp*omega**2))/(cell%deth*p2)
+               END IF
+               IF (n_col == n_block) THEN
+                  CALL ewald_flush_batch(n_col)
+                  n_col = 0
+               END IF
+            END DO
+         END DO
+      END DO
+      IF (n_col > 0) CALL ewald_flush_batch(n_col)
+
+      DEALLOCATE (fourier, p_batch, prefactor, rows_ri, cols_ri, atom_needed, bf_start, bf_end)
+
+      CALL timestop(handle)
+
+   CONTAINS
+
+! **************************************************************************************************
+!> \brief ρ(G) of the batch for the needed atoms and the local update of fm_V with it.
+!> \param n number of wave vectors in the batch
+! **************************************************************************************************
+      SUBROUTINE ewald_flush_batch(n)
+         INTEGER, INTENT(IN)                                :: n
+
+         INTEGER                                            :: i, j
+
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(n, p_batch, particles, qs_kinds, cell, basis_type, bf_start, &
+!$OMP                                  bf_end, fourier, atom_needed) PRIVATE(i)
+         DO i = 1, n
+            CALL gaussian_basis_fourier(p_batch(:, i), particles, qs_kinds, cell, basis_type, &
+                                        bf_start, bf_end, fourier(:, i), atom_mask=atom_needed)
+         END DO
+!$OMP END PARALLEL DO
+         ! rows_ri(:, i) = w_i Re ρ_row(G_i), rows_ri(:, n + i) = w_i Im ρ_row(G_i); cols without w.
+         DO i = 1, n
+            DO j = 1, nrow_local
+               rows_ri(j, i) = prefactor(i)*REAL(fourier(row_indices(j), i), dp)
+               rows_ri(j, n + i) = prefactor(i)*AIMAG(fourier(row_indices(j), i))
+            END DO
+            DO j = 1, ncol_local
+               cols_ri(j, i) = REAL(fourier(col_indices(j), i), dp)
+               cols_ri(j, n + i) = AIMAG(fourier(col_indices(j), i))
+            END DO
+         END DO
+         ! Re(ρ_P ρ_Q*) = Re ρ_P Re ρ_Q + Im ρ_P Im ρ_Q, accumulated into the local block.
+         IF (nrow_local > 0 .AND. ncol_local > 0) THEN
+            CALL dgemm('N', 'T', nrow_local, ncol_local, 2*n, 1.0_dp, rows_ri, nrow_local, &
+                       cols_ri, ncol_local, 1.0_dp, fm_V%local_data, SIZE(fm_V%local_data, 1))
+         END IF
+
+      END SUBROUTINE ewald_flush_batch
+
+   END SUBROUTINE add_ewald_reciprocal_fm
+
+! **************************************************************************************************
+!> \brief Largest angular momentum of a basis type over all kinds.
+!> \param qs_kinds ...
+!> \param basis_type ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION basis_lmax(qs_kinds, basis_type) RESULT(lmax)
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kinds
+      CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
+      INTEGER                                            :: lmax
+
+      INTEGER                                            :: ikind
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+
+      lmax = 0
+      DO ikind = 1, SIZE(qs_kinds)
+         CALL get_qs_kind(qs_kinds(ikind), basis_set=basis, basis_type=basis_type)
+         lmax = MAX(lmax, MAXVAL(basis%lmax))
+      END DO
+   END FUNCTION basis_lmax
+
+! **************************************************************************************************
+!> \brief Fourier transform ρ_P(p) = ∫dr ϕ_P(r) exp(ip·r) of every contracted spherical basis
+!>        function of one basis type (ported from cp2k#6447).
+!>
+!>        For a Cartesian primitive x^i y^j z^k exp(−α|r − R|²) the integral factorizes into the
+!>        one-dimensional moments m_l(p_x) = ∫dx x^l exp(−αx²) exp(ip_x x), with
+!>          m_0 = √(π/α) exp(−p²/4α),  m_1 = ip m_0/(2α),  m_l = (ip m_{l−1} + (l−1) m_{l−2})/(2α),
+!>        times the centre phase exp(ip·R); the contraction matrix sphi carries the primitives to
+!>        the spherical functions. At p = 0 this is the charge ∫ϕ_P.
+!> \param p wave vector (1/bohr)
+!> \param particles ...
+!> \param qs_kinds ...
+!> \param cell ...
+!> \param basis_type ...
+!> \param bf_start first basis function of every atom
+!> \param bf_end last basis function of every atom
+!> \param values ρ_P(p), one entry per basis function
+!> \param atom_mask if present, atoms with .FALSE. are skipped (their values are left zero)
+! **************************************************************************************************
+   SUBROUTINE gaussian_basis_fourier(p, particles, qs_kinds, cell, basis_type, &
+                                     bf_start, bf_end, values, atom_mask)
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: p
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particles
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kinds
+      TYPE(cell_type), POINTER                           :: cell
+      CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: bf_start, bf_end
+      COMPLEX(KIND=dp), DIMENSION(:), INTENT(OUT)        :: values
+      LOGICAL, DIMENSION(:), INTENT(IN), OPTIONAL        :: atom_mask
+
+      COMPLEX(KIND=dp)                                   :: phase
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)        :: primitive
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: moments
+      INTEGER                                            :: iatom, ico, idim, ikind, il, ipgf, iset, &
+                                                            isgf, lmax, ncart, offset
+      REAL(KIND=dp)                                      :: alpha
+      REAL(KIND=dp), DIMENSION(3)                        :: centre
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+
+      values = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      DO iatom = 1, SIZE(particles)
+         IF (PRESENT(atom_mask)) THEN
+            IF (.NOT. atom_mask(iatom)) CYCLE
+         END IF
+         ikind = particles(iatom)%atomic_kind%kind_number
+         CALL get_qs_kind(qs_kinds(ikind), basis_set=basis, basis_type=basis_type)
+         centre = pbc(particles(iatom)%r, cell)
+         phase = EXP(gaussi*SUM(p*centre))
+         CPASSERT(bf_end(iatom) - bf_start(iatom) + 1 == basis%nsgf)
+         DO iset = 1, basis%nset
+            lmax = basis%lmax(iset)
+            ncart = ncoset(lmax)
+            ALLOCATE (moments(0:lmax, 3), primitive(ncart*basis%npgf(iset)))
+            primitive = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+            DO ipgf = 1, basis%npgf(iset)
+               alpha = basis%zet(ipgf, iset)
+               DO idim = 1, 3
+                  moments(0, idim) = SQRT(pi/alpha)*EXP(-p(idim)**2/(4.0_dp*alpha))
+                  IF (lmax > 0) moments(1, idim) = gaussi*p(idim)*moments(0, idim)/(2.0_dp*alpha)
+                  DO il = 2, lmax
+                     moments(il, idim) = (gaussi*p(idim)*moments(il - 1, idim) + &
+                                          REAL(il - 1, dp)*moments(il - 2, idim))/(2.0_dp*alpha)
+                  END DO
+               END DO
+               DO ico = ncoset(basis%lmin(iset) - 1) + 1, ncart
+                  primitive((ipgf - 1)*ncart + ico) = &
+                     moments(indco(1, ico), 1)*moments(indco(2, ico), 2)*moments(indco(3, ico), 3)
+               END DO
+            END DO
+            offset = basis%first_sgf(1, iset)
+            DO isgf = offset, offset + basis%nsgf_set(iset) - 1
+               values(bf_start(iatom) + isgf - 1) = &
+                  phase*SUM(basis%sphi(1:SIZE(primitive), isgf)*primitive)
+            END DO
+            DEALLOCATE (moments, primitive)
+         END DO
+      END DO
+   END SUBROUTINE gaussian_basis_fourier
 
 END MODULE kpoint_coulomb_2c

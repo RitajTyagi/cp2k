@@ -323,7 +323,6 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       CALL section_vals_val_get(ri_rs_sec, "TIKHONOV", r_val=ri_rs%tikhonov)
-      CALL section_vals_val_get(ri_rs_sec, "GAMMA_CORR_DENSE_ALGEBRA", i_val=ri_rs%gamma_corr_dense)
       CALL section_vals_val_get(ri_rs_sec, "GRID_SELECT", i_val=ri_rs%grid_select)
       CALL section_vals_val_get(ri_rs_sec, "CUTOFF_RADIUS_RL_AO", r_val=ri_rs%cutoff_radius_ri_ao)
       CALL section_vals_val_get(ri_rs_sec, "CUTOFF_RADIUS_RL_W", r_val=ri_rs%cutoff_radius_v_w)
@@ -986,13 +985,15 @@ CONTAINS
             END SELECT
          END DO
 
-         ! Gamma-only RI-RS for a 2D slab (KPOINTS_W 1 1 1): no extrapolation mesh. W is then
-         ! W(Gamma) plus the analytic head-and-wing integral over the whole small Brillouin zone
-         ! (gw_gamma_correction). With the extrapolation mesh kept, Gamma would enter the s-s
-         ! elements of W with weight 1/(1 - sqrt(2)) = -2.414 and all other elements with weight
-         ! zero, i.e. it would be a 2x2 calculation with a sign-flipped, amplified Gamma term.
+         ! Gamma-only RI-RS for a 2D slab or a 3D bulk cell (KPOINTS_W 1 1 1): no extrapolation
+         ! mesh. W is then W(Gamma) plus the analytic head-and-wing integral over the whole small
+         ! Brillouin zone (gw_gamma_correction). With the extrapolation mesh kept, Gamma would
+         ! enter the s-s elements of W with weight 1/(1 - sqrt(2)) = -2.414 and all other
+         ! elements with weight zero, i.e. it would be a 2x2 calculation with a sign-flipped,
+         ! amplified Gamma term.
          IF (bs_env%gw_implementation == ri_rs_large_cell_Gamma .AND. &
-             ALL(periodic == [1, 1, 0]) .AND. ALL(nkp_grid == 1)) THEN
+             (ALL(periodic == [1, 1, 0]) .OR. ALL(periodic == [1, 1, 1])) .AND. &
+             ALL(nkp_grid == 1)) THEN
             nkp_grid_extra(1:3) = 1
          END IF
 

@@ -111,11 +111,9 @@ CONTAINS
                                          periodic_images=bs_env%do_periodic)
          CALL print_matrix_occupation(bs_env%ri_rs%mat_phi_mu_l, 'ϕ_μ(r_l)', &
                                       bs_env%para_env, bs_env%unit_nr, bs_env%dbcsr_msg_elem_limit)
-         ! Decide on the Gamma-point correction of W before fitting, because when it applies the
-         ! fit carries one extra right-hand side: the grid representation of the constant
-         ! function, which the correction needs for the separated charge channel.
-         ! Sets bs_env%ri_rs%gamma_corr%enabled (PERIODIC XY with a 1x1x1 W mesh) and, if so,
-         ! the layer area, the in-plane reciprocal vectors and the RI-metric head.
+         ! Decide on the Gamma-point correction of W. Sets bs_env%ri_rs%gamma_corr%enabled
+         ! (PERIODIC XY or XYZ with a 1x1x1 W mesh) and, if so, the cell measure (layer area or
+         ! volume), the reciprocal vectors, the RI-metric head and the dense-algebra path.
          CALL gamma_corr_init(bs_env)
          ! Fit Z_lP using the integration domains and RI basis described in compute_Z_lP below.
          CALL compute_Z_lP(qs_env, bs_env, bs_env%ri_rs%grid_points, &

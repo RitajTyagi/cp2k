@@ -403,9 +403,10 @@ CONTAINS
 
       END IF
 
-      ! With the Gamma-point correction active the mesh is Gamma only and the identical V(q=0)
-      ! lattice sum was already done by gamma_corr_coulomb_at_zero: reuse it (same operator,
-      ! same image box, same basis) instead of summing the images a second time.
+      ! With the Gamma-point correction active the mesh is Gamma only and V(q=0) was already
+      ! built by gamma_corr_coulomb_at_zero (2D: the identical lattice sum, same operator, same
+      ! image box, same basis; 3D: the Ewald sum without its G = 0 term, which the regular path
+      ! must use as well): reuse it instead of summing the images a second time.
       use_cached_V = bs_env%ri_rs%gamma_corr%enabled .AND. bs_env%ri_rs%gamma_corr%V_zero_cached
       IF (use_cached_V) THEN
          CPASSERT(ikp_start == 1 .AND. ikp_end == 1)
@@ -446,18 +447,21 @@ CONTAINS
                                              fm_V_kp_work%local_data, KIND=dp)
          END IF
 
-         ! V(0) <- V(0) - D_box c c^T when the Gamma-point correction is active: the mesh is then
-         ! Gamma only, and at q = 0 the charged lattice sum carries a constant that grows with the
-         ! summation range. Only that constant goes; the head and wings DeltaW adds back are its
-         ! analytic replacement. NOT the projector Pi V Pi, which would also delete the finite
+         ! V(0) <- V(0) - D_box c c^T when the 2D Gamma-point correction is active: the mesh is
+         ! then Gamma only, and at q = 0 the charged lattice sum carries a constant that grows with
+         ! the summation range. Only that constant goes; the head and wings DeltaW adds back are
+         ! its analytic replacement. NOT the projector Pi V Pi, which would also delete the finite
          ! G /= 0 interactions of the charged direction.
          ! With the correction enabled the W mesh is Gamma only, so every ikp here must be q = 0;
          ! the assertion guards against subtracting the q = 0 constant at a finite q. The charge
          ! vector it needs was built in step 4b (gamma_corr_build_coulomb_maps), which runs
          ! before get_W_MIC reaches this routine.
+         ! 3D: nothing to subtract; the cached V(0) is the Ewald sum without its G = 0 term
+         ! (gamma_corr_coulomb_at_zero), which is exactly the body the head-and-wing model needs.
          IF (bs_env%ri_rs%gamma_corr%enabled) THEN
             CPASSERT(ALL(ABS(bs_env%kpoints_chi_eps_W%xkp(:, ikp)) < 1.0E-12_dp))
-            CALL gamma_corr_subtract_divergent_head(bs_env, cfm_V_kp(ikp))
+            IF (bs_env%ri_rs%gamma_corr%slab) &
+               CALL gamma_corr_subtract_divergent_head(bs_env, cfm_V_kp(ikp))
          END IF
       END DO
       CALL cp_fm_release(fm_V_kp_work)

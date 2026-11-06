@@ -84,13 +84,14 @@ CONTAINS
       CALL get_mat_chi_Gamma_tau(bs_env, bs_env%mat_chi_Gamma_tau, cutoff=0.0_dp)
 
        !!========================================================================
-       !! 4b. Gamma-point head-and-wing correction of W (2D slabs whose k-mesh for χ, ε, W
-       !!     contains q = 0, where the real-space Coulomb lattice sum over charged auxiliary
-       !!     functions diverges).
-       !!     c_P, Π = Id - c cᵀ, V_b = Π V(0) Π           -- separate the charge channel
+       !! 4b. Gamma-point head-and-wing correction of W (2D slabs and 3D bulk cells whose k-mesh
+       !!     for χ, ε, W contains q = 0, where the Coulomb operator between charged auxiliary
+       !!     functions is singular).
+       !!     2D: c_P, Π = Id - c cᵀ, V_b = Π V(0) Π       -- separate the charge channel
+       !!     3D: V(0) = Ewald sum without its G = 0 term  -- finite, no projector
        !!     Y_αβ(iτ), X_lα(iτ)                           -- optical head and Cartesian wings
        !!     B_PQ = δ_PQ + F_densityᵀ χ_PQ(Γ) F_density   -- the regular body, reused as is
-       !!     S_αβ = Y - Eᵀ B⁻¹ E,  T^w_lα                 -- block inversion in closed form
+       !!     S_αβ = Y - Eᵀ B⁻¹ E,  T_Pα                   -- block inversion in closed form
        !!     K_h(R), K_w(R)                               -- Brillouin-zone cell integrals
        !!     ΔW^c_PQ(iτ) is then added to W^MIC_PQ(iτ) in RI space inside get_W_MIC (atom-pair
        !!     minimum-image cell integrals, gamma_corr_add_to_W), before M⁻¹ W M⁻¹.
@@ -98,13 +99,15 @@ CONTAINS
        !!========================================================================
       IF (bs_env%ri_rs%gamma_corr%enabled) THEN
          ! c, Pi, V_b^(+-1/2) and the maps F_density = M^-1 Pi V_b^(1/2),
-         ! F_extern = M^-1 V(0) Pi V_b^(-1/2) (gwp42 Eqs. 63-67), all replicated n_RI x n_RI.
+         ! G_extern = V(0) Pi V_b^(-1/2) (gwp42 Eqs. 63-67; Pi = 1 in 3D), replicated or
+         ! distributed depending on the memory estimate.
          CALL gamma_corr_build_coulomb_maps(qs_env, bs_env)
-         ! Head S_ab(i omega) and grid wing map T^w_la(i omega) from the velocity-gauge dipoles
+         ! Head S_ab(i omega) and RI wing vector T_Pa(i omega) from the velocity-gauge dipoles
          ! and chi_PQ(Gamma, i tau) (gwp42 Eqs. 48-49, 71-74).
          CALL gamma_corr_response(bs_env, qs_env, bs_env%mat_chi_Gamma_tau)
-         ! Cell integrals K_h(R, i omega), K_w(R, i omega) on a 128 x 128 mesh of in-plane
-         ! minimum-image displacements; interpolated at atom-pair separations in get_W_MIC.
+         ! 2D: cell integrals K_h(R, i omega), K_w(R, i omega) on a 128 x 128 mesh of in-plane
+         ! minimum-image displacements, interpolated at atom-pair separations in get_W_MIC.
+         ! 3D: per-direction coefficients of the analytic cell integrals (n_tab unused).
          CALL gamma_corr_tabulate(bs_env, n_tab=128)
          ! From here on get_W_MIC may add DeltaW to W^MIC (gamma_corr_add_to_W asserts this).
          bs_env%ri_rs%gamma_corr%ready = .TRUE.

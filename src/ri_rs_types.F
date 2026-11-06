@@ -32,35 +32,47 @@ MODULE ri_rs_types
       REAL(KIND=dp), ALLOCATABLE :: raw_points(:, :)
    END TYPE rirs_grid_type
 
-   ! State of the Gamma-point head-and-wing correction of W for a Gamma-only 2D slab.
+   ! State of the Gamma-point head-and-wing correction of W for a Gamma-only 2D slab or 3D bulk
+   ! cell.
    !
-   ! At q = 0 the real-space Coulomb lattice sum over two CHARGED auxiliary functions diverges
-   ! with the summation range, so the charge channel is split off and carried analytically:
+   ! At q = 0 the Coulomb operator between two CHARGED auxiliary functions is singular, so the
+   ! charge channel is split off and carried analytically:
    !
    !   c_P    = integral dr phi_P0(r)                              (auxiliary charge)
-   !   Pi_PQ  = delta_PQ - c_P c_Q / sum_S |c_S|^2                 (neutral projector)
-   !   V_b    = Pi V(0) Pi                                         (neutral body, converges as R^-3)
-   !   phi_0  = 1/sqrt(A), v(q) = 2 pi / q                         (the separated charge mode)
+   !   2D:  Pi_PQ = delta_PQ - c_P c_Q / sum_S |c_S|^2             (neutral projector)
+   !        V_b   = Pi V(0) Pi                                     (neutral body, converges as R^-3)
+   !        phi_0 = 1/sqrt(A), v(q) = 2 pi / q                     (the separated charge mode)
+   !   3D:  V(0)  = Ewald sum with the G = 0 Fourier coefficient of 1/r omitted (finite in the
+   !        charge channel, no projector), phi_0 = 1/sqrt(Omega), v(q) = 4 pi / q^2
    !
    ! and the head/wing of eps in that extended basis is integrated over the whole small
-   ! Brillouin zone of the supercell instead of being sampled. See GAMMA_W_CORRECTION_PLAN.md.
+   ! Brillouin zone of the supercell instead of being sampled. See GAMMA_W_CORRECTION_PLAN.md
+   ! and large_cell_gamma/GAMMA_CORRECTION_3D_PLAN.md.
    TYPE gamma_corr_type
-      ! enabled: set by gamma_corr_init (PERIODIC XY and KPOINTS_W 1 1 1); every call site of
-      !          the correction tests it.
+      ! enabled: set by gamma_corr_init (PERIODIC XY or XYZ with KPOINTS_W 1 1 1); every call
+      !          site of the correction tests it.
+      ! slab:    PERIODIC XY (2D head 2 pi/q, tabulated in-plane kernels) when .TRUE.,
+      !          PERIODIC XYZ (3D head 4 pi/q^2, kernels per atom pair) when .FALSE.
       ! ready:   set once step 4b of the Gamma-only driver has built the maps, T_RI
       !          and the tables; the Sigma^c loop asserts it before adding DeltaW.
       ! reported_projection: the V(0) - D_box c c^T summary has been printed (print once).
       LOGICAL                                          :: enabled = .FALSE.
+      LOGICAL                                          :: slab = .TRUE.
       LOGICAL                                          :: ready = .FALSE.
       ! distributed: the dense n_RI x n_RI algebra (maps, dielectric body) runs on cp_fm /
       !          ScaLAPACK matrices instead of replicated LAPACK arrays (gamma_corr_init decides
-      !          from GAMMA_CORR_DENSE_ALGEBRA and the memory estimate).
+      !          from the memory estimate).
       LOGICAL                                          :: distributed = .FALSE.
       LOGICAL                                          :: reported_projection = .FALSE.
-      ! Layer area A = |a_1 x a_2| and the two in-plane reciprocal vectors b_1, b_2.
-      ! Units: bohr^2 and 1/bohr; b_recip(1:3, i) is b_i in Cartesian components.
-      REAL(KIND=dp)                                    :: area = 0.0_dp
-      REAL(KIND=dp), DIMENSION(3, 2)                   :: b_recip = 0.0_dp
+      ! measure: the layer area A = |a_1 x a_2| (bohr^2, 2D) or the cell volume Omega (bohr^3,
+      ! 3D); every 1/A of the slab formulas is 1/Omega in the bulk ones.
+      ! b_recip(1:3, i) is the reciprocal vector b_i in Cartesian components (1/bohr): the two
+      ! in-plane ones for a slab (third column zero), all three for a bulk cell.
+      REAL(KIND=dp)                                    :: measure = 0.0_dp
+      REAL(KIND=dp), DIMENSION(3, 3)                   :: b_recip = 0.0_dp
+      ! ewald_omega: splitting parameter of the 3D Ewald sum that builds V(0) (1/bohr); chosen
+      ! from the image box of the real-space erfc sum by gamma_corr_coulomb_at_zero.
+      REAL(KIND=dp)                                    :: ewald_omega = 0.0_dp
       ! Zero-wavevector Fourier value of the RI metric kernel: pi/omega^2 (erfc) or
       ! 2 pi r_c^2 (truncated Coulomb). The charge-channel right-hand side is scaled by it so
       ! that the fixed Tikhonov parameter regularizes it on the same footing as the Gaussian
@@ -98,6 +110,16 @@ MODULE ri_rs_types
       ! n_tab: table points along a_1 and a_2; i_R = 1 + i_u + n_tab(1) i_v over [-1/2, 1/2]^2.
       INTEGER, DIMENSION(2)                            :: n_tab = 0
       REAL(KIND=dp), ALLOCATABLE                       :: K_head(:, :), K_wing(:, :, :)
+      ! 3D bulk cells (slab = .FALSE.): the screening denominator 1 + 4 pi a(q_hat, i_w) is
+      ! independent of |q|, so the radial integrals are analytic and no table is needed. The
+      ! six-face cubature of the BZ cell (gamma_corr_bz_faces) gives the directions q_hat
+      ! (dir_hat(3, n_dir)) and the radius to the cell boundary (dir_radius(n_dir)); per
+      ! direction and frequency, head_coef(n_dir, n_w) and wing_coef(n_dir, n_w) are the
+      ! angular weight times the head/wing prefactor (gamma_corr_direction_coefficients).
+      ! gamma_corr_add_to_W_bulk contracts them with sin(L t)/t and (sin(L t) - L t cos(L t))/t^2,
+      ! t = q_hat . R, at the minimum-image separation of every local atom pair.
+      REAL(KIND=dp), ALLOCATABLE                       :: dir_hat(:, :), dir_radius(:)
+      REAL(KIND=dp), ALLOCATABLE                       :: head_coef(:, :), wing_coef(:, :)
    END TYPE gamma_corr_type
 
    ! User input for the in-memory RI-RS grid optimization.
@@ -113,8 +135,6 @@ MODULE ri_rs_types
       ! Input parameters for RI-RS
       INTEGER                                          :: grid_select = 1
       REAL(KIND=dp)                                    :: tikhonov = 1.0E-08_dp
-      ! GAMMA_CORR_DENSE_ALGEBRA: 0 auto, 1 replicated LAPACK, 2 distributed ScaLAPACK.
-      INTEGER                                          :: gamma_corr_dense = 0
       REAL(KIND=dp)                                    :: cutoff_radius_ri_ao = -1.0_dp
       REAL(KIND=dp)                                    :: cutoff_radius_v_w = -1.0_dp
       TYPE(ri_rs_grid_opt_type)                        :: grid_opt = ri_rs_grid_opt_type()
@@ -172,7 +192,8 @@ MODULE ri_rs_types
       LOGICAL                                          :: V_grid_built = .FALSE.
       LOGICAL                                          :: W0_grid_built = .FALSE.
 
-      ! Gamma-point head-and-wing correction of W (Gamma-only 2D slabs); see gamma_corr_type.
+      ! Gamma-point head-and-wing correction of W (Gamma-only 2D slabs and 3D bulk cells); see
+      ! gamma_corr_type.
       TYPE(gamma_corr_type)                            :: gamma_corr = gamma_corr_type()
 
    END TYPE ri_rs_env
@@ -233,6 +254,10 @@ CONTAINS
       IF (ALLOCATED(ri_rs%gamma_corr%S_head)) DEALLOCATE (ri_rs%gamma_corr%S_head)
       IF (ALLOCATED(ri_rs%gamma_corr%K_head)) DEALLOCATE (ri_rs%gamma_corr%K_head)
       IF (ALLOCATED(ri_rs%gamma_corr%K_wing)) DEALLOCATE (ri_rs%gamma_corr%K_wing)
+      IF (ALLOCATED(ri_rs%gamma_corr%dir_hat)) DEALLOCATE (ri_rs%gamma_corr%dir_hat)
+      IF (ALLOCATED(ri_rs%gamma_corr%dir_radius)) DEALLOCATE (ri_rs%gamma_corr%dir_radius)
+      IF (ALLOCATED(ri_rs%gamma_corr%head_coef)) DEALLOCATE (ri_rs%gamma_corr%head_coef)
+      IF (ALLOCATED(ri_rs%gamma_corr%wing_coef)) DEALLOCATE (ri_rs%gamma_corr%wing_coef)
       ri_rs%gamma_corr%ready = .FALSE.
 
       CALL timestop(handle)
