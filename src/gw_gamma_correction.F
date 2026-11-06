@@ -2831,6 +2831,18 @@ CONTAINS
       CALL gamma_corr_kernel_bulk(gc, n_t, [0.0_dp, 0.0_dp, 0.0_dp], K_h0, K_w0)
       max_head = 0.0_dp
       max_wing = 0.0_dp
+      ! TEMPORARY DIAGNOSTIC: GAMMA_CORR_HEAD_UNIFORM=1 replaces K_h(R_PQ) by K_h(0) for every
+      ! pair, i.e. a rank-one uniform potential w c c^T that is an exact linear functional.
+      CALL GET_ENVIRONMENT_VARIABLE('GAMMA_CORR_HEAD_UNIFORM', env_val, env_len, env_stat)
+      IF (env_stat == 0 .AND. env_len > 0) THEN
+         IF (env_val(1:1) == '1') THEN
+            DO i_pair = 1, n_pair
+               K_h_pair(:, MODULO(i_pair - 1, n_ra) + 1, (i_pair - 1)/n_ra + 1) = K_h0
+            END DO
+            IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(T2,A)') &
+               'DIAGNOSTIC: head kernel replaced by its R = 0 value for all pairs'
+         END IF
+      END IF
 
       ALLOCATE (dW_freq(n_t))
       DO i_col = 1, ncol_local
