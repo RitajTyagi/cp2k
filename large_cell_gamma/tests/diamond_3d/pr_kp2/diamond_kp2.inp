@@ -1,0 +1,92 @@
+! Reference: primitive 2-atom diamond, full-k RI-RS GW of cp2k PR 6447 (no supercell).
+! SCF mesh = W mesh = 2x2x2; path points Gamma, L = b1/2, X = (b1+b2)/2 are the points a
+! 2x2x2 supercell folds onto its Gamma point.
+&GLOBAL
+  RUN_TYPE     ENERGY
+  PROJECT      diamond_kp2
+  PRINT_LEVEL  MEDIUM
+&END GLOBAL
+&FORCE_EVAL
+  METHOD QS
+  &DFT
+    BASIS_SET_FILE_NAME  BASIS_MOLOPT
+    BASIS_SET_FILE_NAME  BASIS_RI_MOLOPT
+    POTENTIAL_FILE_NAME  POTENTIAL
+    SORT_BASIS EXP
+    &KPOINTS
+      SCHEME MONKHORST-PACK 2 2 2
+    &END KPOINTS
+    &MGRID
+      CUTOFF 400
+      REL_CUTOFF 50
+    &END MGRID
+    &QS
+      METHOD GPW
+      EPS_DEFAULT 1.0E-12
+      EPS_PGF_ORB 1.0E-8
+    &END QS
+    &SCF
+      SCF_GUESS ATOMIC
+      ADDED_MOS -1
+      EPS_SCF 1.0E-7
+      MAX_SCF 100
+      &MIXING
+        METHOD BROYDEN_MIXING
+        ALPHA 0.4
+        NBROYDEN 4
+      &END MIXING
+    &END SCF
+    &XC
+      &XC_FUNCTIONAL PBE
+      &END XC_FUNCTIONAL
+    &END XC
+    &POISSON
+      PERIODIC XYZ
+      POISSON_SOLVER PERIODIC
+    &END POISSON
+  &END DFT
+  &PROPERTIES
+    &BANDSTRUCTURE
+      &GW
+        NUM_TIME_FREQ_POINTS      10
+        EPS_FILTER           1.0E-12
+        CUTOFF_RADIUS_RI           5
+        SIZE_LATTICE_SUM           2
+        &RI_RS
+          TIKHONOV 1.0E-8
+          &GRID_OPTIMIZATION
+            RS_AO_RATIO 20
+            MAX_ITER 300
+          &END GRID_OPTIMIZATION
+        &END RI_RS
+      &END GW
+      &DOS
+        KPOINTS 2 2 2
+      &END DOS
+      &BANDSTRUCTURE_PATH
+        NPOINTS 1
+        SPECIAL_POINT GAMMA 0.0 0.0 0.0
+        SPECIAL_POINT L 0.5 0.0 0.0
+        SPECIAL_POINT X 0.5 0.5 0.0
+      &END BANDSTRUCTURE_PATH
+    &END BANDSTRUCTURE
+  &END PROPERTIES
+  &SUBSYS
+    &CELL
+      PERIODIC XYZ
+      A  0.00000 1.78350 1.78350
+      B  1.78350 0.00000 1.78350
+      C  1.78350 1.78350 0.00000
+    &END CELL
+    &COORD
+      SCALED
+      C 0.00 0.00 0.00
+      C 0.25 0.25 0.25
+    &END COORD
+    &KIND C
+      BASIS_SET ORB SZV-MOLOPT-SR-GTH
+      BASIS_SET RI_AUX RI_20_2_2_1_1_0_0_0_1.6e-02
+      POTENTIAL GTH-PBE-q4
+    &END KIND
+  &END SUBSYS
+&END FORCE_EVAL

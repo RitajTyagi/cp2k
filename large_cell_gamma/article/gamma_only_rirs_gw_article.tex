@@ -1,0 +1,1384 @@
+\documentclass[%
+ reprint,
+superscriptaddress,
+ amsmath,amssymb,
+ aps,
+prb,
+]{revtex4-2}
+
+\usepackage{graphicx}% Include figure files
+\usepackage{dcolumn}% Align table columns on decimal point
+\usepackage{bm}% bold math
+\usepackage{tikz}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{mathptmx}
+\usepackage{siunitx}
+\usepackage{amsmath}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage[normalem]{ulem}
+\usepackage{xcolor}
+\usepackage[ colorlinks,
+    linkcolor={blue},
+    citecolor={blue},
+    urlcolor={blue}]{hyperref}
+\usepackage{braket}
+
+%%%%%%%%%% Macros of the equations document (gamma_only_rirs_gw_equations.tex)
+\newcommand{\br}{\mathbf{r}}
+\newcommand{\bR}{\mathbf{R}}
+\newcommand{\bq}{\mathbf{q}}
+\newcommand{\bG}{\mathbf{G}}
+\newcommand{\bk}{\mathbf{k}}
+\newcommand{\qhat}{\hat{\mathbf{q}}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\ii}{\mathrm{i}}
+\newcommand{\ee}{\mathrm{e}}
+\newcommand{\MIC}{\mathrm{MIC}}
+\newcommand{\Tr}{\mathrm{T}}
+\newcommand{\head}{\mathrm{h}}
+\newcommand{\wing}{\mathrm{w}}
+\newcommand{\lat}{\mathrm{lat}}
+\newcommand{\reg}{\mathrm{reg}}
+\newcommand{\occ}{\mathrm{occ}}
+\newcommand{\vir}{\mathrm{vir}}
+\newcommand{\dens}{\mathrm{dens}}
+\newcommand{\ext}{\mathrm{ext}}
+\newcommand{\tc}{\mathrm{tc}}
+%%%%%%%%%% Article-only macros
+\newcommand{\hd}{\mathrm{hd}}
+\newcommand{\Sov}{\mathsf{S}}% AO overlap matrix (distinct from the head tensor S_ab)
+\newcommand{\cpk}{\textsc{cp2k}}
+
+\begin{document}
+
+\title{$\Gamma$-point head-and-wing correction for $\Gamma$-only real-space RI $GW$\\
+of two- and three-dimensional periodic systems}
+
+\author{Ritaj Tyagi}
+\affiliation{University of Regensburg, Germany}
+
+\date{November 2026}
+
+\begin{abstract}
+Large-cell $GW$ calculations of defects, interfaces and moir\'e superlattices are naturally
+done at the $\Gamma$ point of a supercell, but the screened interaction $W$ at the single
+sampled wavevector $\bq=0$ is ill defined: the real-space lattice sum of the bare Coulomb
+operator between charged auxiliary functions diverges there. We present a scheme that makes
+$\Gamma$-only $GW$ with real-space resolution of the identity (RI-RS) well defined for
+two-dimensional slabs and three-dimensional bulk cells. The divergence is confined to a single
+direction of the auxiliary basis, the charge channel. In two dimensions it is removed from
+$V(0)$ as an exactly computable rank-one constant; in three dimensions $V(0)$ is taken as an
+Ewald sum with the $\bG=0$ term omitted. The charge channel is then carried analytically by one
+additional basis function, the normalized constant, whose screened head and wings are obtained
+in closed form from velocity-gauge transition dipoles and the Gaussian dielectric body and are
+integrated over the whole small Brillouin zone of the supercell. Nothing is subtracted, because
+the single sampled point carries no head once the constant has been removed. In two dimensions
+the correction is applied to $W$ in the auxiliary basis; in three dimensions, where the head is
+eV-sized, it is applied to the correlation self-energy in the orbital basis through a single
+orbital-pair kernel that contains the head, the head-dipole and the wing terms. We give every
+working equation in the order of evaluation, describe the implementation in \cpk{}, and discuss
+why the earlier $k$-mesh large-cell scheme is not a valid reference for two-dimensional systems.
+\end{abstract}
+
+\maketitle
+
+%======================================================================================
+\section{Introduction}
+\label{sec:intro}
+%======================================================================================
+
+Many-body perturbation theory in the $GW$ approximation is the standard route to quasiparticle
+band structures of solids, surfaces and two-dimensional (2D) materials. For systems that need
+large simulation cells --- point defects, heterostructures, moir\'e superlattices with thousands
+of atoms --- the Brillouin zone of the supercell is small, and it is natural to evaluate the
+polarizability, the dielectric function and the screened interaction at a single wavevector,
+the $\Gamma$ point of the supercell. The real-space resolution-of-the-identity (RI-RS)
+formulation of $GW$ in \cpk{} is designed for this regime: the Green's function and the
+polarizability are element-wise products on an atom-centred real-space grid, every contraction
+with the auxiliary basis goes through sphere-local fit coefficients, and the cost grows with the
+number of atoms rather than with the number of $k$-points.
+
+The large-cell code in \cpk{} reconstructs $\chi(\bk)$, $\varepsilon(\bk)$ and $W(\bk)$ from
+$\Gamma$ on a $k$-mesh \texttt{KPOINTS\_W}~$n_1\,n_2\,n_3$ of the supercell's own small
+Brillouin zone and takes the bare Coulomb matrix $V(\bk)$ from a finite real-space image sum.
+An even mesh is half-shifted and never samples $\bq=0$; an odd mesh does. The obvious $\Gamma$-only
+setting, \texttt{KPOINTS\_W 1 1 1}, therefore samples exactly the wavevector at which the image
+sum of the bare Coulomb operator between two charged auxiliary Gaussians diverges with the
+summation range. It does not merely sample badly: it produces a large spurious additive
+contribution to $W$. On a 392-atom hexagonal boron nitride (h-BN) slab the correlation
+self-energy $\Sigma^c$ of the valence band maximum moved from $+2.195$ to $-24.043$~eV and that
+of the conduction band minimum from $-3.283$ to $+20.237$~eV (opposite signs, because
+$\Sigma^c=-G\,W$ and the two branches of $G$ carry opposite sign), while the exchange
+self-energy $\Sigma^x$ and $v^{xc}$ stayed bit-identical.
+
+This work makes \texttt{KPOINTS\_W 1 1 1} well defined. The divergence is shown to sit in one
+direction of the auxiliary basis, the charge channel, which is removed from the sampled $V(0)$
+and put back analytically through one additional basis function, the normalized constant. Its
+contribution to the correlation part of the screened interaction (the ``head'' and the
+``wings'') is known in closed form as a function of $\bq$ and is integrated over the whole
+small Brillouin zone of the supercell, following the head-and-wing construction of
+J.~Wilhelm for full-$k$ RI-RS $GW$ (Ref.~\onlinecite{wilhelm_fullk}, Sec.~VI; \cpk{}
+PR~\#6447~\cite{pr6447}). Because the regular path is $\Gamma$ only and its sampled head is
+removed exactly, nothing has to be subtracted.
+
+Section~\ref{sec:theory2d} gives every equation of the scheme for a 2D slab in the order of
+evaluation; Sec.~\ref{sec:theory3d} gives the changes for 3D bulk cells, where the Coulomb
+matrix is an Ewald sum and the correction is applied in the orbital basis.
+Section~\ref{sec:impl} describes the implementation in \cpk{}, Sec.~\ref{sec:results} the
+results, and Sec.~\ref{sec:discussion} discusses why the old $k$-mesh large-cell scheme is not
+a reference for 2D systems and why Gaussian form factors of the auxiliary charges can be
+neglected.
+
+%======================================================================================
+\section{Theory for two-dimensional slabs}
+\label{sec:theory2d}
+%======================================================================================
+
+\subsection{Setting and notation}
+\label{sec:setting}
+
+The simulation cell is a layer with in-plane lattice vectors $\mathbf a_1,\mathbf a_2$,
+periodic in $x$ and $y$ only, with a non-periodic direction $z$. Its layer area is
+\begin{equation}
+  A = |\mathbf a_1\times\mathbf a_2| ,
+\end{equation}
+and the in-plane reciprocal vectors $\mathbf b_1,\mathbf b_2$ satisfy
+$\mathbf b_i\cdot\mathbf a_j = 2\pi\delta_{ij}$. The vacuum height never enters any equation
+below: all Fourier transforms average over a layer cell, not over a three-dimensional cell that
+mostly contains vacuum.
+
+Indices: $\mu,\nu,\lambda,\sigma$ label atomic orbitals (AOs) $\varphi_\mu$; $P,Q,S$ label
+auxiliary (RI) Gaussians $\phi_P$; $\ell,\ell'$ label points $\br_\ell$ of a real-space grid;
+$i$ labels occupied and $a$ empty Kohn--Sham states; $n,m$ label any state; $\bR$ labels lattice
+vectors; $\tau$ is imaginary time and $\omega$ imaginary frequency. $\alpha,\beta\in\{x,y,z\}$
+are Cartesian directions and $\qhat$ an in-plane unit vector. All quantities are real: there is
+one real $k$-point, $\Gamma$, and the single complex factor of the construction (the wing of $W$)
+is split off analytically.
+
+The RI metric is a short-ranged kernel $v_\omega$, the truncated Coulomb operator
+$v_\tc(r) = \theta(r_c-r)/r$ in the calculations reported here. Its zero-wavevector value is
+\begin{equation}
+  \int\dd\br\, v_\omega(r) =
+  \begin{cases}
+    \pi/\omega^2 & \text{erfc-attenuated metric},\\
+    2\pi r_c^2 & \text{truncated Coulomb metric},
+  \end{cases}
+  \label{eq:metric_head}
+\end{equation}
+and is referred to as the metric head.
+
+Imaginary time and frequency are discretized on minimax grids $\{\tau_j\}$, $\{\omega_k\}$,
+$j,k = 1,\dots,N$. The cosine and sine transforms are written with their minimax weights,
+\begin{equation}
+\begin{aligned}
+  f(\ii\omega_k) &= \sum_j \gamma^{\cos}_{kj}\, f(\ii\tau_j),\qquad
+  f(\ii\tau_j) = \sum_k \tilde\gamma^{\cos}_{jk}\, f(\ii\omega_k),\\
+  f(\ii\omega_k) &= \sum_j \gamma^{\sin}_{kj}\, f(\ii\tau_j),
+\end{aligned}
+  \label{eq:transforms}
+\end{equation}
+where the first represents $f(\ii\omega) = 2\int_0^\infty\dd\tau\cos(\omega\tau)f(\ii\tau)$ for
+an even function of $\tau$, the second its inverse, and the third
+$f(\ii\omega) = 2\ii\int_0^\infty\dd\tau\sin(\omega\tau)f(\ii\tau)$ for an odd one.
+
+\subsection{Atomic orbitals on the real-space grid}
+\label{sec:grid}
+
+Modified Lebedev atomic grids are placed at every atom and their union is the global grid
+$\{\br_\ell\}_{\ell=1}^{N_\mathrm{grid}}$, all points in the home cell. Because there is only one
+$k$-point, the AO values on the grid are the $\Gamma$ Bloch sums over periodic images,
+\begin{equation}
+  \Phi_{\mu}(\br_\ell) = \sum_{\bR} \varphi_\mu(\br_\ell - \mathbf A_\mu - \bR),
+  \label{eq:phi_grid}
+\end{equation}
+where $\mathbf A_\mu$ is the center of $\varphi_\mu$. The matrix $\Phi_{\ell\mu}$ is sparse:
+$\Phi_{\ell\mu}$ is kept only if $|\br_\ell-\mathbf A_\mu-\bR|$ is within the AO radius for some
+image. At the $14\times14$ h-BN cell 24.9\,\% of its elements are nonzero.
+
+\subsection{Real-space RI: the fit coefficients $Z_{\ell P}$}
+\label{sec:rirs}
+
+RI-RS expresses products of AOs through the grid. Define the grid metric and the grid--RI
+right-hand side,
+\begin{align}
+  D_{\ell\ell'} &= \Big[\sum_\mu \Phi_\mu(\br_\ell)\Phi_\mu(\br_{\ell'})\Big]^2 ,
+  \label{eq:D}\\
+  d_{\ell P} &= \sum_{\mu\nu}\Phi_\mu(\br_\ell)\Phi_\nu(\br_\ell)\,(\mu\nu|P)_\omega ,
+  \label{eq:d}
+\end{align}
+with
+\begin{equation}
+  (\mu\nu|P)_\omega = \sum_{\bR\bR'}\!\int\!\!\int\dd\br\,\dd\br'\,
+  \varphi_{\mu}^{\bR}(\br)\varphi_{\nu}^{\bR'}(\br)\, v_\omega(|\br-\br'|)\,\phi_P(\br') .
+  \label{eq:3c}
+\end{equation}
+Writing $B_{(\mu\nu),\ell} = \Phi_\mu(\br_\ell)\Phi_\nu(\br_\ell)$ one has
+$D = B^\Tr B$ and $d_{\cdot P} = B^\Tr g_P$ with $g_{(\mu\nu),P} = (\mu\nu|P)_\omega$, so the
+normal equations
+\begin{equation}
+  \sum_{\ell'} D_{\ell\ell'} Z_{\ell' P} = d_{\ell P}
+  \label{eq:fit}
+\end{equation}
+are the least-squares solution of
+$\sum_\ell \Phi_\mu(\br_\ell)\Phi_\nu(\br_\ell) Z_{\ell P}\approx (\mu\nu|P)_\omega$: the
+coefficient $Z_{\ell P}$ is a quadrature weight times the value at $\br_\ell$ of the metric
+potential of $\phi_P$. The solve is balanced and regularized,
+\begin{equation}
+\begin{gathered}
+  j_\ell = \frac{1}{\max(D_{\ell\ell},\sqrt{\epsilon_\mathrm{floor}})},\\
+  \big[j_\ell D_{\ell\ell'} j_{\ell'} + \lambda\,\delta_{\ell\ell'}\big] Z'_{\ell'P} = j_\ell d_{\ell P},
+  \qquad Z_{\ell P} = j_\ell Z'_{\ell P},
+\end{gathered}
+  \label{eq:fit_reg}
+\end{equation}
+with the Tikhonov parameter $\lambda = 10^{-8}$ and $\epsilon_\mathrm{floor}=10^{-16}$.
+Because $d_{\ell P}$ decays away from the center of $\phi_P$, Eq.~\eqref{eq:fit} is solved
+independently for each atom $P$ on the grid points inside a sphere around it (radius
+$r_\mathrm{RI}+r_\mathrm{AO}$), by a dense Cholesky factorization of the sphere's block of
+$D$. This sphere locality is what makes RI-RS linear scaling; it is valid precisely because
+every column $d_{\ell P}$ is localized, a point that becomes important in Sec.~\ref{sec:Zl0}.
+
+Every subsequent contraction between the grid and the RI basis uses the same matrix:
+\begin{equation}
+  X_{PQ} = \sum_{\ell\ell'} Z_{\ell P}\, X_{\ell\ell'}\, Z_{\ell' Q},\qquad
+  X_{\ell\ell'} = \sum_{PQ} Z_{\ell P}\, X_{PQ}\, Z_{\ell' Q}.
+  \label{eq:ZXZ}
+\end{equation}
+
+\subsection{Green's functions and polarizability at $\Gamma$}
+\label{sec:chi}
+
+With Kohn--Sham coefficients $C_{\mu n}$, eigenvalues $\varepsilon_n$ and the Fermi level
+$\varepsilon_F$ placed mid-gap, the occupied and empty Green's functions in imaginary time are
+\begin{align}
+  G^\occ_{\mu\nu}(\ii|\tau|) &= \sum_{i}^{\occ} C_{\mu i}\,\ee^{-|(\varepsilon_i-\varepsilon_F)\tau|}\,C_{\nu i},\nonumber\\
+  G^\vir_{\mu\nu}(\ii|\tau|) &= \sum_{a}^{\vir} C_{\mu a}\,\ee^{-|(\varepsilon_a-\varepsilon_F)\tau|}\,C_{\nu a},
+  \label{eq:G_ao}\\
+  G^{\occ/\vir}_{\ell\ell'}(\ii|\tau|) &= \sum_{\mu\nu}\Phi_\mu(\br_\ell)\, G^{\occ/\vir}_{\mu\nu}(\ii|\tau|)\,\Phi_\nu(\br_{\ell'}),
+  \label{eq:G_grid}
+\end{align}
+each built as $(\tilde C)(\tilde C)^\Tr$ with $\tilde C_{\mu n} = C_{\mu n}\ee^{-|(\varepsilon_n-\varepsilon_F)\tau|/2}$.
+The independent-particle polarizability is an element-wise (Hadamard) product on the grid,
+contracted to the RI basis with Eq.~\eqref{eq:ZXZ},
+\begin{equation}
+\begin{aligned}
+  \chi_{\ell\ell'}(\ii\tau) &= G^\occ_{\ell\ell'}(\ii|\tau|)\,G^\vir_{\ell\ell'}(\ii|\tau|),\\
+  \chi_{PQ}(\ii\tau) &= \sum_{\ell\ell'} Z_{\ell P}\,\chi_{\ell\ell'}(\ii\tau)\,Z_{\ell'Q}.
+\end{aligned}
+  \label{eq:chi}
+\end{equation}
+The grid product is evaluated in panels of grid rows; a geometric cutoff on $|\br_\ell-\br_{\ell'}|$
+limits the pairs. At $\Gamma$, $\chi_{\ell\ell'}$ is a Gram matrix of occupied--empty products
+and therefore exactly positive semidefinite; no clipping of negative eigenvalues is needed. It is
+transformed to imaginary frequency with the cosine weights of Eq.~\eqref{eq:transforms},
+$\chi_{PQ}(\ii\omega_k) = \sum_j\gamma^{\cos}_{kj}\chi_{PQ}(\ii\tau_j)$.
+
+\subsection{The screened interaction at $\Gamma$: the problem and the plan}
+\label{sec:plan}
+
+$W$ is needed at one point only, $\bq=0$. There the bare Coulomb matrix between charged
+auxiliary functions diverges. The scheme handles this in three steps:
+\begin{enumerate}
+\item The divergence sits in one direction of the auxiliary basis, the charge vector $c$. It is
+  removed from $V(0)$ as a single constant, $V(0)\to V(0)-D_\mathrm{box}\,cc^\Tr$
+  (Sec.~\ref{sec:V}).
+\item $\varepsilon$ and $W$ are computed from this finite $V(0)$ in the usual way
+  (Sec.~\ref{sec:W}). What is now missing from $W$ is exactly the screened interaction in the
+  charge channel.
+\item That missing piece is added back analytically: the charge channel is represented by the
+  constant function $\phi_0 = 1/\sqrt A$, its contribution to $W$ (the ``head'' and ``wings'')
+  is known in closed form as a function of $\bq$, and it is integrated over the whole small
+  Brillouin zone of the supercell (Sec.~\ref{sec:charge}). Nothing has to be subtracted,
+  because step~1 already removed it from the sampled point.
+\end{enumerate}
+
+\subsection{Step 1: the bare Coulomb matrix at $\bq=0$}
+\label{sec:V}
+
+\subsubsection{What is computed}
+
+The Coulomb matrix between two auxiliary functions $\phi_P$ and $\phi_Q$ in a periodic layer is
+the interaction of $\phi_P$ in the home cell with $\phi_Q$ in \emph{every} cell. The code sums
+over a finite box of cells,
+\begin{equation}
+  V^\lat_{PQ}(0) = \sum_{\bR\in\mathcal B}\underbrace{\int\!\!\int\dd\br\,\dd\br'\,
+  \frac{\phi_P(\br)\,\phi_Q(\br'-\bR)}{|\br-\br'|}}_{(P0|Q\bR)},
+  \label{eq:Vlat}
+\end{equation}
+\begin{equation}
+  \mathcal B = \{n_1\mathbf a_1+n_2\mathbf a_2 : |n_1|,|n_2|\le m\},
+  \label{eq:box}
+\end{equation}
+with $m = (3^{s-1}-1)/2$ and $s$ the input \texttt{SIZE\_LATTICE\_SUM} ($s=4$: $m=13$, i.e.\
+$27\times27$ cells). There are no images in the direction normal to the layer.
+
+\subsubsection{Far images see only the charge}
+
+Take one term $(P0|Q\bR)$ with $|\bR|$ much larger than the extent of the two Gaussians.
+Seen from far away, $\phi_Q$ looks like a point charge. Its charge is its integral,
+\begin{equation}
+  c_Q = \int\dd\br\,\phi_Q(\br),
+  \label{eq:charge}
+\end{equation}
+and the same for $\phi_P$. The multipole expansion of the term is therefore
+\begin{equation}
+  (P0|Q\bR) = \frac{c_P\,c_Q}{|\bR|} + \frac{(\text{dipole terms})}{|\bR|^2} + \frac{(\ldots)}{|\bR|^3} + \cdots
+  \label{eq:multipole}
+\end{equation}
+Summed over the box, the dipole terms cancel between $\bR$ and $-\bR$ and the $|\bR|^{-3}$ and
+higher terms converge. The only part of the sum that does not settle down is the first one:
+\begin{equation}
+  V^\lat_{PQ}(0) = c_P\,c_Q\,\sum_{\bR\in\mathcal B}\frac{1}{|\bR|}
+  \;+\;\big(\text{converges as the box grows}\big).
+  \label{eq:split}
+\end{equation}
+
+\subsubsection{Why the first part diverges}
+
+In two dimensions the number of lattice points in a ring of radius $R$ and width $\dd R$ is
+$2\pi R\,\dd R/A$ (one point per area $A$). Each of them contributes $1/R$, so the ring
+contributes $2\pi\,\dd R/A$ --- the same for every ring. The sum therefore grows
+\emph{linearly} with the box radius and never converges:
+\begin{equation}
+  \sum_{\bR\in\mathcal B}\frac{1}{|\bR|}\;\approx\;\frac{1}{A}\int_{\mathcal P}\frac{\dd^2 r}{|\br|}
+  \;\propto\;\frac{2\pi}{A}\,R_\mathrm{box}.
+\end{equation}
+On the h-BN cell this term is $7.4\times10^{4}$~Ha in the charge direction (defined next),
+against a few Ha for everything else.
+
+\subsubsection{The charge channel}
+
+Collect the charges into one vector $c = (c_1,\dots,c_{N_\mathrm{RI}})$ and normalize it,
+$\hat c = c/\|c\|$. Equation~\eqref{eq:split} says the divergent part of the matrix is
+$c\,c^\Tr$ times a number: it is a \emph{rank-one} matrix, nonzero only along the single
+direction $\hat c$ of the auxiliary basis. We call that direction the \emph{charge channel}.
+Any matrix can be split into its charge-channel part and the rest,
+\begin{equation}
+  V = \underbrace{(\hat c^\Tr V\hat c)\,\hat c\hat c^\Tr}_{\text{charge channel}}
+  + \underbrace{\big(V - (\hat c^\Tr V\hat c)\,\hat c\hat c^\Tr\big)}_{\text{rest}},
+\end{equation}
+and the whole problem of $\bq=0$ is that the number $\hat c^\Tr V\hat c$ is infinite. Two
+remarks matter later. First, not every auxiliary function is charged: an $s$-type
+Gaussian is, a $p$-type one is not, and a combination like $\phi_1 - (c_1/c_2)\phi_2$ is
+neutral. Second, the charge channel also contains a \emph{finite} part --- the interaction of a
+charged function with its own neighbourhood, the second term of Eq.~\eqref{eq:split} projected
+onto $\hat c$ --- which is physical and must be kept. Only the divergent constant may go.
+
+\subsubsection{$D_\mathrm{box}$: the constant that is removed}
+
+The divergent number is the lattice sum of $1/|\bR|$ over the box. Replacing the sum by the
+integral over the region $\mathcal P$ that the summed cells cover --- the parallelogram
+$\{u_1\mathbf a_1+u_2\mathbf a_2 : |u_1|,|u_2|\le F\}$ with $F = 3^{s-1}/2$, one cell per
+lattice point --- defines
+\begin{equation}
+  D_\mathrm{box} = \frac{1}{A}\int_{\mathcal P}\frac{\dd^2 r}{|\br|} .
+  \label{eq:Dbox}
+\end{equation}
+In polar coordinates $\dd^2r = r\,\dd r\,\dd\theta$, the $1/r$ cancels, and the radial
+integral is just the distance $r_{\max}(\theta)$ from the origin to the edge of the
+parallelogram in direction $\theta$:
+\begin{equation}
+  D_\mathrm{box} = \frac{1}{A}\int_0^{2\pi}\dd\theta\; r_{\max}(\theta)
+  = \frac{1}{A}\oint_{\partial\mathcal P}\frac{\br\times\dd\br}{|\br|},
+  \label{eq:Dbox_edge}
+\end{equation}
+a one-dimensional integral along the four edges of the box, done by Gauss--Legendre quadrature.
+It is a pure number fixed by the cell shape and the box size: $2.80$ for the $6$~\AA\ water cell
+at $s=3$, $1.52$ for the h-BN cell at $s=4$.
+
+\subsubsection{The Coulomb matrix used for $W$}
+
+Subtracting the constant along the charge direction, with the \emph{unnormalized} charges so
+that the prefactor of Eq.~\eqref{eq:split} is matched,
+\begin{equation}
+  V_{PQ}(0) = V^\lat_{PQ}(0) - D_\mathrm{box}\, c_P\, c_Q .
+  \label{eq:Vreg}
+\end{equation}
+This removes exactly the first term of Eq.~\eqref{eq:split} and nothing else. What is left in
+the charge channel is small and finite: $\hat c^\Tr V\hat c$ goes from $796$ to $8.9$~Ha for the
+water cell and from $7.4\times10^{4}$ to $-139$~Ha for h-BN. In reciprocal space this is the
+familiar ``omit the $\bG=0$ term'' of the Coulomb sum; Eq.~\eqref{eq:Vreg} is its real-space
+form.
+
+What one must \emph{not} do is project the charge channel out altogether,
+$V\to\Pi V\Pi$ with $\Pi = 1-\hat c\hat c^\Tr$. That would also discard the finite part of the
+charge channel (the second remark above), which step~3 does not put back, and it was measured
+to inflate every $\Sigma^c$ matrix element by a factor of 5--9 on the water test.
+
+\subsection{Step 2: $\varepsilon$ and $W$ from the finite $V(0)$}
+\label{sec:step2}
+\label{sec:W}
+
+With the RI metric $M_{PQ} = (P|v_\omega|Q)$ and $V$ from Eq.~\eqref{eq:Vreg},
+\begin{align}
+  \varepsilon(\ii\omega) &= 1 + V^{1/2} M^{-1}\chi(\ii\omega) M^{-1} V^{1/2},
+  \label{eq:eps}\\
+  W^c(\ii\omega) &= V^{1/2}\big(\varepsilon^{-1}(\ii\omega) - 1\big)V^{1/2},
+  \label{eq:Wc}\\
+  W^{\MIC}(\ii\omega) &= M^{-1}\, W^c(\ii\omega)\, M^{-1}.
+  \label{eq:Wmic}
+\end{align}
+This is the only $k$-point, so $W^\MIC$ is Eq.~\eqref{eq:Wmic} with weight one. (The code's
+two-mesh extrapolation must be switched off for this; with it, $\Gamma$ would enter $W$ with
+weight $1/(1-\sqrt2)$ in some matrix elements and weight 0 in others.) $W^\MIC$ is transformed
+to imaginary time and brought to the grid,
+\begin{equation}
+  W^{\MIC}_{\ell\ell'}(\ii\tau) = \sum_{PQ} Z_{\ell P}\, W^{\MIC}_{PQ}(\ii\tau)\, Z_{\ell'Q}.
+  \label{eq:W_grid}
+\end{equation}
+
+\subsection{Step 3: the charge channel, added back analytically}
+\label{sec:charge}
+
+\subsubsection{The constant function and its auxiliary charges}
+\label{sec:Zl0}
+
+The charge channel is represented by one extra basis function, the normalized constant,
+\begin{equation}
+  \phi_0(\br) = \frac{1}{\sqrt A},\qquad V_{00}(\bq) = \frac{2\pi}{q}.
+  \label{eq:phi0}
+\end{equation}
+$2\pi/q$ is the exact two-dimensional Coulomb head; it is finite for every $q>0$ and the
+$1/q$ singularity is integrable in two dimensions, which is why integrating over the Brillouin
+zone works where sampling at $q=0$ does not.
+
+At a small but finite $\bq$ the charge channel is the Bloch-modulated constant
+$\ee^{\ii\bq\cdot\br}/\sqrt A$, and a fitted density $\rho = \sum_P \rho_P\phi_P$ couples to
+it through its Fourier component,
+\begin{equation}
+\begin{aligned}
+  \langle\phi_{0,\bq}|\rho\rangle &= \frac{\hat\rho(\bq)}{\sqrt A}
+  = \frac{1}{\sqrt A}\sum_P \rho_P\,\hat\phi_P(\bq)\\
+  &\simeq \frac{1}{\sqrt A}\sum_P \rho_P\, c_P\,\ee^{-\ii\bq\cdot\bR_P},\qquad
+  c_P = \int\dd\br\,\phi_P(\br),
+\end{aligned}
+  \label{eq:Zl0}
+\end{equation}
+with $\bR_P$ the centre of the auxiliary Gaussian $\phi_P$. The last step is the point-charge
+limit $q_\mathrm{max}\sigma_P\ll1$ of the Gaussian form factor; only $s$-type functions carry a
+charge. So the charge channel needs no fit of its own: the auxiliary charges $c_P$ and the
+atomic positions are everything, and the correction is applied in the auxiliary basis
+(Sec.~\ref{sec:DeltaW}), reaching the grid through the same $Z$ as every other part of $W$.
+
+An earlier version gave $\phi_0$ grid coefficients $Z_{\ell0}$ from the fit of
+Eq.~\eqref{eq:fit} with the constant as the target (solved globally by conjugate gradients, since
+its right-hand side does not decay) and applied the correction per grid pair,
+$Z_{\ell0}Z_{\ell'0}K_\head(\bR_{\ell\ell'})$. That is numerically unusable. The RI-RS
+interpolation functions $\xi_\ell$ far from the atoms carry fit weights of $10^4$--$10^8$ of
+alternating sign (on the 3$\times$3 h-BN test cell, $\max|Z_{\ell0}| = 2\times10^4$ at points
+with a density of $10^{-9}$). They cancel exactly in linear functionals of a density,
+$\sum_\ell\rho(\br_\ell)Z_{\ell0}$ gives $1/\sqrt A$ for a diagonal pair and $3\times10^{-6}$
+for a transition density, but not once each point is weighted by a different kernel value
+$K(\bR_{\ell\ell'})$: the odd wing came out wrong by orders of magnitude and split
+symmetry-equivalent states by more than 1~eV, the even head survived only on large cells where
+the kernel is nearly flat over neighbouring points.
+
+\subsubsection{The neutral Gaussians}
+\label{sec:neutral}
+
+The Gaussians are made neutral by projecting out the charge direction,
+\begin{equation}
+  \Pi = 1 - \hat c\hat c^\Tr,\qquad V_b = \Pi\, V^\lat(0)\,\Pi ,
+  \label{eq:Pi}
+\end{equation}
+so that $V_b$ is finite (neutral functions interact as $R^{-3}$). The two maps between a fitted
+grid density and the neutral basis are
+\begin{equation}
+  F^\dens = M^{-1}\,\Pi\, V_b^{1/2},\qquad
+  F^\ext = M^{-1}\, V^\lat(0)\,\Pi\, V_b^{-1/2},
+  \label{eq:F}
+\end{equation}
+the first for the density side of $\varepsilon$, the second for the potential side of $W$. We
+also write $G^\ext = M F^\ext = V^\lat(0)\,\Pi\,V_b^{-1/2}$ for the potential-side map in the
+representation of $W^c$.
+
+\subsubsection{The response in the charge channel}
+\label{sec:response}
+
+The constant function couples to the electrons through the transition dipoles. Under periodic
+boundary conditions the position operator is ill defined, so they are taken in the velocity
+gauge,
+\begin{equation}
+  \mu^\alpha_{ai} = \frac{\langle a|[H,r^\alpha]|i\rangle}{\varepsilon_a-\varepsilon_i},\qquad
+  [H,r^\alpha] = -\partial_\alpha + [V_\mathrm{nl},r^\alpha],
+  \label{eq:dipole}
+\end{equation}
+and checked against the Thomas--Reiche--Kuhn sum rule
+\begin{equation}
+  \frac{2}{n_\mathrm{spin}}\sum_{\sigma}\sum_{ia}2\,(\varepsilon_a-\varepsilon_i)\,|\mu^\alpha_{ai}|^2 = N_\mathrm{el},
+  \label{eq:TRK}
+\end{equation}
+which a finite basis can only undershoot (h-BN: $0.64/0.64/0.41$). The head and the wings of
+the polarizability in imaginary time are
+\begin{align}
+  Y_{\alpha\beta}(\ii\tau) &= \frac{2}{n_\mathrm{spin}A}\sum_\sigma\sum_{ia}\mu^\alpha_{ai}\mu^\beta_{ai}\,\ee^{-(\varepsilon_a-\varepsilon_i)\tau},
+  \label{eq:Y}\\
+  X_{\ell\alpha}(\ii\tau) &= \frac{2}{n_\mathrm{spin}\sqrt A}\sum_\sigma\sum_{ia}\psi_i(\br_\ell)\psi_a(\br_\ell)\,\mu^\alpha_{ai}\,\ee^{-(\varepsilon_a-\varepsilon_i)\tau},
+  \label{eq:X}
+\end{align}
+and are cosine-transformed to imaginary frequency like $\chi$. $Y(\ii\omega\to0)$ is the
+polarizability per area of the layer (h-BN: 1.35~bohr).
+
+\subsubsection{Inverting $\varepsilon$ in the extended basis}
+\label{sec:blockinv}
+
+With the constant as index 0, the dielectric matrix at small $\bq$ is a $2\times2$ block matrix,
+\begin{equation}
+  \varepsilon(\bq,\ii\omega) = \begin{pmatrix} h & w^\dagger\\ w & B\end{pmatrix},
+  \label{eq:blocks}
+\end{equation}
+\begin{equation}
+  h = 1 + 2\pi q\,\qhat^\Tr Y\qhat,\qquad
+  w_P = -\ii\sqrt{2\pi q}\,(E\qhat)_P,
+  \label{eq:hw}
+\end{equation}
+\begin{equation}
+  B(\ii\omega) = 1 + F^{\dens\,\Tr}\chi(\ii\omega)F^\dens,\quad
+  E(\ii\omega) = F^{\dens\,\Tr}Z^\Tr X(\ii\omega).
+  \label{eq:E}
+\end{equation}
+$B$ is the ordinary Gaussian dielectric matrix at $\Gamma$ in the neutral basis; $h$ and $w$
+are the new head and wings. $B$ needs no new grid contraction: $Z F^\dens$ maps the grid to the
+neutral basis, so $F^{\dens\,\Tr}(Z^\Tr\chi_{\ell\ell'}Z)F^\dens$ contains exactly the
+$\chi_{PQ}(\Gamma)$ of Eq.~\eqref{eq:chi}. Inverting the block matrix and keeping the head and
+the wings of $W^c = V^{1/2}(\varepsilon^{-1}-1)V^{1/2}$ gives closed forms. All of the $\bq$
+dependence collapses into one scalar,
+\begin{equation}
+  a(\qhat,\ii\omega) = \qhat^\Tr S\qhat,\qquad
+  S = Y - E^\Tr B^{-1}E,
+  \label{eq:a}
+\end{equation}
+\begin{equation}
+  T_{P\alpha} = \big[V^\lat(0)\,\Pi\,V_b^{-1/2}\,B^{-1}E\big]_{P\alpha},
+  \label{eq:ST}
+\end{equation}
+($S$ is the $3\times3$ head with the body screening folded in, $T$ the wing vector in the
+auxiliary basis --- $M F^\ext B^{-1}E = G^\ext B^{-1}E$, i.e.\ in the same representation as
+$W^c$ of Eq.~\eqref{eq:Wc} --- both obtained by linear solves with $B$), and then
+\begin{align}
+  W^{c}_{\head}(\bq,\ii\omega) &= -\frac{4\pi^2 a}{1+2\pi q a},
+  \label{eq:headwing}\\
+  W^{c}_{\wing,P}(\bq,\ii\omega) &= \frac{\ii\,2\pi\sum_\alpha\hat q_\alpha T_{P\alpha}}{1+2\pi q a}.
+  \label{eq:wing}
+\end{align}
+Both are finite at $q\to0$: the head of $\varepsilon^{-1}$ is proportional to $q$ and cancels
+the $1/q$ of $V_{00}$, the wing is proportional to $\sqrt q$ and cancels $1/\sqrt q$. The head is
+a number, the wing is a vector over the auxiliary functions and linear in $\qhat$, which is what
+allows the angular integral to be done once into a table. The explicit factors of $\ii$ cancel
+in the Schur complement $h - w^\dagger B^{-1}w = 1+2\pi q a$ and reappear in $W$ only as a
+quantity plus its own conjugate, so every stored array is real.
+
+\subsubsection{Integral over the Brillouin zone and the correction to $W$}
+\label{sec:DeltaW}
+
+The head and wings are now integrated over the whole small Brillouin zone of the supercell,
+with the phase $\ee^{-\ii\bq\cdot\bR}$ of Eq.~\eqref{eq:Zl0} that turns $W(\bq)$ into a
+function of the separation $\bR = \MIC(\bR_P-\bR_Q)$ of the atoms carrying two auxiliary
+functions. Because $a$ is even and the wing odd in
+$\qhat$, only $\cos$ survives in the head and only $\sin$ in the wing, and both results are
+real:
+\begin{align}
+  K_\head(\bR,\ii\omega) &= \frac{A}{(2\pi)^2}\int_{\mathrm{BZ}}\dd^2 q\;
+  \Big[-\frac{4\pi^2 a}{1+2\pi q a}\Big]\cos(\bq\cdot\bR),
+  \label{eq:Kh}\\
+  K_{\wing,\alpha}(\bR,\ii\omega) &= \frac{A}{(2\pi)^2}\int_{\mathrm{BZ}}\dd^2 q\;
+  \Big[\frac{2\pi\,\hat q_\alpha}{1+2\pi q a}\Big]\sin(\bq\cdot\bR).
+  \label{eq:Kw}
+\end{align}
+The prefactor $A/(2\pi)^2$ makes this the Brillouin-zone \emph{average}, the continuum limit of
+$\frac1{N_k}\sum_k$. The integrals are done in polar coordinates (24 Gauss--Legendre directions
+per zone edge, 32 radial points), tabulated on a $128\times128$ mesh of $\bR$ over the
+minimum-image cell and interpolated bilinearly at the atom-pair separations. The correction
+to the screened interaction in the auxiliary basis is
+\begin{equation}
+\begin{aligned}
+  \Delta W_{PQ}(\ii\omega) ={}& \frac{c_P c_Q}{A}\,K_\head(\bR_{PQ},\ii\omega)\\
+  &+ \frac{1}{\sqrt A}\sum_\alpha\big[T_{P\alpha}c_Q - c_P T_{Q\alpha}\big]
+  K_{\wing,\alpha}(\bR_{PQ},\ii\omega),
+\end{aligned}
+  \label{eq:DeltaW}
+\end{equation}
+symmetric in $P\leftrightarrow Q$ ($K_\head$ is even and $K_\wing$ odd in $\bR$, the wing
+bracket antisymmetric). It is transformed to imaginary time with the cosine weights of the
+minimax grid and added to $W^c_{PQ}(\ii\tau)$ \emph{before} Eq.~\eqref{eq:Wmic}, so that it
+reaches the grid pairs through $M^{-1}$ and $Z$ exactly like the regular $W$. Its head term
+is a uniform potential $K_\head(0)/A$ in real space ($-0.29$~eV for h-BN). The cost is
+negligible: one table lookup per auxiliary pair and time point.
+
+\subsection{Exchange self-energy}
+\label{sec:Sx}
+
+The exchange part uses the truncated Coulomb operator $v_\tc$ with a cutoff radius equal to
+half the minimum cell dimension (15.2~\AA\ for the h-BN cell), which is finite without any
+treatment of the charge channel and is unaffected by everything above:
+\begin{align}
+  P_{\mu\nu} &= \sum_i^{\occ} C_{\mu i}C_{\nu i},\qquad
+  P_{\ell\ell'} = \sum_{\mu\nu}\Phi_\mu(\br_\ell)P_{\mu\nu}\Phi_\nu(\br_{\ell'}),
+  \label{eq:Sx_parts}\\
+  V^\tc_{\ell\ell'} &= \sum_{PQ}Z_{\ell P}\big[M^{-1}V^\tc M^{-1}\big]_{PQ}Z_{\ell'Q},
+  \label{eq:Vtc_grid}\\
+  \Sigma^x_{\lambda\sigma} &= -\sum_{\ell\ell'}\Phi_\lambda(\br_\ell)\,P_{\ell\ell'}\,V^\tc_{\ell\ell'}\,\Phi_\sigma(\br_{\ell'}).
+  \label{eq:Sx}
+\end{align}
+
+\subsection{Correlation self-energy and quasiparticle energies}
+\label{sec:Sc}
+
+The correlation self-energy is an element-wise product on the grid of the Green's function with
+the \emph{full} screened interaction, the regular part of Eq.~\eqref{eq:W_grid} plus the
+charge-channel correction of Eq.~\eqref{eq:DeltaW}, in the two time branches:
+\begin{align}
+  \Sigma^{c}_{\ell\ell'}(-\ii|\tau|) &= -\,G^\occ_{\ell\ell'}(\ii|\tau|)\,
+  \Big[W^\MIC_{\ell\ell'}(\ii\tau) + \Delta W_{\ell\ell'}(\ii\tau)\Big],
+  \label{eq:Sc_neg}\\
+  \Sigma^{c}_{\ell\ell'}(+\ii|\tau|) &= +\,G^\vir_{\ell\ell'}(\ii|\tau|)\,
+  \Big[W^\MIC_{\ell\ell'}(\ii\tau) + \Delta W_{\ell\ell'}(\ii\tau)\Big],
+  \label{eq:Sc_pos}\\
+  \Sigma^{c}_{\lambda\sigma}(\pm\ii|\tau|) &= \sum_{\ell\ell'}\Phi_\lambda(\br_\ell)\,
+  \Sigma^{c}_{\ell\ell'}(\pm\ii|\tau|)\,\Phi_\sigma(\br_{\ell'}).
+  \label{eq:Sc_ao}
+\end{align}
+In the implementation $W^\MIC_{\ell\ell'}$ is built panel by panel as $Z\,W^\MIC_{PQ}Z^\Tr$,
+with $\Delta W$ already inside $W^\MIC_{PQ}$ (Eq.~\eqref{eq:DeltaW}), and the two Hadamard
+products with $G^\occ$ and $G^\vir$ share that panel. The panels are restricted to the pairs
+within the geometric cutoff of the $\Sigma^c$ panels, which is exact because the Hadamard
+product with the short-ranged $G$ vanishes outside it.
+
+The self-energy is projected onto the Kohn--Sham states,
+$\Sigma^c_{nn}(\pm\ii|\tau|) = \sum_{\lambda\sigma}C_{\lambda n}\Sigma^c_{\lambda\sigma}(\pm\ii|\tau|)C_{\sigma n}$,
+split into its even and odd parts in $\tau$ and transformed to imaginary frequency with the
+cosine and sine weights of Eq.~\eqref{eq:transforms},
+\begin{equation}
+\begin{aligned}
+  \Sigma^c_{nn}(\ii\omega_k) ={}& \sum_j\gamma^{\cos}_{kj}\,
+  \frac{\Sigma^c_{nn}(\ii\tau_j)+\Sigma^c_{nn}(-\ii\tau_j)}{2}\\
+  &+ \sum_j\gamma^{\sin}_{kj}\,
+  \frac{\Sigma^c_{nn}(\ii\tau_j)-\Sigma^c_{nn}(-\ii\tau_j)}{2}.
+\end{aligned}
+  \label{eq:Sc_freq}
+\end{equation}
+$\Sigma^c_{nn}(\ii\omega)$ is continued to the real axis by a Pad\'e approximant fitted to
+the imaginary-frequency points, and the quasiparticle energies follow from
+\begin{equation}
+  \varepsilon^{GW}_n = \varepsilon_n + \mathrm{Re}\,\Sigma^c_{nn}(\varepsilon^{GW}_n)
+  + \Sigma^x_{nn} - v^{xc}_{nn},
+  \label{eq:QP}
+\end{equation}
+solved by a Newton search for the crossing of the quasiparticle equation. For $G_0W_0$ this is
+done once with $G$ built from the Kohn--Sham eigenvalues; for ev$GW_0$ the Green's function is
+rebuilt from the quasiparticle energies and Eqs.~\eqref{eq:G_ao}--\eqref{eq:Sc_freq} are
+iterated to self-consistency with $W$ frozen.
+
+%======================================================================================
+\section{Theory for three-dimensional bulk cells}
+\label{sec:theory3d}
+\label{sec:bulk}
+%======================================================================================
+
+\subsection{Substitutions}
+\label{sec:subst3d}
+
+The same construction applies to a bulk cell (\texttt{PERIODIC XYZ}) with three substitutions.
+The measure is the cell volume $\Omega = |\det(\mathbf a_1,\mathbf a_2,\mathbf a_3)|$,
+$A\to\Omega$ in Eqs.~\eqref{eq:Zl0}, \eqref{eq:Y}, \eqref{eq:X} and \eqref{eq:DeltaW}, the
+reciprocal vectors are the three $\mathbf b_i$ with $\mathbf b_i\cdot\mathbf a_j=2\pi\delta_{ij}$,
+and the charge mode is $\phi_0 = \ee^{\ii\bq\cdot\br}/\sqrt\Omega$ with $v_{00} = 4\pi/q^2$.
+Everything else --- the dipoles, the response $Y$, $X$, $B$, $E$, the block inverse and the
+transform $\ii\omega\to\ii\tau$ --- is shared with the 2D case.
+
+\subsection{The Coulomb matrix: Ewald sum without $\bG=0$}
+\label{sec:ewald}
+
+The finite box sum of Eq.~\eqref{eq:Vlat} cannot be used in three dimensions, not even after
+the subtraction of Eq.~\eqref{eq:Vreg}: between two \emph{neutral} (dipolar) functions the sum
+of $1/r$ over a 3D box is conditionally convergent, with a surface term
+$\tfrac12 d_\alpha d_\beta\int_\mathrm{box}\partial_\alpha\partial_\beta r^{-1}$ that depends
+on the shape of the box and does not vanish as the box grows (the Lorentz depolarization of a
+finite sample). The matrix that the head-and-wing model assumes is the tin-foil limit, the
+periodic Coulomb matrix with the $\bG=0$ Fourier coefficient of $1/r$ omitted, which is
+obtained as an Ewald sum,
+\begin{widetext}
+\begin{equation}
+  V_{PQ}(0) = \sum_{\mathbf{L}\in\mathrm{box}}\big(P\,0\,\big|\,\tfrac{\mathrm{erfc}(\omega r)}{r}\,\big|\,Q\,\mathbf{L}\big)
+  + \frac{4\pi}{\Omega}\sum_{\bG\neq0}\frac{\ee^{-G^2/4\omega^2}}{G^2}\,\rho_P(\bG)\rho_Q(\bG)^*
+  - \frac{\pi}{\Omega\,\omega^2}\,c_P c_Q,
+  \qquad \rho_P(\bG) = \int\dd\br\,\phi_P(\br)\,\ee^{\ii\bG\cdot\br},
+  \label{eq:Vewald}
+\end{equation}
+\end{widetext}
+where $1/r = \mathrm{erfc}(\omega r)/r + \mathrm{erf}(\omega r)/r$, the erf part has the
+Fourier transform $(4\pi/G^2)\,\ee^{-G^2/4\omega^2} = 4\pi/G^2 - \pi/\omega^2 + O(G^2)$, and
+dropping its $4\pi/G^2$ singularity leaves $-\pi/\omega^2$ at $\bG=0$. (Here $\omega$ is the
+Ewald splitting parameter, not an imaginary frequency.) The result is independent of $\omega$,
+which checks both halves against each other; the code sets $\omega r_c = 8$ with
+$r_c = \tfrac12(N-1)h_\mathrm{min}$ the coverage radius of the image box ($N = 3^{s-1}$ images
+per direction, $h_\mathrm{min}$ the smallest cell height $2\pi/|\mathbf b_i|$), so that the erfc
+tail is negligible for every pair the box contains ($\mathrm{erfc}(8)<10^{-28}$; the Gaussian
+extents of the auxiliary functions use a few bohr of that margin). $\rho_P(\bG)$ is analytic
+for Gaussians (one-dimensional moments
+$m_l(p) = \int\dd x\,x^l\ee^{-\alpha x^2}\ee^{\ii p x}$ by the recursion
+$m_l = (\ii p\,m_{l-1} + (l-1)m_{l-2})/2\alpha$). This $V(0)$ is finite and positive on the
+charge direction, so no projector is needed: $\Pi = 1$, $V_b = V(0)$,
+$F^\dens = M^{-1}V^{1/2}$ and $G^\ext = V^{1/2}$, so that Eq.~\eqref{eq:ST} becomes
+\begin{equation}
+  T = V(0)\,V^{-1/2}\,B^{-1}E = V^{1/2}B^{-1}E .
+  \label{eq:T3d}
+\end{equation}
+The regular path of Sec.~\ref{sec:step2} uses the same matrix with nothing subtracted (the same
+choice as the 3D branch of \cpk{}~\#6447~\cite{pr6447}).
+
+\subsection{Head and wings}
+\label{sec:hw3d}
+
+In the extended basis the head is $h = 1 + 4\pi\,\qhat^\Tr Y\qhat$ and the wing
+$w_P = -\ii\sqrt{4\pi}\,(E\qhat)_P$, both independent of $q$: the $q^2$ of the dipole response
+cancels the $1/q^2$ of $v_{00}$ where in two dimensions $2\pi q\,a$ was left. The Schur
+complement of the symmetrized dielectric matrix is
+\begin{equation}
+  \tilde\varepsilon(\qhat,\ii\omega) = 1 + 4\pi a(\qhat,\ii\omega),\qquad a = \qhat^\Tr S\qhat,
+  \label{eq:epstilde}
+\end{equation}
+with $S$ from Eq.~\eqref{eq:a}, and the block inverse gives
+\begin{align}
+  W^c_{\head}(\bq,\ii\omega) &= \frac{4\pi}{q^2}\Big(\frac{1}{1+4\pi a}-1\Big)
+  = -\frac{4\pi}{q^2}\,\frac{4\pi a}{1+4\pi a},
+  \label{eq:headwing3d}\\
+  W^c_{\wing,P}(\bq,\ii\omega) &= \frac{\ii\,(4\pi/q)\sum_\alpha\hat q_\alpha T_{P\alpha}}{1+4\pi a}.
+  \label{eq:wing3d}
+\end{align}
+$1 + 4\pi a(\qhat,\ii\omega)$ is the macroscopic dielectric constant of the cell along $\qhat$.
+It must be positive, $a$ being a quadratic form of the positive head $Y$ minus the body
+correction; the code aborts if it is not.
+
+\subsection{Cell integrals}
+\label{sec:cell3d}
+
+The Brillouin-zone average now carries $\Omega/(2\pi)^3$ and the volume element
+$q^2\dd q\,\dd\Omega_{\qhat}$, which cancels the $1/q^2$ of the head, so that the radial
+integral is elementary:
+\begin{equation}
+\begin{aligned}
+  K_\head(\bR,\ii\omega) &= -\frac{\Omega}{(2\pi)^3}\int\dd\Omega_{\qhat}\,
+  \frac{16\pi^2 a}{1+4\pi a}\int_0^{L(\qhat)}\dd q\,\cos(q\,\qhat\cdot\bR)\\
+  &= -\frac{\Omega}{(2\pi)^3}\int\dd\Omega_{\qhat}\,\frac{16\pi^2 a}{1+4\pi a}\,
+  \frac{\sin(Lt)}{t},
+\end{aligned}
+  \label{eq:Kh3d}
+\end{equation}
+with $t = \qhat\cdot\bR$ and $L(\qhat)$ the distance from $\Gamma$ to the boundary of the cell
+$\{\sum_i s_i\mathbf b_i/2,\ |s_i|\le1\}$ along $\qhat$. In the wing the volume element combines
+with the $1/q$ of Eq.~\eqref{eq:wing3d},
+\begin{equation}
+\begin{aligned}
+  K_{\wing,\alpha}(\bR,\ii\omega) &= \frac{\Omega}{(2\pi)^3}\int\dd\Omega_{\qhat}\,
+  \frac{4\pi\,\hat q_\alpha}{1+4\pi a}\int_0^{L(\qhat)}\dd q\,q\,\sin(q\,\qhat\cdot\bR)\\
+  &= \frac{\Omega}{(2\pi)^3}\int\dd\Omega_{\qhat}\,\frac{4\pi\,\hat q_\alpha}{1+4\pi a}\,
+  \frac{\sin(Lt) - Lt\cos(Lt)}{t^2}.
+\end{aligned}
+  \label{eq:Kw3d}
+\end{equation}
+Both radial results are Taylor expanded below $|Lt| = 0.02$, where the closed forms cancel,
+\begin{equation}
+\begin{aligned}
+  \frac{\sin(Lt)}{t} &= L\Big(1 - \frac{(Lt)^2}{6} + \frac{(Lt)^4}{120} - \cdots\Big),\\
+  \frac{\sin(Lt)-Lt\cos(Lt)}{t^2} &= L^2\Big(\frac{Lt}{3} - \frac{(Lt)^3}{30} + \frac{(Lt)^5}{840} - \cdots\Big),
+\end{aligned}
+  \label{eq:taylor}
+\end{equation}
+with a next omitted term of relative size $10^{-13}$.
+
+The solid-angle integral is a cubature over the six faces of that cell. Face pair $i$ sits at
+$s_i=\pm1$ and is parametrized by $(s_j,s_k)$, a point on it is
+$\bq = \pm\mathbf b_i/2 + s_j\mathbf b_j/2 + s_k\mathbf b_k/2$, and its solid-angle element
+seen from $\Gamma$ is
+\begin{equation}
+  \dd\Omega = \frac{|\bq\cdot\dd\mathbf S|}{q^3}
+  = \frac{|\bq\cdot(\mathbf b_j\times\mathbf b_k)|}{4\,q^3}\,\dd s_j\,\dd s_k ,
+  \label{eq:dOmega}
+\end{equation}
+integrated with an $8\times8$ Gauss--Legendre rule per face ($6\times64$ directions $\qhat_d$
+with weights $\varpi_d$), so that
+$\int_\mathrm{cell}\dd^3q\,f(\qhat)g(q) = \sum_d\varpi_d\int_0^{L(\qhat_d)}\dd q\,q^2f(\qhat_d)g(q)$.
+Both signs of every face are included, which makes the direction set symmetric under
+$\qhat\to-\qhat$ and the $\cos$/$\sin$ split of the kernels exact. The rule is checked by
+$\sum_d \varpi_d L_d^3/3 = (2\pi)^3/\Omega$.
+
+\subsection{Where the bulk correction is applied: in the orbital basis, not through the RI fit}
+\label{sec:where3d}
+
+In two dimensions the head is a $\sim30$~meV effect and Eq.~\eqref{eq:DeltaW} can be applied
+in the auxiliary basis. In three dimensions the head potential $K_\head(0,\ii\omega)/\Omega$ is
+of order eV ($-3.5$~eV for a $3\times3\times3$ diamond cell with $\varepsilon_\infty = 3$) and
+scales as $1/L$, and the same application fails. $c_P c_Q K_\head(\bR_{PQ})$ is the projection
+of a smooth, long-wavelength kernel onto atom-centred Gaussians; its fit through
+$M^{-1}\,\cdot\,M^{-1}$ in Eq.~\eqref{eq:Wmic} demands large cancelling coefficients, and the
+neglected form factors break the cancellation. On the 54-atom diamond cell the head alone,
+applied in the RI basis, gives a gap of $-96$~eV and splits a degenerate triplet by $0.4$~eV
+--- which a uniform potential cannot do. The bulk correction is therefore added where it is an
+exact functional of the orbital-pair densities: to $\Sigma^c$ in the orbital basis, after
+Eq.~\eqref{eq:Sc_ao}, with $\Delta W_{\ell\ell'}=0$ in Eqs.~\eqref{eq:Sc_neg}--\eqref{eq:Sc_pos}.
+No RI fit of a kernel is involved anywhere.
+
+\subsection{The orbital-pair kernel}
+\label{sec:What}
+
+Between orbital-pair densities $\rho_{nm} = \psi_n\psi_m$ the cell average of the correction
+needs only the coupling of the pair to the charge mode,
+\begin{equation}
+  \langle mn|\phi_0\rangle = \frac{1}{\sqrt\Omega}\int\dd\br\,\rho_{mn}(\br)\,\ee^{\ii\bq\cdot\br}
+  = \frac{\delta_{mn} + \ii\,\bq\cdot\mathbf d_{mn}}{\sqrt\Omega} + O(q^2),
+  \label{eq:pair_phi0}
+\end{equation}
+with the velocity-gauge dipole between \emph{any} two orbitals,
+\begin{equation}
+  \mathbf d_{nm} = \langle n|\br|m\rangle
+  = \frac{\langle n|[H,\br]|m\rangle}{\varepsilon_n - \varepsilon_m},
+  \label{eq:dnm}
+\end{equation}
+which vanishes between folded states of different crystal momentum, where the commutator
+vanishes, and is set to zero inside degenerate manifolds ($|\varepsilon_n-\varepsilon_m|<10^{-5}$~Ha),
+where it is not defined. Collecting $\langle nm|\Delta W(\bq)|mn\rangle$ from the head
+\eqref{eq:headwing3d} and the wings \eqref{eq:wing3d} and averaging over the cell gives the
+real kernel
+\begin{equation}
+\begin{aligned}
+  \hat W_{nm}(\ii\omega) ={}& w(\ii\omega)\,\delta_{nm}
+  + \sum_{\alpha\beta} B^\hd_{\alpha\beta}(\ii\omega)\, d_{nm,\alpha} d_{nm,\beta}\\
+  &+ 2\sqrt\Omega\sum_{\alpha\beta} A^\wing_{\alpha\beta}(\ii\omega)\,
+  V_{nm,\alpha}(\ii\omega)\, d_{nm,\beta},
+\end{aligned}
+  \label{eq:What}
+\end{equation}
+with the three ingredients
+\begin{align}
+  w(\ii\omega) &= \frac{K_\head(\mathbf 0,\ii\omega)}{\Omega},
+  \label{eq:headpot}\\
+  A^\wing_{\alpha\beta}(\ii\omega) &= \frac{1}{(2\pi)^3}\int_\mathrm{cell}\dd^3q\;
+  \frac{4\pi}{\tilde\varepsilon(\qhat,\ii\omega)}\,\hat q_\alpha\hat q_\beta,
+  \label{eq:Awing}\\
+  B^\hd_{\alpha\beta}(\ii\omega) &= \frac{1}{(2\pi)^3}\int_\mathrm{cell}\dd^3q\;
+  4\pi\Big(\frac{1}{\tilde\varepsilon(\qhat,\ii\omega)} - 1\Big)\hat q_\alpha\hat q_\beta,
+  \label{eq:Bhd}
+\end{align}
+evaluated with the face cubature as
+$\int_\mathrm{cell}\dd^3q\,f(\qhat) = \sum_d\varpi_d\,L_d^3 f(\qhat_d)/3$, and the wing potential
+\begin{equation}
+\begin{aligned}
+  V_{nm,\alpha}(\ii\omega) &= \int\dd\br\,\rho_{nm}(\br)\,w_\alpha(\br;\ii\omega)\\
+  &= \sum_\ell \rho_{nm}(\br_\ell)\,\big[Z M^{-1} T(\ii\omega)\big]_{\ell\alpha},\\
+  w_\alpha &= \sum_P \hat\phi_P\,T_{P\alpha},
+\end{aligned}
+  \label{eq:Vnm}
+\end{equation}
+where $\hat\phi_P$ denotes the RI-RS dual of $\phi_P$, i.e.\ the functional
+$\int\rho\,\hat\phi_P = \sum_\ell\rho(\br_\ell)(ZM^{-1})_{\ell P}$ that maps a density to its
+coefficient in the representation of $W^\MIC$. With $\tilde w = ZM^{-1}T$ this is evaluated as
+\begin{equation}
+  V_{nm,\alpha} = \big[C^\Tr\big(\Phi^\Tr\,\mathrm{diag}(\tilde w_{\cdot\alpha})\,\Phi\big)C\big]_{nm}.
+  \label{eq:Vnm_grid}
+\end{equation}
+The head is a uniform potential (order $1/L$), the head-dipole term is the $O(q^2)$
+remainder of the head, and the wing couples the dipole of the pair density to the potential
+$w_\alpha$ that the uniform field induces in the body ($A^\wing, B^\hd\propto1/\Omega$ and
+$T\propto1/\sqrt\Omega$, so both are of order $1/\Omega$). The wing carries a single
+$1/\sqrt\Omega$ from Eq.~\eqref{eq:pair_phi0} against the $\Omega/(2\pi)^3$ of the average,
+hence $2\sqrt\Omega$; the head terms carry $|\langle mn|\phi_0\rangle|^2\propto1/\Omega$, which
+the average cancels. $V_{nm}$ is a linear functional of $\rho_{nm}$ and is exact on the RI-RS
+grid, unlike the pair kernel $c_Pc_QK_\head(\bR_{PQ})$ of the RI-space application,
+Eq.~\eqref{eq:DeltaW}.
+
+\subsection{Correction of the correlation self-energy}
+\label{sec:dSigma3d}
+
+$\hat W_{nm}$ is transformed to imaginary time with the cosine weights of the minimax grid,
+$\hat W_{nm}(\ii\tau_j) = \sum_k\tilde\gamma^{\cos}_{jk}\hat W_{nm}(\ii\omega_k)$. With the
+$\Sigma^c$ construction of Eqs.~\eqref{eq:Sc_neg}--\eqref{eq:Sc_pos}
+($\Sigma^c(-\ii|\tau|) = -G^\occ\circ W$, $\Sigma^c(+\ii|\tau|) = +G^\vir\circ W$) the
+orbital-diagonal correction is
+\begin{align}
+  \Delta\Sigma^c_n(-\ii|\tau|) &= -\sum_{m}^{\occ} \ee^{-|\tau|(\varepsilon_F-\varepsilon_m)}\,\hat W_{nm}(\ii\tau),
+  \label{eq:dSigma_neg}\\
+  \Delta\Sigma^c_n(+\ii|\tau|) &= +\sum_{m}^{\vir} \ee^{-|\tau|(\varepsilon_m-\varepsilon_F)}\,\hat W_{nm}(\ii\tau),
+  \label{eq:dSigma_pos}
+\end{align}
+added to the AO matrices of Eq.~\eqref{eq:Sc_ao} as
+\begin{equation}
+  \Delta\Sigma^c_{\mu\nu}(\pm\ii|\tau|) = \Big[(\Sov C)\,\mathrm{diag}\big(\Delta\Sigma^c_n(\pm\ii|\tau|)\big)\,(\Sov C)^\Tr\Big]_{\mu\nu},
+  \label{eq:dSigma_ao}
+\end{equation}
+with $\Sov$ the AO overlap matrix. Because $C^\Tr\Sov C = 1$ this folds onto the band and
+density-of-states $k$-points exactly like the regular $\Sigma^c$. For the head alone,
+$\hat W_{nm} = w\,\delta_{nm}$, Eqs.~\eqref{eq:dSigma_neg}--\eqref{eq:dSigma_ao} reduce to
+\begin{equation}
+\begin{aligned}
+  \Delta\Sigma^c_{\mu\nu}(-\ii|\tau|) &= -w(\ii\tau)\,\big[\Sov\,C_\occ\,\ee^{-|\tau|(\varepsilon_F-\varepsilon)}C_\occ^\Tr \Sov\big]_{\mu\nu},\\
+  \Delta\Sigma^c_{\mu\nu}(+\ii|\tau|) &= +w(\ii\tau)\,\big[\Sov\,C_\vir\,\ee^{-|\tau|(\varepsilon-\varepsilon_F)}C_\vir^\Tr \Sov\big]_{\mu\nu},
+\end{aligned}
+  \label{eq:dSigma3d}
+\end{equation}
+whose orbital diagonal is $\mp w(\ii\tau)\,\ee^{-|\tau(\varepsilon_n-\varepsilon_F)|}$ for
+occupied and empty $n$: the $\pm w/2$ shift of the COHSEX head in the static limit. A uniform
+potential couples a state only to itself, $\langle m|\ee^{\ii\bq\cdot\br}|n\rangle =
+\delta_{mn} + O(q)$, and therefore cannot split a degenerate manifold; the head-dipole and wing
+terms carry the $O(\bq\cdot\mathbf d_{mn})$ corrections of the same expansion.
+
+%======================================================================================
+\section{Implementation in CP2K}
+\label{sec:impl}
+%======================================================================================
+
+\subsection{Activation}
+\label{sec:activation}
+
+The correction lives in the module \texttt{gw\_gamma\_correction} and is switched on
+automatically for the RI-RS large-cell $\Gamma$ code when (i) the system is a slab
+(\texttt{PERIODIC XY}, head $2\pi/q$) or a bulk cell (\texttt{PERIODIC XYZ}, head $4\pi/q^2$),
+and (ii) the mesh for $\chi$, $\varepsilon$, $W$ is \texttt{KPOINTS\_W 1 1 1}. Only the
+$1\times1\times1$ mesh samples $\bq=0$: the setup keeps $n_1n_2n_3/2$ points of an
+$n_1\times n_2\times n_3$ mesh, one per $\pm\bk$ pair, and for odd $n>1$ the integer division
+drops the self-paired $\Gamma$ point. For this case the extrapolation mesh is dropped (otherwise
+$\Gamma$ would enter the $s$--$s$ elements of $W$ with the extrapolation weight $-2.414$ and
+every other element with weight 0). Wires and slabs whose vacuum direction is not $z$ are not
+implemented. There is no input keyword.
+
+\subsection{Call sequence}
+\label{sec:calls}
+
+Table~\ref{tab:calls} lists the routines in the order in which the $GW$ driver calls them.
+\texttt{gamma\_corr\_init} runs before the $Z_{\ell P}$ fit and sets only geometric quantities
+(layer area or cell volume, reciprocal vectors, metric head). The Coulomb side, the response and
+the cell integrals are built in step 4b of \texttt{gw\_ri\_rs\_large\_cell\_gamma}, after
+$\chi_{PQ}(\Gamma,\ii\tau)$ exists and before \texttt{get\_W\_MIC} consumes it. The $V(0)$ of
+\texttt{gamma\_corr\_coulomb\_at\_zero} is kept distributed and reused by the regular $W$ path
+instead of repeating the lattice sum. In 2D, \texttt{gamma\_corr\_add\_to\_W} adds
+$\Delta W_{PQ}(\ii\tau)$ inside \texttt{compute\_W\_MIC}, before the contraction
+$M^{-1}W^\MIC M^{-1}$; in 3D it returns immediately and
+\texttt{gamma\_corr\_add\_to\_sigma} adds Eqs.~\eqref{eq:dSigma_neg}--\eqref{eq:dSigma_ao}
+after \texttt{compute\_Sigma\_c} and before the quasiparticle solve.
+
+\begin{table*}
+\caption{Call sequence of the $\Gamma$-point correction in \cpk{}. ``2D''/``3D'' mark
+dimension-specific branches.}
+\label{tab:calls}
+\footnotesize
+\begin{ruledtabular}
+\begin{tabular}{>{\raggedright}p{0.25\textwidth}>{\raggedright}p{0.30\textwidth}>{\raggedright\arraybackslash}p{0.38\textwidth}}
+caller & routine & computes \\
+\colrule
+\texttt{ri\_rs\_setup} & \texttt{gamma\_corr\_init} & activation; $A$ or $\Omega$, $\mathbf b_i$, metric head; dense-algebra mode\\
+\texttt{gw\_ri\_rs\_large\_cell\_gamma}, step 4b & \texttt{gamma\_corr\_build\_coulomb\_maps} & $c$, $\Pi$, $V_b$, $F^\dens$, $G^\ext$; $V(0)$ via \texttt{gamma\_corr\_coulomb\_at\_zero}\\
+ & \texttt{gamma\_corr\_response} & dipoles, $Y$, $X$, $B$, $E$; $S_{\alpha\beta}(\ii\omega)$, $T_{P\alpha}(\ii\omega)$\\
+ & \texttt{gamma\_corr\_tabulate} & 2D: $K_\head(\bR)$, $K_\wing(\bR)$ tables; 3D: \texttt{gamma\_corr\_direction\_coefficients}\\
+\texttt{gw\_compute\_V\_and\_W} & \texttt{gamma\_corr\_subtract\_divergent\_head} & 2D only: $V(0)-D_\mathrm{box}cc^\Tr$, Eq.~\eqref{eq:Vreg}\\
+\texttt{compute\_W\_MIC} & \texttt{gamma\_corr\_add\_to\_W} & 2D: $W^\MIC_{PQ}(\ii\tau) \mathrel{+}= \Delta W_{PQ}(\ii\tau)$, Eq.~\eqref{eq:DeltaW}\\
+\texttt{gw\_ri\_rs\_large\_cell\_gamma}, after $\Sigma^c$ & \texttt{gamma\_corr\_add\_to\_sigma} & 3D: $\Sigma^c_{\mu\nu}(\pm\ii|\tau|) \mathrel{+}= \Delta\Sigma^c_{\mu\nu}$, Eq.~\eqref{eq:dSigma_ao}\\
+\end{tabular}
+\end{ruledtabular}
+\end{table*}
+
+The wing quantity $X_{\ell\alpha}$ of Eq.~\eqref{eq:X} is evaluated as the diagonal of
+$\Phi P^\alpha(\ii\tau)\Phi^\Tr$ with the dense AO matrix
+$P^\alpha = C_\occ\,\ee\,\mu^\alpha\,\ee\,C_\vir^\Tr$, using that the exponential factorizes,
+$\ee^{-(\varepsilon_a-\varepsilon_i)\tau} = \ee^{-|\varepsilon_a-\varepsilon_F|\tau}\ee^{-|\varepsilon_i-\varepsilon_F|\tau}$;
+this is formed by two ScaLAPACK multiplications and one sparse product on the block pattern
+of $\Phi$, and is correct under any distribution of the MO coefficients.
+
+\subsection{Replicated or distributed dense algebra}
+\label{sec:dense}
+
+The Coulomb maps and the response involve dense $N_\mathrm{RI}\times N_\mathrm{RI}$ algebra
+($V$, $\Pi$, $V_b$, $V_b^{\pm1/2}$, $M^{-1}$, $F^\dens$, $G^\ext$, $B$ and its inverse). The
+replicated path holds up to ten such arrays per rank. \texttt{gamma\_corr\_init} estimates that
+peak as $10\times8N_\mathrm{RI}^2$~bytes, measures the memory available per MPI rank, and takes
+the distributed (ScaLAPACK) path when the estimate exceeds a quarter of it; the remaining
+three quarters are left for the distributed matrices of the regular $W$ path. With 12 auxiliary
+functions per atom the replicated peak is 4~GB per rank at about 600 atoms and 46~GB at 2000
+atoms. In the distributed path $\Pi$ is filled locally, $V_b = \Pi V\Pi$, $F^\dens$ and $G^\ext$
+are parallel matrix products, $V_b^{\pm1/2}$ come from one distributed eigendecomposition with
+the same relative eigenvalue cut, and per frequency $B$ is inverted by a Cholesky factorization,
+$x = B^{-1}E$, $S \mathrel{-}= E^\Tr x$, $T = G^\ext x$. Only $N_\mathrm{RI}\times3$ arrays are
+replicated. The choice is automatic; the two paths agree to all printed digits on one rank.
+The remaining replicated arrays, the dipoles $\mu$ ($3\,n_\occ n_\vir$) and $X(\ii\tau)$ on the
+grid ($3N_\mathrm{grid}N_\tau$), grow linearly with system size.
+
+\subsection{Cost}
+\label{sec:cost}
+
+In 2D the correction costs one table lookup per auxiliary pair and time point in
+\texttt{gamma\_corr\_add\_to\_W}; the tables are built once from the $3\times3$ tensors $S$ on a
+$128\times128$ mesh. In 3D the cell integrals are per-direction coefficients
+($6\times8\times8$ directions) and the radial integrals are analytic. The orbital-pair kernel
+costs, per frequency, three products $\Phi^\Tr\mathrm{diag}(\tilde w_{\cdot\alpha})\Phi$ on the
+grid, six $n_\mathrm{AO}^2n_\mathrm{MO}$ transforms to the MO basis, and an
+$n_\mathrm{MO}^2/n_\mathrm{ranks}$ element loop; the dipoles $\mathbf d_{nm}$ need three
+$n_\mathrm{AO}^2n_\mathrm{MO}$ transforms once per spin.
+% TIMINGS TO BE FILLED BY RITAJ (2D and 3D wall times of the correction)
+
+\subsection{Order of evaluation}
+\label{sec:order}
+
+\begin{enumerate}
+\item $\Phi_\mu(\br_\ell)$, Eq.~\eqref{eq:phi_grid}; $Z_{\ell P}$ sphere by sphere, Eqs.~\eqref{eq:D}--\eqref{eq:fit_reg}.
+\item $G^\occ,G^\vir$, $\chi_{\ell\ell'}$, $\chi_{PQ}(\ii\tau)\to\chi_{PQ}(\ii\omega)$, Eqs.~\eqref{eq:G_ao}--\eqref{eq:chi}.
+\item $c_P$, $\Pi$, $V_b$, $F^\dens$, $F^\ext$, Eqs.~\eqref{eq:charge}--\eqref{eq:F}; dipoles
+  and sum rule, Eqs.~\eqref{eq:dipole}--\eqref{eq:TRK}; $Y$, $X$, $B$, $E$, $S$, $T$,
+  Eqs.~\eqref{eq:Y}--\eqref{eq:ST}; 2D: tables $K_\head$, $K_\wing$,
+  Eqs.~\eqref{eq:Kh}--\eqref{eq:Kw}; 3D: direction coefficients, $w$, $A^\wing$, $B^\hd$,
+  Eqs.~\eqref{eq:Kh3d}, \eqref{eq:headpot}--\eqref{eq:Bhd}.
+\item 2D: $V^\lat(0)\to V(0)$, Eqs.~\eqref{eq:Vlat}--\eqref{eq:Vreg}; 3D: the Ewald $V(0)$ of
+  Eq.~\eqref{eq:Vewald}, nothing subtracted. $\varepsilon$, $W^c$, $W^c(\ii\omega)\to W^c(\ii\tau)$;
+  2D: $W^c_{PQ}(\ii\tau) \mathrel{+}= \Delta W_{PQ}(\ii\tau)$, Eq.~\eqref{eq:DeltaW}; then
+  $W^\MIC$, Eqs.~\eqref{eq:eps}--\eqref{eq:Wmic}.
+\item $\Sigma^x$, Eq.~\eqref{eq:Sx}.
+\item Per time point and panel: $W^\MIC_{\ell\ell'}$, Eq.~\eqref{eq:W_grid}; $\Sigma^c$ in both
+  branches, Eqs.~\eqref{eq:Sc_neg}--\eqref{eq:Sc_ao}.
+\item 3D: $\hat W_{nm}$, Eqs.~\eqref{eq:dnm}--\eqref{eq:Vnm_grid}; $\Delta\Sigma^c$,
+  Eqs.~\eqref{eq:dSigma_neg}--\eqref{eq:dSigma_ao}.
+\item Eqs.~\eqref{eq:Sc_freq}--\eqref{eq:QP}.
+\end{enumerate}
+
+%======================================================================================
+\section{Results}
+\label{sec:results}
+%======================================================================================
+
+All reference calculations use the full-$k$-point RI-RS $GW$ of cp2k PR~\#6447 at its head
+\texttt{4e0d03c43b} (standard 16-parameter Pad\'e continuation; an earlier head averaged
+several Pad\'e orders, which moved 2D gaps by up to $0.4$~eV and has since been moved to a
+separate PR), with the same orbital and auxiliary bases, pseudopotentials, cutoffs, minimax
+grid and RI settings as the $\Gamma$-only runs. The PR requires its own optimised RI-RS grid
+(\texttt{RS\_AO\_RATIO}~7, about 90 points per atom with a DZVP basis); a three times denser
+grid changes the h-BN gap by 2~meV. Our runs use the tabulated atom-centred grids of CP2K
+(\texttt{data/ri\_rs\_grid}, about 340 points per atom). Odd meshes of the PR abort in its own
+$\Gamma$ treatment, so its series are $12$, $18$ and $24$ (2D) and $4$, $6$ and $8$ (3D).
+
+\subsection{Validation of the slab correction: h-BN with the aug-SZV basis}
+\label{sec:resval}
+
+Table~\ref{tab:resval} compares the $\Gamma$-only $8\times8$ h-BN supercell (128 atoms,
+aug-SZV-MOLOPT-GTH tier-1 orbital and RI bases, 15~\AA\ vacuum, cutoff 600~Ry, 10 minimax
+points) with the PR at increasing meshes, at the primitive point $P=(11/32,11/32)$ nearest to
+$K$ that the supercell samples, and state by state at the point $Q$ that the supercell folds
+onto its $\Gamma$. The full-$k$ gap converges from below onto the $\Gamma$-only value; at
+$24\times24$ the absolute quasiparticle energies agree to 5~meV (valence) and 14~meV
+(conduction), with identical $\Sigma^x$ and $v^{xc}$. Larger $\Gamma$-only cells ($10\times10$,
+$14\times14$) move the gap by less than 10~meV, i.e.\ the $8\times8$ result is cell-converged.
+
+\begin{table}[h]
+\caption{h-BN monolayer, aug-SZV tier-1 basis: direct $G_0W_0$ gap at $P$ and quasiparticle
+energies at $Q$ (eV). $\Gamma$-only: $8\times8$ supercell with the head-and-wing correction.
+PR: primitive cell, $N\times N$ mesh.}
+\label{tab:resval}
+\begin{ruledtabular}
+\begin{tabular}{lcccc}
+ & gap($P$) & VB($Q$) & CB($Q$) & $\Sigma^c$ VB / CB\\
+\colrule
+PR $6\times6$   & 6.590 &        &       & \\
+PR $8\times8$   & 6.658 & $-4.974$ & 2.109 & 2.160 / $-3.164$\\
+PR $12\times12$ & 6.681 &        &       & \\
+PR $16\times16$ & 6.684 &        &       & \\
+PR $24\times24$ & 6.690 & $-5.034$ & 2.067 & 2.225 / $-3.222$\\
+$\Gamma$-only $8\times8$ & 6.710 & $-5.039$ & 2.081 & 2.131 / $-3.210$\\
+$\Gamma$-only $10\times10$ & 6.705 & & & \\
+$\Gamma$-only $14\times14$ & 6.699 & & & \\
+\end{tabular}
+\end{ruledtabular}
+\end{table}
+
+\subsection{2D benchmark with a DZVP basis}
+\label{sec:res2d}
+
+Four planar hexagonal monolayers (h-BN, SiC, h-GaN, h-AlN) with DZVP-MOLOPT-SR-GTH orbital
+bases and MOLOPT RI sets at the $2\cdot10^{-3}$ fit-error level, 15~\AA\ vacuum, cutoff
+500~Ry, 10 minimax points, \texttt{CUTOFF\_RADIUS\_RI} 5~\AA, \texttt{SIZE\_LATTICE\_SUM}~4.
+The $\Gamma$-only cells are $9\times9$ (162 atoms; the folded manifold contains $K$) and
+$12\times12$ (288 atoms); the PR meshes contain $K$ as well. Table~\ref{tab:res2d} lists the
+indirect gap over the sampled points. Three of the four materials agree with the converged
+reference to $16$--$75$~meV, and the $12\times12$ cells show that the $\Gamma$-only results are
+cell-converged to a few meV. h-AlN deviates by $0.25$~eV; state by state the difference sits
+at its nearly-free-electron conduction minimum at $\Gamma$ ($\Sigma^c$ $-2.48$ vs $-2.39$~eV,
+$\Sigma^x$ $-4.89$ vs $-4.83$~eV) and at the valence maximum at $K$ ($+0.10$~eV). $\Sigma^x$
+differs between the two codes by $\pm0.07$~eV in every system, without a trend, which is the
+level of the RI-RS grid differences; the extra $0.09$~eV in $\Sigma^c$ of the diffuse AlN
+state is specific to a state that extends into the vacuum and is discussed in
+Sec.~\ref{sec:disc_approx}.
+
+\begin{table}[h]
+\caption{2D benchmark, DZVP basis ($a$ = 2.502, 3.090, 3.210, 3.110~\AA): indirect $G_0W_0$ gap
+(eV) of the $\Gamma$-only supercell with the head-and-wing correction against the full-$k$ PR
+at $N\times N$ meshes. Last column: $\Gamma$-only ($9\times9$) minus PR $24\times24$.}
+\label{tab:res2d}
+\begin{ruledtabular}
+\small
+\begin{tabular}{lcccccc}
+system & $9\times9$ & $12\times12$ & PR 12 & PR 18 & PR 24 & $\Delta$\\
+\colrule
+h-BN  & 7.435 &       & 7.434 & 7.444 & 7.451 & $-0.016$\\
+SiC   & 3.982 & 3.980 & 4.021 & 4.029 & 4.031 & $-0.049$\\
+h-GaN & 4.345 & 4.363 & 4.402 & 4.416 & 4.420 & $-0.075$\\
+h-AlN & 6.082 & 6.090 & 6.319 & 6.331 & 6.339 & $-0.257$\\
+\end{tabular}
+\end{ruledtabular}
+\end{table}
+
+\subsection{3D: diamond}
+\label{sec:res3d}
+
+Diamond ($a=3.567$~\AA, primitive two-atom cell, SZV-MOLOPT-SR-GTH, RI set
+\texttt{RI\_20\_2\_2\_1\_1\_0\_0\_0}, cutoff 400~Ry, 10 minimax points,
+\texttt{SIZE\_LATTICE\_SUM}~2, default RI-metric cutoff of half the cell height) in
+$n\times n\times n$ supercells of 54, 128, 250 and 432 atoms. Table~\ref{tab:res3d} shows the
+indirect $G_0W_0$ gap over the folded $\Gamma$ manifold for the successive stages of the
+bulk correction, together with the PR at $N\times N\times N$ meshes and the Hartree--Fock
+gaps. Two things are established independently of the PR. First, the exchange: the exact-RI
+tensor implementation of the same 128-atom cell gives $\Sigma^x=-18.957$~eV (valence triplet)
+and $-9.767$~eV (conduction) and a Hartree--Fock gap of 15.125~eV, identical to the RI-RS
+values ($-18.957$/$-9.767$, 15.123~eV), whereas the PR at $4\times4\times4$ is 0.4--0.6~eV off
+in $\Sigma^x$ and splits the $\Gamma$ triplet by 0.2~eV, reaching the correct exchange only at
+$8\times8\times8$. Second, the structure of the correction: the head alone shifts the valence
+and conduction edges by $+1.58$ and $-1.80$~eV at $3\times3\times3$ (the $\pm w/2$ of a uniform
+potential with $w=-3.5$~eV, $\varepsilon_\infty=3.05$); the head-dipole term adds $+0.20$~eV
+to the gap at 54 atoms and $+0.06$~eV at 128 atoms, the wing $-0.03$ and $-0.00$~eV, and the
+wing-wing term $-0.002$~eV, i.e.\ the dipole terms scale as $1/\Omega$ as they should. The
+RI-space application of the same head, by contrast, gave $-96$~eV. Degeneracies of the folded
+manifold are preserved to 3~meV. With the full kernel the $\Gamma$-only gap converges as
+$9.041\to9.782\to9.934$~eV (54, 128, 250 atoms), the PR as $9.200\to9.444\to9.511$~eV
+($4^3$, $6^3$, $8^3$ meshes); both exchange series converge to the same 15.3~eV, so the
+remaining $0.4$~eV at convergence is in $\Sigma^c$. The standard tensor $k$-point $GW$ of CP2K
+on the primitive cell is the independent arbiter: \textit{(values to be inserted when the
+$6\times6\times6$ and $8\times8\times8$ runs finish)}.
+
+\begin{table}[h]
+\caption{Diamond, SZV basis: indirect $G_0W_0$ gap over the folded $\Gamma$ manifold (eV) for
+the stages of the bulk correction, and the full-$k$ PR. HF: Hartree--Fock gap with the
+truncated Coulomb operator of each run.}
+\label{tab:res3d}
+\begin{ruledtabular}
+\footnotesize
+\begin{tabular}{lcccccc}
+cell & atoms & none & head & +h.-dip. & full & HF\\
+\colrule
+$3^3$ & 54  & 12.249 & 8.871 & 9.066 & 9.041 & 14.838\\
+$4^3$ & 128 &        & 9.722 &       & 9.782 & 15.123\\
+$5^3$ & 250 &        & 9.910 &       & 9.934 & 15.216\\
+$6^3$ & 432 &        & --    &       &       & \\
+\colrule
+PR $4^3$ & & & & & 9.200 & 14.275\\
+PR $6^3$ & & & & & 9.444 & 14.981\\
+PR $8^3$ & & & & & 9.511 & 15.167\\
+\end{tabular}
+\end{ruledtabular}
+\end{table}
+
+%======================================================================================
+\section{Discussion}
+\label{sec:discussion}
+%======================================================================================
+
+\subsection{Why the old k-mesh large-cell scheme is not a reference}
+\label{sec:oldscheme}
+
+The large-cell $\Gamma$-point $GW$ implementations in \cpk{}
+(\texttt{tensor\_large\_cell\_Gamma}, \texttt{ri\_rs\_large\_cell\_Gamma}) build the screened
+interaction of a 2D supercell on a $k$-mesh \texttt{KPOINTS\_W}~$n\,n\,1$ of the supercell's
+small Brillouin zone, with a second ``extrapolation'' mesh of $2n$ points and a Coulomb matrix
+$V(\bq)$ from a minimum-image truncated real-space lattice sum. Band gaps from this scheme were
+used as the reference against which the $\Gamma$-only scheme was judged, and the two differ by
+$0.12$~eV on the largest cell we can afford. The old scheme carries the systematic error; the
+error is the spurious net charge of RI-fitted pair densities identified by J.~Wilhelm in
+\cpk{} PR~\#6447~\cite{pr6447}; and the $\Gamma$-only numbers are confirmed by his
+full-$k$-point code to about 15~meV. Numbers that came out of the old scheme for 2D systems
+should therefore not be used as references.
+
+\paragraph{The observation.} Monolayer h-BN, $a = 2.502$~\AA, 15~\AA\ vacuum, PBE,
+aug-SZV-MOLOPT-GTH tier-1 orbital and RI bases, 10 minimax points,
+\texttt{CUTOFF\_RADIUS\_RI}~5~\AA, identical in every code and run. ``Gap'' is the direct
+$G_0W_0$ gap at the $k$-point $P = (11/32, 11/32)$ of the primitive zone, the point nearest to
+$K$ that an $8\times8$ supercell with a $2\times2$ DOS mesh samples (Table~\ref{tab:oldscheme}).
+
+\begin{table}[h]
+\caption{Direct $G_0W_0$ gap of monolayer h-BN at $P=(11/32,11/32)$ from the old large-cell
+scheme, the $\Gamma$-only scheme of this work, and the full-$k$ RI-RS $GW$ of
+PR~\#6447 (primitive cell).}
+\label{tab:oldscheme}
+\begin{ruledtabular}
+\begin{tabular}{llr}
+scheme & cell / mesh & gap (eV)\\
+\colrule
+old, \texttt{KPOINTS\_W 4 4 1} + extrap. & $8\times8$ supercell & 8.152\\
+old, \texttt{KPOINTS\_W 4 4 1} + extrap. & $14\times14$ supercell & 6.582\\
+old, \texttt{KPOINTS\_W 2 2 1} + extrap. & $14\times14$ supercell & 6.595\\
+\colrule
+$\Gamma$-only + head/wing (this work) & $8\times8$ supercell & 6.710\\
+$\Gamma$-only + head/wing & $10\times10$ supercell & 6.705\\
+$\Gamma$-only + head/wing & $14\times14$ supercell & 6.699\\
+\colrule
+full-$k$ RI-RS, PR \#6447 & $6\times6$ mesh & 6.590\\
+full-$k$ RI-RS, PR \#6447 & $8\times8$ mesh & 6.658\\
+full-$k$ RI-RS, PR \#6447 & $12\times12$ mesh & 6.681\\
+full-$k$ RI-RS, PR \#6447 & $16\times16$ mesh & 6.684\\
+full-$k$ RI-RS, PR \#6447 & $20\times20$ mesh & 6.687\\
+full-$k$ RI-RS, PR \#6447 & $24\times24$ mesh & 6.690\\
+\end{tabular}
+\end{ruledtabular}
+\end{table}
+
+Three things stand out. (i) The old scheme is not converged with the cell: $8.15$~eV at
+$8\times8$ against $6.58$~eV at $14\times14$, and an earlier sweep with the tier-2 basis
+(11.85, 9.74, 9.66, 9.43, 8.63, 7.54~eV for $n = 5, 6, 7, 8, 10, 12$) was still falling at
+30~\AA. (ii) The $\Gamma$-only scheme is converged to 5~meV in the gap from $8\times8$ on.
+(iii) The independent full-$k$-point code converges from below onto the $\Gamma$-only value;
+state by state at the supercell $\Gamma$ point the absolute $G_0W_0$ energies agree to 5~meV
+(valence) and 14~meV (conduction) with the $24\times24$ mesh, with identical $\Sigma^x$ and
+$v^{xc}$ and $\Sigma^c$ within 10~meV. The old scheme sits $0.12$~eV below both at
+$14\times14$ and is still drifting downwards, so the $0.12$~eV is its error, not the new
+code's.
+
+\paragraph{The mechanism: a spurious charge in the fitted pair densities.}
+In RI-RS a product of two orbitals is interpolated from its values on the atom-centred grid
+points $\br_\ell$ and fitted to the auxiliary basis through the fit coefficients $Z_{\ell P}$,
+\begin{equation}
+\begin{aligned}
+  \psi_i(\br)\psi_a(\br) &\approx \sum_{P}\Big[\sum_\ell Z_{\ell P}\,\psi_i(\br_\ell)\psi_a(\br_\ell)\Big]\phi_P(\br)\\
+  &\equiv \sum_P d_{ia,P}\,\phi_P(\br).
+\end{aligned}
+\end{equation}
+The exact transition density is neutral, $\int\psi_i\psi_a = 0$ by orthogonality. The fitted one
+is not: its charge $m_{ia} = \sum_P c_P\,d_{ia,P}$ is a small but nonzero number set by the grid
+and the fit (the grid cannot represent orthogonality, and the fit is regularised). This was
+found by J.~Wilhelm while converging his full-$k$-point RI-RS $GW$.
+
+A spurious charge is harmless for a molecule and nearly harmless for a 3D crystal, but not in
+two dimensions. On the $\bq$ mesh of a 2D calculation the Coulomb kernel in the charge channel
+is $v(\bq) = 2\pi/(Aq)$, so the charge mode of $\chi$ enters the dielectric function as
+\begin{equation}
+  \varepsilon_{00}(\bq) - 1 \;\sim\; \frac{2\pi}{Aq}\sum_{ia}\frac{2\,|m_{ia}|^2\,\Delta_{ia}}{\Delta_{ia}^2+\omega^2}
+  \;=\; \frac{C}{q},
+\end{equation}
+a $1/q$ divergence with a spurious prefactor. Summed over a 2D mesh the mesh points approach
+$\bq = 0$ as $1/N$, and $\sum_\bq 1/q$ over an $N\times N$ mesh grows like $\ln N$: the
+screening, and with it the gap, drifts logarithmically with the mesh instead of converging. In
+Wilhelm's calculations the WSe$_2$ gap moved from 2.222 to 2.197~eV with the mesh; after
+projecting the charge out of every fitted density, $d' = d - c\,(c^\dagger d)/(c^\dagger c)$, it
+is 2.233~eV and stable; the 2D h-BN regression reference moved by $+0.92$~eV.
+
+The old large-cell scheme has the same fitted densities with the same spurious charge, but its
+Coulomb matrix is not $2\pi/(Aq)$. $V(\bq)$ is a real-space lattice sum truncated at the
+minimum-image radius $R_c \approx L/2$ of the supercell, whose charge-channel value is finite,
+$\int_0^{R_c}\!2\pi r\,\dd r/r = 2\pi R_c$ per cell area. The leak therefore does not
+diverge; it produces a finite spurious screening proportional to $|m|^2 R_c/A \propto 1/L$,
+i.e.\ a uniform downward shift of $\Sigma^c$ that decays only as the inverse cell size. That is
+exactly the signature in Table~\ref{tab:oldscheme}: a gap that is too small, converges slowly
+from below, and is still moving at 30~\AA. The sign of Wilhelm's fix ($+0.92$~eV for h-BN with
+his settings) and the sign of our discrepancy (old scheme below) agree.
+
+\paragraph{Why the $\Gamma$-only scheme is immune.}
+The $\Gamma$-only implementation never lets a fitted density interact through the charge
+channel of a sampled $V(\bq)$:
+\begin{itemize}
+\item the body of the dielectric matrix of the correction is built with the neutral projector,
+      $V_b = \Pi V(0)\Pi$, Eq.~\eqref{eq:Pi}, so the charge direction of the auxiliary basis
+      carries no Coulomb interaction at all in that body;
+\item the head and wings of $\varepsilon$ in the charge channel are built from the exact
+      velocity-gauge transition dipoles, Eq.~\eqref{eq:dipole}, checked by the sum rule of
+      Eq.~\eqref{eq:TRK}, and integrated analytically over the whole small Brillouin zone with
+      the $2\pi/q$ kernel;
+\item the regular $W(\Gamma)$ uses $V(0)$ with only the divergent $\bG = 0$ constant removed,
+      Eq.~\eqref{eq:Vreg}, and the charge direction of that matrix is quenched in
+      $\varepsilon^{-1}$.
+\end{itemize}
+This is the same treatment of the charge channel as Wilhelm's $\Gamma$ model, which is why the
+two codes agree once his leak is removed. The agreement (15~meV at $8\times8$ versus
+$24\times24$, with the remaining difference of the size expected from the $8\times8$ cell) is
+the actual validation of the $\Gamma$-only scheme; the old large-cell numbers are not.
+
+\paragraph{Consequences.} Band gaps of 2D systems produced by
+\texttt{tensor\_large\_cell\_Gamma} or \texttt{ri\_rs\_large\_cell\_Gamma} with
+\texttt{KPOINTS\_W} $n\,n\,1$ ($n>1$) carry a cell-size-dependent error of order $0.1$~eV at
+30~\AA\ and more than 1~eV on cells of 20~\AA, and should not be used as references or
+regression values. For 2D the large-cell code should be run $\Gamma$-only
+(\texttt{KPOINTS\_W 1 1 1}), which activates the head-and-wing correction; the same holds for
+3D cells (\texttt{PERIODIC XYZ}), where $V(0)$ is an Ewald sum with the $\bG=0$ term omitted.
+
+\subsection{Gaussian form factors of the auxiliary charges are not needed}
+\label{sec:formfactor}
+
+The 2D correction treats the auxiliary Gaussians as point charges at their centres, the limit
+$q_\mathrm{max}\sigma_P\ll1$ of Eq.~\eqref{eq:Zl0}; the Gaussian form factors
+$\ee^{-q^2/4\alpha}$ are neglected. With the most diffuse $s$ exponent of the aug-SZV RI basis
+($\alpha = 0.199$) the head kernel changes by 7\,\% on the $3\times3$ cell, 1.8\,\% at
+$6\times6$, 1.1\,\% at $8\times8$ and 0.4\,\% at $14\times14$. On a head contribution of
+$\sim30$~meV to the gap this is below 1~meV on production cells, and the form factors are not
+implemented. In 3D the question does not arise: the correction is applied in the orbital basis,
+Eq.~\eqref{eq:What}, and involves no auxiliary charges.
+
+\subsection{Remaining approximations}
+\label{sec:disc_approx}
+\label{sec:approx}
+
+Four approximations of the model remain. (i) The body of $W$ is taken at $\Gamma$ only, so its
+dispersion across the small Brillouin zone is not corrected; this error decreases with the cell
+size, and the cells for which the method is intended have a flat body. (ii) In 2D, the
+constant-function head carries no $\ee^{-q|z-z'|}$ form factor for the finite thickness of the
+layer: a state that extends several \AA\ into the vacuum couples to the charge mode with a
+factor $\ee^{-q|z|}$ that is $0.7$ at $q=0.1$~\AA$^{-1}$ and $z=4$~\AA. Our integral runs
+over the whole small Brillouin zone ($q\le\pi/9a$ for a $9\times9$ cell) while the PR applies
+its model only to the cells adjacent to $\Gamma$ ($q\le\pi/24a$), so the two schemes are
+affected differently; this is the natural explanation of the $0.09$~eV difference in
+$\Sigma^c$ of the nearly-free-electron conduction state of h-AlN (Sec.~\ref{sec:res2d}),
+and it is not a property of the box of the lattice sum: the subtracted constant
+$D_\mathrm{box}$ grows with the box while the finite remainder of the charge channel does not
+(h-BN, $8\times8$: $s=4$ and $s=5$ boxes differ by 1~meV in the gap). (iii) In 3D, the
+small-$q$ expansion of the pair phase, Eq.~\eqref{eq:pair_phi0}, holds for $|\bq\cdot\mathbf
+d_{nm}|<1$; nearly degenerate pairs with a finite coupling violate it, and their dipoles are
+clipped at $1/q_{\max}$ (484 of $512^2$ pairs in the 128-atom diamond cell). (iv) The
+orbital-diagonal application neglects the off-diagonal elements $\Delta\Sigma^c_{nm}$,
+$n\neq m$, which only matter if the correction were allowed to mix quasiparticle states.
+
+%======================================================================================
+\section{Conclusions}
+\label{sec:conclusions}
+%======================================================================================
+
+$\Gamma$-only RI-RS $GW$ of periodic large cells is made well defined by separating the charge
+channel of the auxiliary basis. In 2D slabs its divergent lattice sum is removed from $V(0)$
+as a single rank-one constant, $D_\mathrm{box}\,cc^\Tr$, computed exactly as a boundary integral
+of the image box; in 3D bulk cells $V(0)$ is the Ewald sum with the $\bG=0$ term omitted. The
+charge channel is put back analytically through the normalized constant function, whose
+screened head and wings follow in closed form from the velocity-gauge transition dipoles and the
+Gaussian dielectric body and are integrated over the whole small Brillouin zone of the
+supercell; nothing is subtracted. In 2D the correction is applied in the auxiliary basis, at
+negligible cost. In 3D, where the head is eV-sized and an RI-space application is amplified by
+the fit, it is applied to $\Sigma^c$ in the orbital basis through a single orbital-pair kernel
+that contains the head, the head-dipole and the wing terms. The implementation in \cpk{} is
+activated automatically by \texttt{KPOINTS\_W 1 1 1} for \texttt{PERIODIC XY} and
+\texttt{PERIODIC XYZ}, and chooses replicated or distributed dense algebra from a memory
+estimate. The earlier $k$-mesh large-cell scheme carries a spurious charge leak of the fitted
+pair densities and should not be used as a reference for 2D systems.
+Numerically, the slab correction reproduces the converged full-$k$ RI-RS $GW$ of PR~\#6447
+to 15--75~meV for h-BN (two bases), SiC and h-GaN, with a 0.25~eV deviation for the
+nearly-free-electron conduction state of h-AlN. For diamond the exchange of the $\Gamma$-only
+RI-RS code is identical to the exact-RI tensor result, the dipole terms of the bulk kernel
+scale as $1/\Omega$ as derived, and the gap converges with the cell to within 0.1~eV by 250
+atoms; the 0.4~eV that separates the two codes at convergence lies in $\Sigma^c$ and is being
+arbitrated by the standard tensor $k$-point $GW$. The correction costs about 1~\% of a
+128-atom run.
+
+\begin{acknowledgments}
+The full-$k$ reference calculations use the implementation of J.~Wilhelm (cp2k PR~\#6447).
+Computations were carried out on the Noctua~2 cluster of the Paderborn Center for Parallel
+Computing (PC$^2$).
+\end{acknowledgments}
+
+\begin{thebibliography}{2}
+\bibitem{wilhelm_fullk}
+J.~Wilhelm, \emph{Periodic real-space RI for full-$k$ $GW$ band structures}, manuscript in
+preparation.
+\bibitem{pr6447}
+\cpk{} pull request \#6447, \url{https://github.com/cp2k/cp2k/pull/6447}.
+\end{thebibliography}
+
+\end{document}

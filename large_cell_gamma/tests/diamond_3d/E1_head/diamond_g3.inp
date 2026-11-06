@@ -1,0 +1,81 @@
+! Gamma-only RI-RS (KPOINTS_W 1 1 1 + 3D head-and-wing correction) on a 3x3x3 supercell of the
+! primitive diamond cell (54 atoms). Deterministic settings (EPS_FILTER 1e-12).
+&GLOBAL
+  RUN_TYPE     ENERGY
+  PROJECT      diamond_g3
+  PRINT_LEVEL  MEDIUM
+&END GLOBAL
+&FORCE_EVAL
+  METHOD QS
+  &DFT
+    BASIS_SET_FILE_NAME  BASIS_MOLOPT
+    BASIS_SET_FILE_NAME  BASIS_RI_MOLOPT
+    POTENTIAL_FILE_NAME  POTENTIAL
+    &MGRID
+      CUTOFF 400
+      REL_CUTOFF 50
+    &END MGRID
+    &QS
+      METHOD GPW
+      EPS_DEFAULT 1.0E-12
+      EPS_PGF_ORB 1.0E-8
+    &END QS
+    &SCF
+      EPS_SCF 1.0E-7
+      MAX_SCF 100
+      &MIXING
+        METHOD BROYDEN_MIXING
+        ALPHA 0.4
+        NBROYDEN 4
+      &END MIXING
+    &END SCF
+    &XC
+      &XC_FUNCTIONAL PBE
+      &END XC_FUNCTIONAL
+    &END XC
+    &POISSON
+      PERIODIC XYZ
+      POISSON_SOLVER PERIODIC
+    &END POISSON
+  &END DFT
+  &PROPERTIES
+    &BANDSTRUCTURE
+      &GW
+        NUM_TIME_FREQ_POINTS      10
+        EPS_FILTER 1.0E-12
+        KPOINTS_W              1 1 1
+        SIZE_LATTICE_SUM           2
+        &RI_RS
+        &END
+      &END GW
+      &DOS
+        KPOINTS 1 1 1
+      &END DOS
+      &BANDSTRUCTURE_PATH
+        SPECIAL_POINT GAMMA 0.0 0.0 0.0
+      &END
+    &END BANDSTRUCTURE
+  &END PROPERTIES
+  &SUBSYS
+    &CELL
+      PERIODIC XYZ
+      A  0.00000 1.78350 1.78350
+      B  1.78350 0.00000 1.78350
+      C  1.78350 1.78350 0.00000
+      MULTIPLE_UNIT_CELL 3 3 3
+    &END CELL
+    &COORD
+      SCALED
+      C 0.00 0.00 0.00
+      C 0.25 0.25 0.25
+    &END COORD
+    &TOPOLOGY
+      MULTIPLE_UNIT_CELL 3 3 3
+    &END TOPOLOGY
+    &KIND C
+      BASIS_SET ORB SZV-MOLOPT-SR-GTH
+      BASIS_SET RI_AUX RI_20_2_2_1_1_0_0_0_1.6e-02
+      POTENTIAL GTH-PBE-q4
+    &END KIND
+  &END SUBSYS
+&END FORCE_EVAL
