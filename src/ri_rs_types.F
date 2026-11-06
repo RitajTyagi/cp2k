@@ -123,6 +123,11 @@ MODULE ri_rs_types
       ! head_pot_time(i_t): the head potential w(i tau) = K_h(0, i omega)/Omega transformed to
       ! imaginary time; gamma_corr_add_to_sigma adds -+ w S G S to Sigma^c(-+ i tau) (3D only).
       REAL(KIND=dp), ALLOCATABLE                       :: head_pot_time(:)
+      ! head_pot_freq(i_w): the same head potential in imaginary frequency; A_wing(a,b,i_w) and
+      ! B_hd(a,b,i_w): the cell-averaged wing and head-dipole tensors (1/Omega), see
+      ! gamma_corr_add_to_sigma (3D only).
+      REAL(KIND=dp), ALLOCATABLE                       :: head_pot_freq(:)
+      REAL(KIND=dp), ALLOCATABLE                       :: A_wing(:, :, :), B_hd(:, :, :)
    END TYPE gamma_corr_type
 
    ! User input for the in-memory RI-RS grid optimization.
@@ -262,6 +267,9 @@ CONTAINS
       IF (ALLOCATED(ri_rs%gamma_corr%head_coef)) DEALLOCATE (ri_rs%gamma_corr%head_coef)
       IF (ALLOCATED(ri_rs%gamma_corr%wing_coef)) DEALLOCATE (ri_rs%gamma_corr%wing_coef)
       IF (ALLOCATED(ri_rs%gamma_corr%head_pot_time)) DEALLOCATE (ri_rs%gamma_corr%head_pot_time)
+      IF (ALLOCATED(ri_rs%gamma_corr%head_pot_freq)) DEALLOCATE (ri_rs%gamma_corr%head_pot_freq)
+      IF (ALLOCATED(ri_rs%gamma_corr%A_wing)) DEALLOCATE (ri_rs%gamma_corr%A_wing)
+      IF (ALLOCATED(ri_rs%gamma_corr%B_hd)) DEALLOCATE (ri_rs%gamma_corr%B_hd)
       ri_rs%gamma_corr%ready = .FALSE.
 
       CALL timestop(handle)

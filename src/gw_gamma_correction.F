@@ -1103,6 +1103,57 @@ CONTAINS
    END SUBROUTINE gamma_corr_phi_quadratic_form
 
 ! **************************************************************************************************
+!> \brief AO matrices of the commutator [H, r^α] = −∂^α + [V_nl, r^α], α = x, y, z.
+!>
+!>        Construction follows the COMMUTATOR_HR print path in qs_scf_post_gpw: both builders
+!>        ACCUMULATE into the same antisymmetric matrix, then one overall sign makes it [H, r].
+!>        build_com_mom_nl returns immediately when sap_ppnl is null, so all-electron runs get the
+!>        bare −∂^α, which is the correct commutator for a purely local potential. The commutator
+!>        replaces the position operator, which is not a legal operator under periodic boundary
+!>        conditions (see gamma_corr_transition_dipoles).
+!> \param qs_env QS environment, for the AO overlap template, neighbor lists and pseudopotential
+!> \param moments the three antisymmetric AO matrices, allocated here (caller deallocates)
+! **************************************************************************************************
+   SUBROUTINE gamma_corr_commutator_matrices(qs_env, moments)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: moments
+
+      INTEGER                                            :: i_dir
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_s
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_orb, sap_ppnl
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+
+      NULLIFY (matrix_s, particle_set, qs_kind_set, sab_orb, sap_ppnl, cell, dft_control)
+      CALL get_qs_env(qs_env, matrix_s=matrix_s, particle_set=particle_set, &
+                      qs_kind_set=qs_kind_set, sab_orb=sab_orb, sap_ppnl=sap_ppnl, &
+                      cell=cell, dft_control=dft_control)
+
+      ! Antisymmetric (real, anti-Hermitian operator), sparsity of sab_orb, zero-initialized.
+      CALL dbcsr_allocate_matrix_set(moments, 3)
+      DO i_dir = 1, 3
+         ALLOCATE (moments(i_dir)%matrix)
+         CALL dbcsr_create(moments(i_dir)%matrix, template=matrix_s(1)%matrix, &
+                           name='COMMUTATOR_HR', matrix_type=dbcsr_type_antisymmetric)
+         CALL cp_dbcsr_alloc_block_from_nbl(moments(i_dir)%matrix, sab_orb)
+         CALL dbcsr_set(moments(i_dir)%matrix, 0.0_dp)
+      END DO
+      ! Accumulate [r^α, V_nl] (build_com_mom_nl, matrix_rv) ...
+      CALL build_com_mom_nl(qs_kind_set, sab_orb, sap_ppnl, dft_control%qs_control%eps_ppnl, &
+                            particle_set, cell, matrix_rv=moments)
+      ! ... plus ⟨µ|∂^α|ν⟩ (build_lin_mom_matrix), ...
+      CALL build_lin_mom_matrix(qs_env, moments)
+      ! ... and negate: −(∂^α + [r^α, V_nl]) = −∂^α + [V_nl, r^α] = [H, r^α].
+      DO i_dir = 1, 3
+         CALL dbcsr_scale(moments(i_dir)%matrix, alpha_scalar=-1.0_dp)
+      END DO
+
+   END SUBROUTINE gamma_corr_commutator_matrices
+
+! **************************************************************************************************
 !> \brief Optical transition dipoles µ^α_ai between occupied i and empty a at Γ.
 !>
 !>        gwp42 Eq. 41 writes the interband position matrix element as the AO position matrix
@@ -1143,15 +1194,9 @@ CONTAINS
       REAL(KIND=dp)                                      :: delta, n_elec
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: mu_mo
       REAL(KIND=dp), DIMENSION(3)                        :: f_sum
-      TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_fm_struct_type), POINTER                   :: struct_mo_mo
       TYPE(cp_fm_type)                                   :: fm_mo_mo, fm_r_ao, fm_r_mo
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_s, moments
-      TYPE(dft_control_type), POINTER                    :: dft_control
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
-         POINTER                                         :: sab_orb, sap_ppnl
-      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
-      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: moments
 
       CALL timeset(routineN, handle)
 
@@ -1178,31 +1223,10 @@ CONTAINS
       ! ACCUMULATE into the same antisymmetric matrix, then one overall sign makes it [H, r].
       ! build_com_mom_nl returns immediately when sap_ppnl is null, so all-electron runs get the
       ! bare -∂^α, which is the correct commutator for a purely local potential.
-      NULLIFY (matrix_s, particle_set, qs_kind_set, sab_orb, sap_ppnl, cell, dft_control)
-      CALL get_qs_env(qs_env, matrix_s=matrix_s, particle_set=particle_set, &
-                      qs_kind_set=qs_kind_set, sab_orb=sab_orb, sap_ppnl=sap_ppnl, &
-                      cell=cell, dft_control=dft_control)
 
-      ! moments(α) = AO matrix of [H, r^α], α = x, y, z: antisymmetric (real, anti-Hermitian
-      ! operator), with the sparsity of the orbital neighbor list sab_orb, zero-initialized.
+      ! moments(α) = AO matrix of [H, r^α], α = x, y, z (gamma_corr_commutator_matrices).
       NULLIFY (moments)
-      CALL dbcsr_allocate_matrix_set(moments, 3)
-      DO i_dir = 1, 3
-         ALLOCATE (moments(i_dir)%matrix)
-         CALL dbcsr_create(moments(i_dir)%matrix, template=matrix_s(1)%matrix, &
-                           name='COMMUTATOR_HR', matrix_type=dbcsr_type_antisymmetric)
-         CALL cp_dbcsr_alloc_block_from_nbl(moments(i_dir)%matrix, sab_orb)
-         CALL dbcsr_set(moments(i_dir)%matrix, 0.0_dp)
-      END DO
-      ! Accumulate [r^α, V_nl] (build_com_mom_nl, matrix_rv) ...
-      CALL build_com_mom_nl(qs_kind_set, sab_orb, sap_ppnl, dft_control%qs_control%eps_ppnl, &
-                            particle_set, cell, matrix_rv=moments)
-      ! ... plus ⟨µ|∂^α|ν⟩ (build_lin_mom_matrix), ...
-      CALL build_lin_mom_matrix(qs_env, moments)
-      ! ... and negate: −(∂^α + [r^α, V_nl]) = −∂^α + [V_nl, r^α] = [H, r^α].
-      DO i_dir = 1, 3
-         CALL dbcsr_scale(moments(i_dir)%matrix, alpha_scalar=-1.0_dp)
-      END DO
+      CALL gamma_corr_commutator_matrices(qs_env, moments)
 
       ! mu is sized for the worst case over spins: the largest occupied count and the largest
       ! empty count n_mo − min(n_occ). Entries beyond a spin's own (n_occ, n_vir) stay zero.
@@ -2628,6 +2652,9 @@ CONTAINS
       CALL gamma_corr_bz_faces(bs_env, n_face, gc%dir_hat, dir_weight, gc%dir_radius)
       n_dir = SIZE(dir_weight)
       ALLOCATE (gc%head_coef(n_dir, n_t), gc%wing_coef(n_dir, n_t))
+      ALLOCATE (gc%A_wing(3, 3, n_t), gc%B_hd(3, 3, n_t))
+      gc%A_wing(:, :, :) = 0.0_dp
+      gc%B_hd(:, :, :) = 0.0_dp
 
       DO i_w = 1, n_t
          DO i_dir = 1, n_dir
@@ -2640,24 +2667,36 @@ CONTAINS
             ! head: −(Ω/(2π)³) w · 16π² a/(1 + 4πa);  wing: (Ω/(2π)³) w · 4π/(1 + 4πa)
             gc%head_coef(i_dir, i_w) = -prefactor*dir_weight(i_dir)*16.0_dp*pi**2*a_scalar/denom
             gc%wing_coef(i_dir, i_w) = prefactor*dir_weight(i_dir)*fourpi/denom
+            ! Cell averages of the q-independent dipole terms (gamma_corr_add_to_sigma):
+            !   A_αβ = (1/(2π)³) ∫_cell d³q (4π/(1 + 4πa)) q̂_α q̂_β              (wing)
+            !   B_αβ = (1/(2π)³) ∫_cell d³q 4π (1/(1 + 4πa) − 1) q̂_α q̂_β        (head-dipole)
+            ! with ∫_cell d³q f(q̂) = Σ_q̂ w(q̂) L(q̂)³/3 f(q̂); both are of order 1/Ω.
+            gc%A_wing(:, :, i_w) = gc%A_wing(:, :, i_w) + &
+                                   dir_weight(i_dir)*gc%dir_radius(i_dir)**3/3.0_dp/twopi**3* &
+                                   fourpi/denom*SPREAD(gc%dir_hat(:, i_dir), 2, 3)* &
+                                   SPREAD(gc%dir_hat(:, i_dir), 1, 3)
+            gc%B_hd(:, :, i_w) = gc%B_hd(:, :, i_w) + &
+                                 dir_weight(i_dir)*gc%dir_radius(i_dir)**3/3.0_dp/twopi**3* &
+                                 fourpi*(1.0_dp/denom - 1.0_dp)*SPREAD(gc%dir_hat(:, i_dir), 2, 3)* &
+                                 SPREAD(gc%dir_hat(:, i_dir), 1, 3)
          END DO
       END DO
 
       ! Head potential w(iω) = K_h(R = 0, iω)/Ω, the Brillouin-zone-cell average of the screened
       ! head (4π/q²)(1/ε̃ − 1), transformed to imaginary time with the cosine weights of the
       ! minimax grid (the same transform W^MIC undergoes). gamma_corr_add_to_sigma consumes it.
-      ALLOCATE (K_h0(n_t), K_w0(3, n_t), gc%head_pot_time(n_t))
+      ALLOCATE (K_h0(n_t), K_w0(3, n_t), gc%head_pot_time(n_t), gc%head_pot_freq(n_t))
       CALL gamma_corr_kernel_bulk(gc, n_t, [0.0_dp, 0.0_dp, 0.0_dp], K_h0, K_w0)
+      gc%head_pot_freq(:) = K_h0/gc%measure
       DO i_t = 1, n_t
          gc%head_pot_time(i_t) = SUM(bs_env%time_frequency_grid%cosine_frequency_to_time(i_t, :)* &
                                      K_h0)/gc%measure
       END DO
 
-      ! The direction data and T_RI are not needed in 3D once the head potential is known
-      ! (wings: not yet implemented in the orbital-basis form, see gamma_corr_add_to_sigma).
+      ! The direction data are consumed; T_RI, A_wing, B_hd and head_pot_time are kept for
+      ! gamma_corr_add_to_sigma.
       DEALLOCATE (gc%S_head, dir_weight, gc%head_coef, gc%wing_coef, gc%dir_hat, gc%dir_radius, &
                   K_w0)
-      IF (ALLOCATED(gc%T_RI)) DEALLOCATE (gc%T_RI)
 
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A,I5,A,T62,F10.1,A)') &
@@ -2669,6 +2708,9 @@ CONTAINS
          WRITE (bs_env%unit_nr, '(T4,A,T62,2F10.3)') &
             'Head potential in imaginary time, tau_1, tau_n (eV)', &
             gc%head_pot_time(1)*evolt, gc%head_pot_time(n_t)*evolt
+         WRITE (bs_env%unit_nr, '(T4,A,T62,2ES10.2)') &
+            'Wing tensor A_xx and head-dipole tensor B_xx at omega_1 (Ha/bohr^3)', &
+            gc%A_wing(1, 1, 1), gc%B_hd(1, 1, 1)
          WRITE (bs_env%unit_nr, '(A)') ' '
       END IF
       DEALLOCATE (K_h0)
@@ -2727,46 +2769,75 @@ CONTAINS
 
 
 ! **************************************************************************************************
-!> \brief Bulk cell: add the Γ-point head correction to Σ^c(±iτ) in the atomic-orbital basis.
+!> \brief Bulk cell: add the Γ-point head, head-dipole and wing corrections to Σ^c(±iτ) in the
+!>        atomic-orbital basis, through one orbital-pair kernel Ŵ_nm.
 !>
-!>        The head of the correction is a potential that is uniform in space,
-!>        ΔW(r, r'; iτ) = w(iτ) with w(iω) = K_h(0, iω)/Ω (gamma_corr_direction_coefficients):
-!>        the Brillouin-zone-cell average of (4π/q²)(1/ε̃(q̂, iω) − 1) that the Γ-point W cannot
-!>        contain. With the Σ^c construction of compute_Sigma_c,
+!>        The correction ΔW of the extended basis {ϕ_0 = e^{iq·r}/√Ω, ϕ_P} has the head
+!>        W_00(q) = (4π/q²)(1/ε̃ − 1) and the wings W_P0(q) = i(4π/q)(q̂·T_P)/ε̃ with
+!>        ε̃ = 1 + 4π a(q̂, iω) (gamma_corr_direction_coefficients). Between orbital pair
+!>        densities ρ_nm = ψ_n ψ_m its Brillouin-zone-cell average needs only
 !>
-!>          Σ^c(iτ, τ < 0) = −G^occ(i|τ|) ∘ W(iτ),    Σ^c(iτ, τ > 0) = +G^vir(i|τ|) ∘ W(iτ),
+!>          ⟨mn|ϕ_0⟩ = (1/√Ω) ∫ρ_mn e^{iq·r} = (δ_mn + i q·d_mn)/√Ω + O(q²),
 !>
-!>        a uniform W enters as ΔΣ^c(r, r') = ∓ w(iτ) G^{occ/vir}(r, r'), i.e. in the orbital
-!>        basis
+!>        with d_nm = ⟨n|r|m⟩ = ⟨n|[H,r]|m⟩/(ε_n − ε_m) the velocity-gauge dipole between ANY two
+!>        orbitals (zero between folded states of different crystal momentum, where the
+!>        commutator vanishes, and set to zero inside degenerate manifolds, where it is not
+!>        defined). Collecting ⟨nm|ΔW(q)|mn⟩ and averaging over the cell gives the real kernel
 !>
-!>          ΔΣ^c_µν(−i|τ|) = −w(iτ) [S C_occ e^{−|τ|(ε_F − ε)} C_occᵀ S]_µν ,
-!>          ΔΣ^c_µν(+i|τ|) = +w(iτ) [S C_vir e^{−|τ|(ε − ε_F)} C_virᵀ S]_µν ,
+!>          Ŵ_nm(iω) = w(iω) δ_nm + Σ_αβ B_αβ(iω) d_nm,α d_nm,β
+!>                   + (2/√Ω) Σ_αβ A_αβ(iω) V_nm,α(iω) d_nm,β ,
 !>
-!>        whose orbital diagonal is ∓ w(iτ) e^{−|τ(ε_n − ε_F)|} for n occupied/empty and zero
-!>        otherwise (Cᵀ S C = 1): the exact statement that a uniform potential couples a state
-!>        only to itself. In the static limit this is the ±w/2 shift of the COHSEX head. The
-!>        overlap S folds the correction onto the band and DOS k-points of the supercell exactly
-!>        like the regular Σ^c. No RI fit and no grid is involved; the cost is three n_AO³
-!>        products per time point and spin.
+!>          w = K_h(0)/Ω,   A_αβ = (1/(2π)³)∫_cell d³q (4π/ε̃) q̂_α q̂_β,
+!>          B_αβ = (1/(2π)³)∫_cell d³q 4π (1/ε̃ − 1) q̂_α q̂_β,
+!>          V_nm,α(iω) = ∫ρ_nm(r) w_α(r; iω),   w_α = Σ_P ϕ̂_P T_Pα ,
 !>
-!>        Not yet included in 3D: the wings and the head-dipole term, i.e. the O(q·d_nm) terms of
-!>        ⟨m|e^{iq·r}|n⟩ = δ_nm + i q·d_nm + …; their cell averages scale as 1/Ω against the
-!>        1/L of the head and are left for a later step.
-!> \param bs_env band-structure environment: head potential, MO coefficients, overlap, levels
+!>        where the head (first term, order 1/L) is a uniform potential, the head-dipole term
+!>        is the O(q²) remainder of the head, and the wing couples the dipole of the pair
+!>        density to the potential w_α that the uniform field induces in the body (order 1/Ω
+!>        each). V_nm is evaluated on the RI-RS grid as the linear functional
+!>        Σ_ℓ ρ_nm(r_ℓ) w̃_ℓα with w̃ = Z M⁻¹ T: exact for linear functionals of a density,
+!>        unlike the pair kernel c_P c_Q K_h(R_PQ) that the RI-space application needed.
+!>
+!>        With the Σ^c construction of compute_Sigma_c (Σ^c(−i|τ|) = −G^occ ∘ W,
+!>        Σ^c(+i|τ|) = +G^vir ∘ W) and Ŵ transformed to imaginary time with the cosine weights
+!>        of the minimax grid, the orbital-diagonal correction is
+!>
+!>          ΔΣ^c_n(−i|τ|) = −Σ_{m occ} e^{−|τ|(ε_F − ε_m)} Ŵ_nm(iτ),
+!>          ΔΣ^c_n(+i|τ|) = +Σ_{m vir} e^{−|τ|(ε_m − ε_F)} Ŵ_nm(iτ),
+!>
+!>        added to the stored AO matrices as (SC) diag(ΔΣ_n) (SC)ᵀ, so that it folds onto the band
+!>        and DOS k-points exactly like the regular Σ^c (Cᵀ S C = 1). For the head alone this is
+!>        ∓w(iτ) e^{−|τ(ε_n−ε_F)|} on the diagonal, the ±w/2 shift of the COHSEX head in the
+!>        static limit. Cost per frequency: three Φᵀ diag(w̃) Φ products on the grid, six
+!>        n_AO² n_MO transforms and an n_MO²/n_ranks element loop; no RI fit of a kernel anywhere.
+!> \param bs_env band-structure environment: head potential, tensors, T_RI, MOs, overlap, levels
+!> \param qs_env QS environment, for the commutator matrices of the dipoles
 !> \param fm_Sigma_c_Gamma_time Σ^c_µν(±i|τ_j|) per time point, sector (1 = +, 2 = −) and spin
 ! **************************************************************************************************
-   SUBROUTINE gamma_corr_add_to_sigma(bs_env, fm_Sigma_c_Gamma_time)
+   SUBROUTINE gamma_corr_add_to_sigma(bs_env, qs_env, fm_Sigma_c_Gamma_time)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(cp_fm_type), DIMENSION(:, :, :), &
          INTENT(INOUT)                                   :: fm_Sigma_c_Gamma_time
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_add_to_sigma'
+      REAL(KIND=dp), PARAMETER                           :: eps_degenerate = 1.0E-5_dp
 
-      INTEGER                                            :: handle, i_sector, i_spin, i_t, n, &
-                                                            n_ao, n_occ, n_t
-      REAL(KIND=dp)                                      :: sign_w, start_time, tau, tau_E
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: scaling
-      TYPE(cp_fm_type)                                   :: fm_C, fm_G, fm_SG
+      INTEGER :: col, handle, i_col, i_dir, i_row, i_sector, i_spin, i_t, i_w, j_dir, m, n, &
+         n_ao, n_grid, n_mo, n_occ, n_RI, n_t, ncol_local, nrow_local, row
+      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
+      REAL(KIND=dp)                                      :: delta, inv_sqrt_V, start_time, tau, &
+                                                            tau_E, w_hat
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: g_branch, scaling, y_loc
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: u_RI, w_grid
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: dSigma
+      REAL(KIND=dp), DIMENSION(3)                        :: d_nm, v_nm
+      TYPE(cp_fm_struct_type), POINTER                   :: struct_mo_mo, struct_RI_3
+      TYPE(cp_fm_type)                                   :: fm_ao_ao, fm_ao_mo, fm_C_scaled, &
+                                                            fm_SC, fm_T, fm_u, fm_What
+      TYPE(cp_fm_type), DIMENSION(3)                     :: fm_d, fm_V
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: moments
+      TYPE(dbcsr_type)                                   :: mat_Omega, mat_phi_own, mat_phi_scaled
       TYPE(gamma_corr_type), POINTER                     :: gc
 
       CALL timeset(routineN, handle)
@@ -2774,52 +2845,206 @@ CONTAINS
 
       gc => bs_env%ri_rs%gamma_corr
       CPASSERT(gc%ready .AND. .NOT. gc%slab .AND. ALLOCATED(gc%head_pot_time))
+      CPASSERT(ALLOCATED(gc%T_RI) .AND. ALLOCATED(gc%A_wing))
       n_ao = bs_env%n_ao
+      n_RI = bs_env%n_RI
+      n_grid = bs_env%ri_rs%n_grid_points
       n_t = bs_env%num_time_freq_points
+      n_mo = bs_env%n_mo_retained
+      IF (n_mo <= 0) n_mo = n_ao
+      inv_sqrt_V = 1.0_dp/SQRT(gc%measure)
 
-      CALL cp_fm_create(fm_C, bs_env%fm_s_Gamma%matrix_struct)
-      CALL cp_fm_create(fm_G, bs_env%fm_s_Gamma%matrix_struct)
-      CALL cp_fm_create(fm_SG, bs_env%fm_s_Gamma%matrix_struct)
-      ALLOCATE (scaling(n_ao))
+      ! Work matrices: n_MO x n_MO for d, V and Ŵ; n_AO x n_AO and n_AO x n_MO intermediates;
+      ! n_RI x 3 for T(iω) and u = M⁻¹ T.
+      NULLIFY (struct_mo_mo, struct_RI_3)
+      CALL cp_fm_struct_create(struct_mo_mo, &
+                               context=bs_env%fm_mo_coeff_Gamma(1)%matrix_struct%context, &
+                               para_env=bs_env%fm_mo_coeff_Gamma(1)%matrix_struct%para_env, &
+                               nrow_global=n_mo, ncol_global=n_mo)
+      CALL cp_fm_struct_create(struct_RI_3, &
+                               context=bs_env%fm_RI_RI%matrix_struct%context, &
+                               para_env=bs_env%fm_RI_RI%matrix_struct%para_env, &
+                               nrow_global=n_RI, ncol_global=3)
+      DO i_dir = 1, 3
+         CALL cp_fm_create(fm_d(i_dir), struct_mo_mo)
+         CALL cp_fm_create(fm_V(i_dir), struct_mo_mo)
+      END DO
+      CALL cp_fm_create(fm_What, struct_mo_mo)
+      CALL cp_fm_create(fm_ao_ao, bs_env%fm_s_Gamma%matrix_struct)
+      CALL cp_fm_create(fm_ao_mo, bs_env%fm_mo_coeff_Gamma(1)%matrix_struct)
+      CALL cp_fm_create(fm_SC, bs_env%fm_mo_coeff_Gamma(1)%matrix_struct)
+      CALL cp_fm_create(fm_C_scaled, bs_env%fm_mo_coeff_Gamma(1)%matrix_struct)
+      CALL cp_fm_create(fm_T, struct_RI_3)
+      CALL cp_fm_create(fm_u, struct_RI_3)
+      CALL cp_fm_get_info(fm_What, nrow_local=nrow_local, ncol_local=ncol_local, &
+                          row_indices=row_indices, col_indices=col_indices)
+      ALLOCATE (u_RI(n_RI, 3), w_grid(n_grid, 3), g_branch(n_mo), y_loc(n_mo), &
+                scaling(n_ao), dSigma(n_mo, n_t, 2))
+
+      ! Φ on its owner ranks and the result/scratch matrices of Φᵀ diag(w̃) Φ.
+      CALL dbcsr_create(mat_phi_own, template=bs_env%ri_rs%mat_phi_mu_l)
+      CALL dbcsr_complete_redistribute(bs_env%ri_rs%mat_phi_mu_l, mat_phi_own)
+      CALL dbcsr_create(mat_phi_scaled, template=mat_phi_own)
+      CALL dbcsr_create(mat_Omega, template=bs_env%mat_ao_ao%matrix)
+
+      ! [H, r^α] in the AO basis, shared by the spins.
+      NULLIFY (moments)
+      CALL gamma_corr_commutator_matrices(qs_env, moments)
 
       DO i_spin = 1, bs_env%n_spin
          n_occ = bs_env%n_occ(i_spin)
-         DO i_t = 1, n_t
-            tau = bs_env%time_frequency_grid%imaginary_time(i_t)
-            ! Sector 1 = positive time (empty states, +w), sector 2 = negative time (occupied, −w).
-            DO i_sector = 1, 2
-               ! Column scaling e^{−|τ(ε_n − ε_F)|/2} on the states of this sector, zero elsewhere;
-               ! the same stabilization as G_occ_vir (exponent capped at stabilize_exp).
-               DO n = 1, n_ao
-                  scaling(n) = 0.0_dp
-                  IF ((i_sector == 1 .AND. n > n_occ) .OR. (i_sector == 2 .AND. n <= n_occ)) THEN
-                     tau_E = ABS(0.5_dp*tau*(bs_env%eigenval_scf_Gamma(n, i_spin) - &
-                                             bs_env%e_fermi(i_spin)))
-                     IF (tau_E < bs_env%stabilize_exp) scaling(n) = EXP(-tau_E)
+
+         ! ---------------------------------------------------------------------------------
+         ! 1. Dipoles d_nm = ⟨n|[H,r^α]|m⟩/(ε_n − ε_m) for all pairs of retained MOs.
+         ! ---------------------------------------------------------------------------------
+         DO i_dir = 1, 3
+            CALL cp_fm_set_all(fm_ao_ao, 0.0_dp)
+            CALL copy_dbcsr_to_fm(moments(i_dir)%matrix, fm_ao_ao)
+            CALL parallel_gemm('N', 'N', n_ao, n_mo, n_ao, 1.0_dp, fm_ao_ao, &
+                               bs_env%fm_mo_coeff_Gamma(i_spin), 0.0_dp, fm_ao_mo)
+            CALL parallel_gemm('T', 'N', n_mo, n_mo, n_ao, 1.0_dp, &
+                               bs_env%fm_mo_coeff_Gamma(i_spin), fm_ao_mo, 0.0_dp, fm_d(i_dir))
+            DO i_col = 1, ncol_local
+               m = col_indices(i_col)
+               DO i_row = 1, nrow_local
+                  n = row_indices(i_row)
+                  delta = bs_env%eigenval_scf_Gamma(n, i_spin) - bs_env%eigenval_scf_Gamma(m, i_spin)
+                  IF (ABS(delta) > eps_degenerate) THEN
+                     fm_d(i_dir)%local_data(i_row, i_col) = fm_d(i_dir)%local_data(i_row, i_col)/delta
+                  ELSE
+                     fm_d(i_dir)%local_data(i_row, i_col) = 0.0_dp
                   END IF
                END DO
-               ! G = C diag(e^{−|τ(ε−ε_F)|}) Cᵀ restricted to the sector.
-               CALL cp_fm_to_fm(bs_env%fm_mo_coeff_Gamma(i_spin), fm_C)
-               CALL cp_fm_column_scale(fm_C, scaling)
-               CALL parallel_gemm('N', 'T', n_ao, n_ao, n_ao, 1.0_dp, fm_C, fm_C, 0.0_dp, fm_G)
-               ! ΔΣ^c = ∓ w(iτ) S G S, accumulated into the stored Σ^c(±iτ).
-               CALL parallel_gemm('N', 'N', n_ao, n_ao, n_ao, 1.0_dp, bs_env%fm_s_Gamma, fm_G, &
-                                  0.0_dp, fm_SG)
-               sign_w = MERGE(1.0_dp, -1.0_dp, i_sector == 1)*gc%head_pot_time(i_t)
-               CALL parallel_gemm('N', 'N', n_ao, n_ao, n_ao, sign_w, fm_SG, bs_env%fm_s_Gamma, &
+            END DO
+         END DO
+
+         dSigma(:, :, :) = 0.0_dp
+         DO i_w = 1, n_t
+            ! ------------------------------------------------------------------------------
+            ! 2. Wing potential on the grid, w̃_ℓα = Σ_Q Z_ℓQ [M⁻¹ T(iω)]_Qα, and its orbital
+            !    matrix V_nm,α = Σ_ℓ ψ_n(r_ℓ) ψ_m(r_ℓ) w̃_ℓα = [Cᵀ (Φᵀ diag(w̃_α) Φ) C]_nm.
+            ! ------------------------------------------------------------------------------
+            CALL cp_fm_set_submatrix(fm_T, gc%T_RI(:, :, i_w))
+            CALL parallel_gemm('N', 'N', n_RI, 3, n_RI, 1.0_dp, bs_env%fm_Minv_Gamma, fm_T, &
+                               0.0_dp, fm_u)
+            CALL cp_fm_get_submatrix(fm_u, u_RI)
+            CALL gamma_corr_project_RI_to_grid(bs_env, u_RI, w_grid)
+            DO i_dir = 1, 3
+               CALL dbcsr_copy(mat_phi_scaled, mat_phi_own)
+               CALL gamma_corr_scale_rows(mat_phi_scaled, w_grid(:, i_dir))
+               CALL dbcsr_multiply('T', 'N', 1.0_dp, mat_phi_scaled, mat_phi_own, 0.0_dp, &
+                                   mat_Omega, filter_eps=bs_env%eps_filter)
+               CALL cp_fm_set_all(fm_ao_ao, 0.0_dp)
+               CALL copy_dbcsr_to_fm(mat_Omega, fm_ao_ao)
+               CALL parallel_gemm('N', 'N', n_ao, n_mo, n_ao, 1.0_dp, fm_ao_ao, &
+                                  bs_env%fm_mo_coeff_Gamma(i_spin), 0.0_dp, fm_ao_mo)
+               CALL parallel_gemm('T', 'N', n_mo, n_mo, n_ao, 1.0_dp, &
+                                  bs_env%fm_mo_coeff_Gamma(i_spin), fm_ao_mo, 0.0_dp, fm_V(i_dir))
+            END DO
+
+            ! ------------------------------------------------------------------------------
+            ! 3. Ŵ_nm(iω) on the local elements.
+            ! ------------------------------------------------------------------------------
+            DO i_col = 1, ncol_local
+               m = col_indices(i_col)
+               DO i_row = 1, nrow_local
+                  n = row_indices(i_row)
+                  DO i_dir = 1, 3
+                     d_nm(i_dir) = fm_d(i_dir)%local_data(i_row, i_col)
+                     v_nm(i_dir) = fm_V(i_dir)%local_data(i_row, i_col)
+                  END DO
+                  w_hat = 0.0_dp
+                  DO j_dir = 1, 3
+                     DO i_dir = 1, 3
+                        w_hat = w_hat + gc%B_hd(i_dir, j_dir, i_w)*d_nm(i_dir)*d_nm(j_dir) + &
+                                2.0_dp*inv_sqrt_V*gc%A_wing(i_dir, j_dir, i_w)*v_nm(i_dir)*d_nm(j_dir)
+                     END DO
+                  END DO
+                  IF (n == m) w_hat = w_hat + gc%head_pot_freq(i_w)
+                  fm_What%local_data(i_row, i_col) = w_hat
+               END DO
+            END DO
+
+            ! ------------------------------------------------------------------------------
+            ! 4. Branch sums per time point, ΔΣ_n(∓i|τ|) += ∓ cos(τ, ω) Σ_{m∈branch} g_m(τ) Ŵ_nm(iω).
+            ! ------------------------------------------------------------------------------
+            DO i_t = 1, n_t
+               tau = bs_env%time_frequency_grid%imaginary_time(i_t)
+               DO i_sector = 1, 2
+                  DO m = 1, n_mo
+                     g_branch(m) = 0.0_dp
+                     IF ((i_sector == 1 .AND. m > n_occ) .OR. (i_sector == 2 .AND. m <= n_occ)) THEN
+                        tau_E = ABS(tau*(bs_env%eigenval_scf_Gamma(m, i_spin) - bs_env%e_fermi(i_spin)))
+                        IF (tau_E < bs_env%stabilize_exp) g_branch(m) = EXP(-tau_E)
+                     END IF
+                  END DO
+                  y_loc(:) = 0.0_dp
+                  DO i_col = 1, ncol_local
+                     m = col_indices(i_col)
+                     IF (g_branch(m) == 0.0_dp) CYCLE
+                     DO i_row = 1, nrow_local
+                        n = row_indices(i_row)
+                        y_loc(n) = y_loc(n) + fm_What%local_data(i_row, i_col)*g_branch(m)
+                     END DO
+                  END DO
+                  CALL bs_env%para_env%sum(y_loc)
+                  dSigma(:, i_t, i_sector) = dSigma(:, i_t, i_sector) + &
+                                             MERGE(1.0_dp, -1.0_dp, i_sector == 1)* &
+                                             bs_env%time_frequency_grid%cosine_frequency_to_time(i_t, i_w)* &
+                                             y_loc(:)
+               END DO
+            END DO
+         END DO ! i_w
+
+         ! ---------------------------------------------------------------------------------
+         ! 5. ΔΣ^c_µν(±iτ) = (S C) diag(ΔΣ_n) (S C)ᵀ, accumulated into the stored Σ^c.
+         ! ---------------------------------------------------------------------------------
+         CALL parallel_gemm('N', 'N', n_ao, n_ao, n_ao, 1.0_dp, bs_env%fm_s_Gamma, &
+                            bs_env%fm_mo_coeff_Gamma(i_spin), 0.0_dp, fm_SC)
+         DO i_t = 1, n_t
+            DO i_sector = 1, 2
+               scaling(:) = 0.0_dp
+               scaling(1:n_mo) = dSigma(:, i_t, i_sector)
+               CALL cp_fm_to_fm(fm_SC, fm_C_scaled)
+               CALL cp_fm_column_scale(fm_C_scaled, scaling)
+               CALL parallel_gemm('N', 'T', n_ao, n_ao, n_mo, 1.0_dp, fm_C_scaled, fm_SC, &
                                   1.0_dp, fm_Sigma_c_Gamma_time(i_t, i_sector, i_spin))
             END DO
          END DO
-      END DO
 
-      DEALLOCATE (scaling, gc%head_pot_time)
-      CALL cp_fm_release(fm_C)
-      CALL cp_fm_release(fm_G)
-      CALL cp_fm_release(fm_SG)
+         IF (bs_env%unit_nr > 0) THEN
+            WRITE (bs_env%unit_nr, '(T2,A,I2,A)') 'Gamma-point correction of Sigma^c (3D), spin', i_spin, &
+               ': orbital-diagonal shifts at tau_1 (eV), VBM / CBM'
+            WRITE (bs_env%unit_nr, '(T4,A,T62,2F10.3)') 'negative branch (occupied), VBM, CBM', &
+               dSigma(n_occ, 1, 2)*evolt, dSigma(MIN(n_occ + 1, n_mo), 1, 2)*evolt
+            WRITE (bs_env%unit_nr, '(T4,A,T62,2F10.3)') 'positive branch (empty),    VBM, CBM', &
+               dSigma(n_occ, 1, 1)*evolt, dSigma(MIN(n_occ + 1, n_mo), 1, 1)*evolt
+         END IF
+      END DO ! i_spin
+
+      CALL dbcsr_deallocate_matrix_set(moments)
+      CALL dbcsr_release(mat_phi_own)
+      CALL dbcsr_release(mat_phi_scaled)
+      CALL dbcsr_release(mat_Omega)
+      DO i_dir = 1, 3
+         CALL cp_fm_release(fm_d(i_dir))
+         CALL cp_fm_release(fm_V(i_dir))
+      END DO
+      CALL cp_fm_release(fm_What)
+      CALL cp_fm_release(fm_ao_ao)
+      CALL cp_fm_release(fm_ao_mo)
+      CALL cp_fm_release(fm_SC)
+      CALL cp_fm_release(fm_C_scaled)
+      CALL cp_fm_release(fm_T)
+      CALL cp_fm_release(fm_u)
+      CALL cp_fm_struct_release(struct_mo_mo)
+      CALL cp_fm_struct_release(struct_RI_3)
+      DEALLOCATE (u_RI, w_grid, g_branch, y_loc, scaling, dSigma)
+      DEALLOCATE (gc%head_pot_time, gc%head_pot_freq, gc%A_wing, gc%B_hd, gc%T_RI)
 
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A,T62,F10.1,A)') &
-            'Gamma-point head correction added to Sigma^c(itau) in the AO basis, Exec. time', &
+            'Gamma-point correction added to Sigma^c(itau) in the AO basis, Exec. time', &
             m_walltime() - start_time, ' s'
          WRITE (bs_env%unit_nr, '(A)') ' '
       END IF
@@ -2827,5 +3052,62 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE gamma_corr_add_to_sigma
+
+! **************************************************************************************************
+!> \brief w_ℓα = Σ_Q Z_ℓQ u_Qα for a three-column RI quantity (the transpose of
+!>        gamma_corr_project_grid_to_RI), by walking the local blocks of Z.
+!> \param bs_env band-structure environment, for mat_Z_lP and the communicator
+!> \param u_RI u_Qα, replicated, n_RI x 3
+!> \param w_grid result, replicated over grid rows, n_grid x 3
+! **************************************************************************************************
+   SUBROUTINE gamma_corr_project_RI_to_grid(bs_env, u_RI, w_grid)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: u_RI
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)        :: w_grid
+
+      INTEGER                                            :: col, col_start, n_col, n_row, row, &
+                                                            row_start
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
+      TYPE(dbcsr_iterator_type)                          :: iter
+
+      w_grid(:, :) = 0.0_dp
+      CALL dbcsr_iterator_start(iter, bs_env%ri_rs%mat_Z_lP)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
+         CALL dbcsr_iterator_next_block(iter, row, col, block, &
+                                        row_offset=row_start, col_offset=col_start)
+         n_row = SIZE(block, 1)
+         n_col = SIZE(block, 2)
+         w_grid(row_start:row_start + n_row - 1, :) = w_grid(row_start:row_start + n_row - 1, :) + &
+                                                      MATMUL(block, u_RI(col_start:col_start + n_col - 1, :))
+      END DO
+      CALL dbcsr_iterator_stop(iter)
+      CALL bs_env%para_env%sum(w_grid)
+
+   END SUBROUTINE gamma_corr_project_RI_to_grid
+
+! **************************************************************************************************
+!> \brief Scale the rows of a grid x AO DBCSR matrix by a replicated grid vector, in place.
+!> \param matrix the matrix (its local blocks are modified)
+!> \param factor one factor per global row
+! **************************************************************************************************
+   SUBROUTINE gamma_corr_scale_rows(matrix, factor)
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: matrix
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: factor
+
+      INTEGER                                            :: col, i, row, row_start
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
+      TYPE(dbcsr_iterator_type)                          :: iter
+
+      CALL dbcsr_iterator_start(iter, matrix)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
+         CALL dbcsr_iterator_next_block(iter, row, col, block, row_offset=row_start)
+         DO i = 1, SIZE(block, 1)
+            block(i, :) = block(i, :)*factor(row_start + i - 1)
+         END DO
+      END DO
+      CALL dbcsr_iterator_stop(iter)
+
+   END SUBROUTINE gamma_corr_scale_rows
+
 
 END MODULE gw_gamma_correction
