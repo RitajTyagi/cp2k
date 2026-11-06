@@ -2793,16 +2793,19 @@ CONTAINS
 !>        (the 128-atom diamond cell had single states shifted by 2 eV before the clip). Collecting ⟨nm|ΔW(q)|mn⟩ and averaging over the cell gives the real kernel
 !>
 !>          Ŵ_nm(iω) = w(iω) δ_nm + Σ_αβ B_αβ(iω) d_nm,α d_nm,β
-!>                   + 2√Ω Σ_αβ A_αβ(iω) V_nm,α(iω) d_nm,β ,
+!>                   + 2√Ω Σ_αβ A_αβ(iω) V_nm,α(iω) d_nm,β
+!>                   + Ω Σ_αβ A_αβ(iω) V_nm,α(iω) V_nm,β(iω) ,
 !>
 !>          w = K_h(0)/Ω,   A_αβ = (1/(2π)³)∫_cell d³q (4π/ε̃) q̂_α q̂_β,
 !>          B_αβ = (1/(2π)³)∫_cell d³q 4π (1/ε̃ − 1) q̂_α q̂_β,
 !>          V_nm,α(iω) = ∫ρ_nm(r) w_α(r; iω),   w_α = Σ_P ϕ̂_P T_Pα ,
 !>
 !>        where the head (first term, order 1/L) is a uniform potential, the head-dipole term
-!>        is the O(q²) remainder of the head, and the wing couples the dipole of the pair
-!>        density to the potential w_α that the uniform field induces in the body (order 1/Ω
-!>        each: A, B ∝ 1/Ω and T ∝ 1/√Ω, so 2√Ω A V d ∝ 1/Ω like B d d). V_nm is evaluated on the RI-RS grid as the linear functional
+!>        is the O(q²) remainder of the head, the wing couples the dipole of the pair density
+!>        to the potential w_α that the uniform field induces in the body, and the last term is
+!>        the wing-wing part of the block inverse, W^ww_PQ = 4π(q̂·T_P)(q̂·T_Q)/ε̃, the body
+!>        screening that the Γ-only ε(Γ) with the G = 0 term omitted does not contain (order
+!>        1/Ω each: A, B ∝ 1/Ω and T ∝ 1/√Ω, so 2√Ω A V d and Ω A V V are ∝ 1/Ω like B d d). V_nm is evaluated on the RI-RS grid as the linear functional
 !>        Σ_ℓ ρ_nm(r_ℓ) w̃_ℓα with w̃ = Z M⁻¹ T: exact for linear functionals of a density,
 !>        unlike the pair kernel c_P c_Q K_h(R_PQ) that the RI-space application needed.
 !>
@@ -2986,7 +2989,8 @@ CONTAINS
                   DO j_dir = 1, 3
                      DO i_dir = 1, 3
                         w_hat = w_hat + gc%B_hd(i_dir, j_dir, i_w)*d_nm(i_dir)*d_nm(j_dir) + &
-                                2.0_dp*sqrt_V*gc%A_wing(i_dir, j_dir, i_w)*v_nm(i_dir)*d_nm(j_dir)
+                                2.0_dp*sqrt_V*gc%A_wing(i_dir, j_dir, i_w)*v_nm(i_dir)*d_nm(j_dir) + &
+                                gc%measure*gc%A_wing(i_dir, j_dir, i_w)*v_nm(i_dir)*v_nm(j_dir)
                      END DO
                   END DO
                   IF (n == m) w_hat = w_hat + gc%head_pot_freq(i_w)
