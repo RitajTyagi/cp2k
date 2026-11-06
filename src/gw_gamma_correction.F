@@ -64,7 +64,7 @@
 !>        same as the 3D branch of cp2k#6447), and the charge mode ϕ_0 = 1/√Ω carries only the
 !>        omitted G = 0 term. The screening denominator 1 + 4π a(q̂) of the bulk head is
 !>        independent of |q|, so the radial integrals of the cell integrals are analytic and the
-!>        kernels are evaluated per atom pair (gamma_corr_add_to_W_bulk) instead of being
+!>        head is applied to Σ^c in the orbital basis (gamma_corr_add_to_sigma) instead of being
 !>        tabulated. Everything else -- dipoles, response, block inverse, iω → iτ -- is shared.
 !>
 !>        **Call sequence.** Read the routines in the order in which the GW driver calls them:
@@ -75,7 +75,9 @@
 !>                                   gamma_corr_tabulate             2D: K_h(R), K_w(R) tables
 !>                                                                   3D: per-direction coefficients
 !>          gw_compute_V_and_W       gamma_corr_subtract_divergent_head   2D only: V(0) − D_box c cᵀ
-!>          (compute_W_MIC)          gamma_corr_add_to_W             W^MIC_PQ(iτ) += ΔW_PQ(iτ)
+!>          (compute_W_MIC)          gamma_corr_add_to_W             2D: W^MIC_PQ(iτ) += ΔW_PQ(iτ)
+!>          gw_ri_rs_large_cell_     gamma_corr_add_to_sigma         3D: Σ^c_µν(±iτ) += ∓w S G S
+!>          gamma (after Σ^c)
 !>
 !>        **Where the correction is applied.** In the RI basis, on the auxiliary charges c_P and
 !>        the atom-pair separations, and BEFORE the M⁻¹ W M⁻¹ contraction, so that it reaches
@@ -144,6 +146,7 @@ MODULE gw_gamma_correction
                                               ncoset
    USE parallel_gemm_api,               ONLY: parallel_gemm
    USE particle_types,                  ONLY: particle_type
+   USE physcon,                         ONLY: evolt
    USE post_scf_bandstructure_types,    ONLY: post_scf_bandstructure_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
@@ -177,6 +180,7 @@ MODULE gw_gamma_correction
              gamma_corr_response, &
              gamma_corr_tabulate, &
              gamma_corr_add_to_W, &
+             gamma_corr_add_to_sigma, &
              gamma_corr_subtract_divergent_head, &
              gamma_corr_auxiliary_charges, &
              gamma_corr_metric_head, &
@@ -2112,9 +2116,13 @@ CONTAINS
       gc => bs_env%ri_rs%gamma_corr
       CPASSERT(gc%ready)
 
-      ! Bulk cell: kernels per atom pair instead of interpolated tables.
+      ! Bulk cell: W is left alone. The 3D head is eV-sized and smooth over the whole cell, and
+      ! pushing c_P c_Q K_h(R_PQ) through the RI fit (M⁻¹ on both sides) amplifies it beyond
+      ! recognition (54-atom diamond: head-only gap −96 eV, degenerate triplet split by 0.4 eV,
+      ! where a uniform potential cannot split anything). The bulk correction is therefore added
+      ! to Σ^c in the orbital basis, where it is an exact rank-one functional:
+      ! gamma_corr_add_to_sigma.
       IF (.NOT. gc%slab) THEN
-         CALL gamma_corr_add_to_W_bulk(bs_env, qs_env, fm_W_MIC_time)
          CALL timestop(handle)
          RETURN
       END IF
@@ -2602,10 +2610,11 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_direction_coefficients'
       INTEGER, PARAMETER                                 :: n_face = 8
 
-      INTEGER                                            :: handle, i_dir, i_w, n_dir, n_t
+      INTEGER                                            :: handle, i_dir, i_t, i_w, n_dir, n_t
       REAL(KIND=dp)                                      :: a_scalar, denom, prefactor, &
                                                             start_time
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: dir_weight
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: dir_weight, K_h0
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: K_w0
       TYPE(gamma_corr_type), POINTER                     :: gc
 
       CALL timeset(routineN, handle)
@@ -2634,15 +2643,35 @@ CONTAINS
          END DO
       END DO
 
-      ! The coefficients and T_RI are consumed by gamma_corr_add_to_W_bulk.
-      DEALLOCATE (gc%S_head, dir_weight)
+      ! Head potential w(iω) = K_h(R = 0, iω)/Ω, the Brillouin-zone-cell average of the screened
+      ! head (4π/q²)(1/ε̃ − 1), transformed to imaginary time with the cosine weights of the
+      ! minimax grid (the same transform W^MIC undergoes). gamma_corr_add_to_sigma consumes it.
+      ALLOCATE (K_h0(n_t), K_w0(3, n_t), gc%head_pot_time(n_t))
+      CALL gamma_corr_kernel_bulk(gc, n_t, [0.0_dp, 0.0_dp, 0.0_dp], K_h0, K_w0)
+      DO i_t = 1, n_t
+         gc%head_pot_time(i_t) = SUM(bs_env%time_frequency_grid%cosine_frequency_to_time(i_t, :)* &
+                                     K_h0)/gc%measure
+      END DO
+
+      ! The direction data and T_RI are not needed in 3D once the head potential is known
+      ! (wings: not yet implemented in the orbital-basis form, see gamma_corr_add_to_sigma).
+      DEALLOCATE (gc%S_head, dir_weight, gc%head_coef, gc%wing_coef, gc%dir_hat, gc%dir_radius, &
+                  K_w0)
+      IF (ALLOCATED(gc%T_RI)) DEALLOCATE (gc%T_RI)
 
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A,I5,A,T62,F10.1,A)') &
             'Gamma-point correction: 3D cell cubature with', n_dir, ' directions, Exec. time', &
             m_walltime() - start_time, ' s'
+         WRITE (bs_env%unit_nr, '(T4,A,T62,2F10.3)') &
+            'Head potential K_h(0)/Omega at omega_1, omega_n (eV)', &
+            K_h0(1)/gc%measure*evolt, K_h0(n_t)/gc%measure*evolt
+         WRITE (bs_env%unit_nr, '(T4,A,T62,2F10.3)') &
+            'Head potential in imaginary time, tau_1, tau_n (eV)', &
+            gc%head_pot_time(1)*evolt, gc%head_pot_time(n_t)*evolt
          WRITE (bs_env%unit_nr, '(A)') ' '
       END IF
+      DEALLOCATE (K_h0)
 
       CALL timestop(handle)
 
@@ -2696,216 +2725,107 @@ CONTAINS
 
    END SUBROUTINE gamma_corr_kernel_bulk
 
+
 ! **************************************************************************************************
-!> \brief Bulk cell: add the Γ-point head-and-wing correction to W^MIC_PQ(iτ) in the RI basis,
+!> \brief Bulk cell: add the Γ-point head correction to Σ^c(±iτ) in the atomic-orbital basis.
 !>
-!>          (ϕ_P|ΔW|ϕ_Q)(iω) = (c_P c_Q / Ω) K_h(R_PQ, iω)
-!>                           + (1/√Ω) Σ_α [T_Pα c_Q − c_P T_Qα] K_w,α(R_PQ, iω) ,
+!>        The head of the correction is a potential that is uniform in space,
+!>        ΔW(r, r'; iτ) = w(iτ) with w(iω) = K_h(0, iω)/Ω (gamma_corr_direction_coefficients):
+!>        the Brillouin-zone-cell average of (4π/q²)(1/ε̃(q̂, iω) − 1) that the Γ-point W cannot
+!>        contain. With the Σ^c construction of compute_Sigma_c,
 !>
-!>        the same expression as the slab one of gamma_corr_add_to_W with A → Ω and the 3D
-!>        kernels of gamma_corr_kernel_bulk, at the minimum-image separation R_PQ of the atoms
-!>        carrying P and Q (fractional difference folded into [−1/2, 1/2)³, the convention of
-!>        cp2k#6447's add_gamma_corr_pair_cell; for strongly skewed cells this is not always the
-!>        shortest image, but it is the one the regular W^MIC uses too). The kernels are
-!>        evaluated once per atom pair that this rank's local block of W touches (row atoms x
-!>        column atoms, OpenMP over the pairs), then read for every local RI element; the
-!>        result is transformed to iτ with the cosine weights of the minimax grid and added to
-!>        W^MIC_PQ(iτ) BEFORE the M⁻¹ W M⁻¹ contraction.
-!> \param bs_env band-structure environment: the correction data, the cell, the RI-atom map
-!> \param qs_env QS environment, for the atomic positions
-!> \param fm_W_MIC_time W^MIC_PQ(iτ) in the projection representation, one fm per time point
+!>          Σ^c(iτ, τ < 0) = −G^occ(i|τ|) ∘ W(iτ),    Σ^c(iτ, τ > 0) = +G^vir(i|τ|) ∘ W(iτ),
+!>
+!>        a uniform W enters as ΔΣ^c(r, r') = ∓ w(iτ) G^{occ/vir}(r, r'), i.e. in the orbital
+!>        basis
+!>
+!>          ΔΣ^c_µν(−i|τ|) = −w(iτ) [S C_occ e^{−|τ|(ε_F − ε)} C_occᵀ S]_µν ,
+!>          ΔΣ^c_µν(+i|τ|) = +w(iτ) [S C_vir e^{−|τ|(ε − ε_F)} C_virᵀ S]_µν ,
+!>
+!>        whose orbital diagonal is ∓ w(iτ) e^{−|τ(ε_n − ε_F)|} for n occupied/empty and zero
+!>        otherwise (Cᵀ S C = 1): the exact statement that a uniform potential couples a state
+!>        only to itself. In the static limit this is the ±w/2 shift of the COHSEX head. The
+!>        overlap S folds the correction onto the band and DOS k-points of the supercell exactly
+!>        like the regular Σ^c. No RI fit and no grid is involved; the cost is three n_AO³
+!>        products per time point and spin.
+!>
+!>        Not yet included in 3D: the wings and the head-dipole term, i.e. the O(q·d_nm) terms of
+!>        ⟨m|e^{iq·r}|n⟩ = δ_nm + i q·d_nm + …; their cell averages scale as 1/Ω against the
+!>        1/L of the head and are left for a later step.
+!> \param bs_env band-structure environment: head potential, MO coefficients, overlap, levels
+!> \param fm_Sigma_c_Gamma_time Σ^c_µν(±i|τ_j|) per time point, sector (1 = +, 2 = −) and spin
 ! **************************************************************************************************
-   SUBROUTINE gamma_corr_add_to_W_bulk(bs_env, qs_env, fm_W_MIC_time)
+   SUBROUTINE gamma_corr_add_to_sigma(bs_env, fm_Sigma_c_Gamma_time)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(cp_fm_type), DIMENSION(:), INTENT(INOUT)      :: fm_W_MIC_time
+      TYPE(cp_fm_type), DIMENSION(:, :, :), &
+         INTENT(INOUT)                                   :: fm_Sigma_c_Gamma_time
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_add_to_W_bulk'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'gamma_corr_add_to_sigma'
 
-      INTEGER                                            :: atom_P, atom_Q, handle, i_atom, i_col, &
-                                                            i_pair, i_ra, i_row, i_t, i_w, &
-                                                            n_atom, n_ca, n_pair, n_ra, n_RI, &
-                                                            n_t, ncol_local, nrow_local, P, Q
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_of_RI, col_atom_index, &
-                                                            col_atom_list, row_atom_index, &
-                                                            row_atom_list
-      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
-      INTEGER                                            :: env_len, env_stat
-      CHARACTER(LEN=32)                                  :: env_val
-      REAL(KIND=dp)                                      :: c_P, c_Q, inv_sqrt_V, inv_V, start_time, &
-                                                            scale_head, scale_wing, max_head, &
-                                                            max_wing, d_head, d_wing
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: c, dW_freq, K_h0
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: frac_atom, K_w0
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: K_h_pair
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: K_w_pair
-      REAL(KIND=dp), DIMENSION(3)                        :: d_frac, R_cart
+      INTEGER                                            :: handle, i_sector, i_spin, i_t, n, &
+                                                            n_ao, n_occ, n_t
+      REAL(KIND=dp)                                      :: sign_w, start_time, tau, tau_E
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: scaling
+      TYPE(cp_fm_type)                                   :: fm_C, fm_G, fm_SG
       TYPE(gamma_corr_type), POINTER                     :: gc
-      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
 
       CALL timeset(routineN, handle)
       start_time = m_walltime()
 
       gc => bs_env%ri_rs%gamma_corr
-      CPASSERT(gc%ready .AND. ALLOCATED(gc%head_coef))
-      n_RI = bs_env%n_RI
+      CPASSERT(gc%ready .AND. .NOT. gc%slab .AND. ALLOCATED(gc%head_pot_time))
+      n_ao = bs_env%n_ao
       n_t = bs_env%num_time_freq_points
-      inv_V = 1.0_dp/gc%measure
-      inv_sqrt_V = 1.0_dp/SQRT(gc%measure)
 
-      ! Unnormalized auxiliary charges c_P = ∫ϕ_P (gc%charge is the unit vector ĉ).
-      ALLOCATE (c(n_RI))
-      c(:) = gc%charge_norm*gc%charge
+      CALL cp_fm_create(fm_C, bs_env%fm_s_Gamma%matrix_struct)
+      CALL cp_fm_create(fm_G, bs_env%fm_s_Gamma%matrix_struct)
+      CALL cp_fm_create(fm_SG, bs_env%fm_s_Gamma%matrix_struct)
+      ALLOCATE (scaling(n_ao))
 
-      ! Atom of every auxiliary function and the fractional coordinates of the atoms (unfolded;
-      ! the minimum image is taken on the difference).
-      NULLIFY (particle_set)
-      CALL get_qs_env(qs_env, particle_set=particle_set)
-      n_atom = SIZE(particle_set)
-      ALLOCATE (frac_atom(3, n_atom), atom_of_RI(n_RI))
-      DO i_atom = 1, n_atom
-         frac_atom(:, i_atom) = MATMUL(bs_env%ri_rs%cell%h_inv, particle_set(i_atom)%r)
-         atom_of_RI(bs_env%i_RI_start_from_atom(i_atom):bs_env%i_RI_end_from_atom(i_atom)) = i_atom
-      END DO
-
-      ! Local block of the distributed W^MIC(iτ): every time point shares one layout. The atoms
-      ! behind the local rows and columns, as compact lists plus the inverse maps.
-      CALL cp_fm_get_info(fm_W_MIC_time(1), nrow_local=nrow_local, ncol_local=ncol_local, &
-                          row_indices=row_indices, col_indices=col_indices)
-      ALLOCATE (row_atom_index(n_atom), col_atom_index(n_atom))
-      row_atom_index(:) = 0
-      col_atom_index(:) = 0
-      DO i_row = 1, nrow_local
-         row_atom_index(atom_of_RI(row_indices(i_row))) = 1
-      END DO
-      DO i_col = 1, ncol_local
-         col_atom_index(atom_of_RI(col_indices(i_col))) = 1
-      END DO
-      n_ra = SUM(row_atom_index)
-      n_ca = SUM(col_atom_index)
-      ALLOCATE (row_atom_list(n_ra), col_atom_list(n_ca))
-      n_ra = 0
-      n_ca = 0
-      DO i_atom = 1, n_atom
-         IF (row_atom_index(i_atom) == 1) THEN
-            n_ra = n_ra + 1
-            row_atom_list(n_ra) = i_atom
-            row_atom_index(i_atom) = n_ra
-         END IF
-         IF (col_atom_index(i_atom) == 1) THEN
-            n_ca = n_ca + 1
-            col_atom_list(n_ca) = i_atom
-            col_atom_index(i_atom) = n_ca
-         END IF
-      END DO
-
-      ! Kernels for every local (row atom, column atom) pair at its minimum-image separation.
-      n_pair = n_ra*n_ca
-      ALLOCATE (K_h_pair(n_t, n_ra, n_ca), K_w_pair(3, n_t, n_ra, n_ca))
-!$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(dynamic) &
-!$OMP          PRIVATE(i_pair, i_ra, atom_P, atom_Q, d_frac, R_cart) &
-!$OMP          SHARED(n_pair, n_ra, row_atom_list, col_atom_list, frac_atom, bs_env, gc, n_t, &
-!$OMP                 K_h_pair, K_w_pair)
-      DO i_pair = 1, n_pair
-         i_ra = MODULO(i_pair - 1, n_ra) + 1
-         atom_P = row_atom_list(i_ra)
-         atom_Q = col_atom_list((i_pair - 1)/n_ra + 1)
-         ! R_PQ = h (s_P − s_Q − ANINT(s_P − s_Q)): the fractional difference folded into
-         ! [−1/2, 1/2)³, then back to Cartesian coordinates.
-         d_frac = frac_atom(:, atom_P) - frac_atom(:, atom_Q)
-         d_frac = d_frac - ANINT(d_frac)
-         R_cart = MATMUL(bs_env%hmat, d_frac)
-         CALL gamma_corr_kernel_bulk(gc, n_t, R_cart, K_h_pair(:, i_ra, (i_pair - 1)/n_ra + 1), &
-                                     K_w_pair(:, :, i_ra, (i_pair - 1)/n_ra + 1))
-      END DO
-!$OMP END PARALLEL DO
-
-      ! TEMPORARY DIAGNOSTICS: GAMMA_CORR_SCALE_HEAD / GAMMA_CORR_SCALE_WING scale the two terms.
-      scale_head = 1.0_dp
-      scale_wing = 1.0_dp
-      CALL GET_ENVIRONMENT_VARIABLE('GAMMA_CORR_SCALE_HEAD', env_val, env_len, env_stat)
-      IF (env_stat == 0 .AND. env_len > 0) READ (env_val, *) scale_head
-      CALL GET_ENVIRONMENT_VARIABLE('GAMMA_CORR_SCALE_WING', env_val, env_len, env_stat)
-      IF (env_stat == 0 .AND. env_len > 0) READ (env_val, *) scale_wing
-      ALLOCATE (K_h0(n_t), K_w0(3, n_t))
-      CALL gamma_corr_kernel_bulk(gc, n_t, [0.0_dp, 0.0_dp, 0.0_dp], K_h0, K_w0)
-      max_head = 0.0_dp
-      max_wing = 0.0_dp
-      ! TEMPORARY DIAGNOSTIC: GAMMA_CORR_HEAD_UNIFORM=1 replaces K_h(R_PQ) by K_h(0) for every
-      ! pair, i.e. a rank-one uniform potential w c c^T that is an exact linear functional.
-      CALL GET_ENVIRONMENT_VARIABLE('GAMMA_CORR_HEAD_UNIFORM', env_val, env_len, env_stat)
-      IF (env_stat == 0 .AND. env_len > 0) THEN
-         IF (env_val(1:1) == '1') THEN
-            DO i_pair = 1, n_pair
-               K_h_pair(:, MODULO(i_pair - 1, n_ra) + 1, (i_pair - 1)/n_ra + 1) = K_h0
-            END DO
-            IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(T2,A)') &
-               'DIAGNOSTIC: head kernel replaced by its R = 0 value for all pairs'
-         END IF
-      END IF
-
-      ALLOCATE (dW_freq(n_t))
-      DO i_col = 1, ncol_local
-         Q = col_indices(i_col)
-         atom_Q = col_atom_index(atom_of_RI(Q))
-         c_Q = c(Q)
-         DO i_row = 1, nrow_local
-            P = row_indices(i_row)
-            atom_P = row_atom_index(atom_of_RI(P))
-            c_P = c(P)
-
-            ! (ϕ_P|ΔW|ϕ_Q)(iω) per frequency: head c_P c_Q K_h/Ω and wing
-            ! (1/√Ω) Σ_α [T_Pα c_Q − c_P T_Qα] K_w,α. Symmetric in P <-> Q: K_h is even and K_w
-            ! odd in R, the wing bracket is antisymmetric.
-            DO i_w = 1, n_t
-               d_head = inv_V*c_P*c_Q*K_h_pair(i_w, atom_P, atom_Q)
-               d_wing = inv_sqrt_V*SUM(K_w_pair(:, i_w, atom_P, atom_Q)* &
-                                       (gc%T_RI(P, :, i_w)*c_Q - c_P*gc%T_RI(Q, :, i_w)))
-               IF (i_w == 1) THEN
-                  max_head = MAX(max_head, ABS(d_head))
-                  max_wing = MAX(max_wing, ABS(d_wing))
-               END IF
-               dW_freq(i_w) = scale_head*d_head + scale_wing*d_wing
-            END DO
-
-            ! iω -> iτ with the cosine weights of the minimax grid (the transform W^MIC uses),
-            ! accumulated straight into the local element of every W^MIC(iτ).
-            DO i_t = 1, n_t
-               fm_W_MIC_time(i_t)%local_data(i_row, i_col) = &
-                  fm_W_MIC_time(i_t)%local_data(i_row, i_col) + &
-                  SUM(bs_env%time_frequency_grid%cosine_frequency_to_time(i_t, :)*dW_freq)
+      DO i_spin = 1, bs_env%n_spin
+         n_occ = bs_env%n_occ(i_spin)
+         DO i_t = 1, n_t
+            tau = bs_env%time_frequency_grid%imaginary_time(i_t)
+            ! Sector 1 = positive time (empty states, +w), sector 2 = negative time (occupied, −w).
+            DO i_sector = 1, 2
+               ! Column scaling e^{−|τ(ε_n − ε_F)|/2} on the states of this sector, zero elsewhere;
+               ! the same stabilization as G_occ_vir (exponent capped at stabilize_exp).
+               DO n = 1, n_ao
+                  scaling(n) = 0.0_dp
+                  IF ((i_sector == 1 .AND. n > n_occ) .OR. (i_sector == 2 .AND. n <= n_occ)) THEN
+                     tau_E = ABS(0.5_dp*tau*(bs_env%eigenval_scf_Gamma(n, i_spin) - &
+                                             bs_env%e_fermi(i_spin)))
+                     IF (tau_E < bs_env%stabilize_exp) scaling(n) = EXP(-tau_E)
+                  END IF
+               END DO
+               ! G = C diag(e^{−|τ(ε−ε_F)|}) Cᵀ restricted to the sector.
+               CALL cp_fm_to_fm(bs_env%fm_mo_coeff_Gamma(i_spin), fm_C)
+               CALL cp_fm_column_scale(fm_C, scaling)
+               CALL parallel_gemm('N', 'T', n_ao, n_ao, n_ao, 1.0_dp, fm_C, fm_C, 0.0_dp, fm_G)
+               ! ΔΣ^c = ∓ w(iτ) S G S, accumulated into the stored Σ^c(±iτ).
+               CALL parallel_gemm('N', 'N', n_ao, n_ao, n_ao, 1.0_dp, bs_env%fm_s_Gamma, fm_G, &
+                                  0.0_dp, fm_SG)
+               sign_w = MERGE(1.0_dp, -1.0_dp, i_sector == 1)*gc%head_pot_time(i_t)
+               CALL parallel_gemm('N', 'N', n_ao, n_ao, n_ao, sign_w, fm_SG, bs_env%fm_s_Gamma, &
+                                  1.0_dp, fm_Sigma_c_Gamma_time(i_t, i_sector, i_spin))
             END DO
          END DO
       END DO
 
-      CALL bs_env%para_env%max(max_head)
-      CALL bs_env%para_env%max(max_wing)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A)') 'Gamma-point correction (3D) diagnostics:'
-         WRITE (bs_env%unit_nr, '(T4,A,T62,2F10.3)') 'Head potential K_h(0)/Omega, w=1, w=n (eV)', &
-            K_h0(1)/gc%measure*27.211386_dp, K_h0(n_t)/gc%measure*27.211386_dp
-         WRITE (bs_env%unit_nr, '(T4,A,T62,2ES10.2)') 'max |head|, |wing| of DeltaW_PQ at w=1 (Ha)', &
-            max_head, max_wing
-         WRITE (bs_env%unit_nr, '(T4,A,T62,2F10.3)') 'Scale factors head, wing (diagnostic)', &
-            scale_head, scale_wing
-         WRITE (bs_env%unit_nr, '(T4,A,T62,ES10.2)') 'max |T_RI| (w=1)', MAXVAL(ABS(gc%T_RI(:, :, 1)))
-         WRITE (bs_env%unit_nr, '(T4,A,T62,ES10.2)') 'max |c_P|', MAXVAL(ABS(c))
-      END IF
-
-      DEALLOCATE (c, frac_atom, atom_of_RI, dW_freq, K_h_pair, K_w_pair, row_atom_list, &
-                  col_atom_list, row_atom_index, col_atom_index, K_h0, K_w0)
-      ! The correction is now inside W^MIC; its ingredients are dead.
-      DEALLOCATE (gc%head_coef, gc%wing_coef, gc%dir_hat, gc%dir_radius, gc%T_RI)
+      DEALLOCATE (scaling, gc%head_pot_time)
+      CALL cp_fm_release(fm_C)
+      CALL cp_fm_release(fm_G)
+      CALL cp_fm_release(fm_SG)
 
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A,T62,F10.1,A)') &
-            'Gamma-point correction added to W^MIC_PQ(itau) in RI space, Exec. time', &
+            'Gamma-point head correction added to Sigma^c(itau) in the AO basis, Exec. time', &
             m_walltime() - start_time, ' s'
          WRITE (bs_env%unit_nr, '(A)') ' '
       END IF
 
       CALL timestop(handle)
 
-   END SUBROUTINE gamma_corr_add_to_W_bulk
+   END SUBROUTINE gamma_corr_add_to_sigma
 
 END MODULE gw_gamma_correction

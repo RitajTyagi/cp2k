@@ -14,7 +14,8 @@ MODULE gw_ri_rs_large_cell_Gamma
    USE cp_fm_types,                     ONLY: cp_fm_release,&
                                               cp_fm_type
    USE gw_compute_V_and_W,              ONLY: get_W_MIC
-   USE gw_gamma_correction,             ONLY: gamma_corr_build_coulomb_maps,&
+   USE gw_gamma_correction,             ONLY: gamma_corr_add_to_sigma,&
+                                              gamma_corr_build_coulomb_maps,&
                                               gamma_corr_response,&
                                               gamma_corr_tabulate
    USE gw_ri_rs_chi_sigma_kernels,      ONLY: compute_Sigma_c,&
@@ -201,6 +202,12 @@ CONTAINS
          ! Σ^c_λσ(iτ)  =  Σ_ll' ϕ_λ(r_l) Σ^c_ll'(iτ) ϕ_σ(r_l')
          CALL compute_Sigma_c(bs_env, fm_W_time, fm_Sigma_c_Gamma_time, cutoff=0.0_dp, &
                               keep_w_and_files=.TRUE.)
+
+         ! 3D Gamma-point correction: the head is a uniform potential and is added to Σ^c in the
+         ! AO basis, ΔΣ^c(±iτ) = ±w(iτ) S G^{vir/occ} S (gamma_corr_add_to_sigma); the 2D
+         ! correction was already added to W^MIC inside get_W_MIC.
+         IF (bs_env%ri_rs%gamma_corr%enabled .AND. .NOT. bs_env%ri_rs%gamma_corr%slab) &
+            CALL gamma_corr_add_to_sigma(bs_env, fm_Sigma_c_Gamma_time)
 
          ! Σ^c_λσ(iτ) -> Σ^c_nn(ϵ) at every band and DOS k-point
          ! ϵ_nk^GW,(i) = ϵ_nk^DFT + Σ^c_nn[G^(i-1),W](ϵ_nk^GW,(i)) + Σ^x_nn - v^xc_nn
