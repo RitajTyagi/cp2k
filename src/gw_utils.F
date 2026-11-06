@@ -139,7 +139,6 @@ MODULE gw_utils
    USE rpa_gw,                          ONLY: continuation_pade
    USE rpa_gw_im_time_util,             ONLY: build_ao_propagator
    USE time_frequency_grids,            ONLY: build_minimax_time_frequency_grid
-   USE util,                            ONLY: sort
 #include "base/base_uses.f90"
 
    IMPLICIT NONE
@@ -3620,39 +3619,25 @@ CONTAINS
       INTEGER, INTENT(IN), OPTIONAL                      :: i_iter
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'analyt_conti_and_print'
-      INTEGER, PARAMETER                                 :: max_pade_orders = 7
 
       CHARACTER(len=3)                                   :: occ_vir
       CHARACTER(len=default_path_length)                 :: fname
       CHARACTER(len=default_string_length)               :: gw_label
-      INTEGER                                            :: handle, i_central, i_mo, i_order, &
-                                                            icycle, ikp_for_print, iunit, &
-                                                            n_central, n_mo, n_orders, nkp
-      INTEGER, DIMENSION(max_pade_orders)                :: order_index
+      INTEGER                                            :: handle, i_mo, icycle, ikp_for_print, &
+                                                            iunit, n_mo, nkp
       LOGICAL                                            :: is_bandstruc_kpoint, print_DOS_kpoints, &
                                                             print_ikp
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenval_G, m_value, Sigma_c_ikp_n_qp, &
                                                             z_value
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: Sigma_c_orders
-      REAL(KIND=dp), DIMENSION(max_pade_orders)          :: Sigma_c_sorted
 
       CALL timeset(routineN, handle)
 
       icycle = 1
       IF (PRESENT(i_iter)) icycle = i_iter
 
-      ! A single Padé approximant occasionally places a spurious pole next to the
-      ! quasiparticle energy, where Newton then fails and Σ^c jumps by up to 1 eV from one
-      ! k-point to the next. The mean of the three central values over the orders
-      ! nparam_pade, nparam_pade - 1, ..., nparam_pade - 6 discards such outliers.
-      n_orders = MIN(max_pade_orders, bs_env%nparam_pade - 1)
-      n_central = MIN(3, n_orders)
-      i_central = (n_orders - n_central)/2 + 1
-
       n_mo = bs_env%n_ao
-      ALLOCATE (z_value(n_mo), m_value(n_mo), Sigma_c_ikp_n_qp(n_mo), eigenval_G(n_mo), &
-                Sigma_c_orders(n_mo, n_orders))
-      Sigma_c_orders(:, :) = 0.0_dp
+      ALLOCATE (z_value(n_mo), m_value(n_mo), Sigma_c_ikp_n_qp(n_mo), eigenval_G(n_mo))
+      Sigma_c_ikp_n_qp(:) = 0.0_dp
 
       ! Eigenvalues of the Green's function that produced Σ^c: the DFT ones for G0W0, the
       ! previous cycle's quasiparticle energies for evGW0. They set the Newton start value,
@@ -3669,28 +3654,19 @@ CONTAINS
          ! parallelization
          IF (MODULO(i_mo, bs_env%para_env%num_pe) /= bs_env%para_env%mepos) CYCLE
 
-         DO i_order = 1, n_orders
-            CALL continuation_pade(Sigma_c_orders(:, i_order), &
-                                   bs_env%imag_freq_points_fit, z_value, m_value, &
-                                   Sigma_c_ikp_n_freq(:, 1:bs_env%num_freq_points_fit), &
-                                   Sigma_x_ikp_n(:) - V_xc_ikp_n(:), &
-                                   eigenval_G(:), eigenval_scf(:), &
-                                   bs_env%do_hedin_shift, &
-                                   i_mo, bs_env%n_occ(ispin), bs_env%n_vir(ispin), &
-                                   bs_env%nparam_pade - i_order + 1, bs_env%num_freq_points_fit, &
-                                   ri_rpa_g0w0_crossing_newton, bs_env%n_occ(ispin), &
-                                   0.0_dp, .TRUE., .FALSE., 1, e_fermi_ext=bs_env%e_fermi(ispin))
-         END DO
+         CALL continuation_pade(Sigma_c_ikp_n_qp, &
+                                bs_env%imag_freq_points_fit, z_value, m_value, &
+                                Sigma_c_ikp_n_freq(:, 1:bs_env%num_freq_points_fit), &
+                                Sigma_x_ikp_n(:) - V_xc_ikp_n(:), &
+                                eigenval_G(:), eigenval_scf(:), &
+                                bs_env%do_hedin_shift, &
+                                i_mo, bs_env%n_occ(ispin), bs_env%n_vir(ispin), &
+                                bs_env%nparam_pade, bs_env%num_freq_points_fit, &
+                                ri_rpa_g0w0_crossing_newton, bs_env%n_occ(ispin), &
+                                0.0_dp, .TRUE., .FALSE., 1, e_fermi_ext=bs_env%e_fermi(ispin))
       END DO
 
-      CALL bs_env%para_env%sum(Sigma_c_orders)
-
-      DO i_mo = 1, n_mo
-         Sigma_c_sorted(1:n_orders) = Sigma_c_orders(i_mo, 1:n_orders)
-         CALL sort(Sigma_c_sorted(1:n_orders), n_orders, order_index(1:n_orders))
-         Sigma_c_ikp_n_qp(i_mo) = SUM(Sigma_c_sorted(i_central:i_central + n_central - 1))/ &
-                                  REAL(n_central, KIND=dp)
-      END DO
+      CALL bs_env%para_env%sum(Sigma_c_ikp_n_qp)
 
       CALL correct_obvious_fitting_fails(Sigma_c_ikp_n_qp, ispin, bs_env)
 
