@@ -76,8 +76,8 @@
 !>                                                                   3D: per-direction coefficients
 !>          gw_compute_V_and_W       gamma_corr_subtract_divergent_head   2D only: V(0) − D_box c cᵀ
 !>          (compute_W_MIC)          gamma_corr_add_to_W             2D: W^MIC_PQ(iτ) += ΔW_PQ(iτ)
-!>          gw_ri_rs_large_cell_     gamma_corr_add_to_sigma         3D: Σ^c_µν(±iτ) += ∓w S G S
-!>          gamma (after Σ^c)
+!>          gw_ri_rs_large_cell_     gamma_corr_add_to_sigma         3D: Σ^c(±iτ) += (SC) ΔΣ_n (SC)ᵀ
+!>          gamma (after Σ^c)                                        head, head-dipole, wings
 !>
 !>        **Where the correction is applied.** In the RI basis, on the auxiliary charges c_P and
 !>        the atom-pair separations, and BEFORE the M⁻¹ W M⁻¹ contraction, so that it reaches
@@ -2785,7 +2785,7 @@ CONTAINS
 !>        defined). Collecting ⟨nm|ΔW(q)|mn⟩ and averaging over the cell gives the real kernel
 !>
 !>          Ŵ_nm(iω) = w(iω) δ_nm + Σ_αβ B_αβ(iω) d_nm,α d_nm,β
-!>                   + (2/√Ω) Σ_αβ A_αβ(iω) V_nm,α(iω) d_nm,β ,
+!>                   + 2√Ω Σ_αβ A_αβ(iω) V_nm,α(iω) d_nm,β ,
 !>
 !>          w = K_h(0)/Ω,   A_αβ = (1/(2π)³)∫_cell d³q (4π/ε̃) q̂_α q̂_β,
 !>          B_αβ = (1/(2π)³)∫_cell d³q 4π (1/ε̃ − 1) q̂_α q̂_β,
@@ -2794,7 +2794,7 @@ CONTAINS
 !>        where the head (first term, order 1/L) is a uniform potential, the head-dipole term
 !>        is the O(q²) remainder of the head, and the wing couples the dipole of the pair
 !>        density to the potential w_α that the uniform field induces in the body (order 1/Ω
-!>        each). V_nm is evaluated on the RI-RS grid as the linear functional
+!>        each: A, B ∝ 1/Ω and T ∝ 1/√Ω, so 2√Ω A V d ∝ 1/Ω like B d d). V_nm is evaluated on the RI-RS grid as the linear functional
 !>        Σ_ℓ ρ_nm(r_ℓ) w̃_ℓα with w̃ = Z M⁻¹ T: exact for linear functionals of a density,
 !>        unlike the pair kernel c_P c_Q K_h(R_PQ) that the RI-space application needed.
 !>
@@ -2826,7 +2826,7 @@ CONTAINS
       INTEGER :: col, handle, i_col, i_dir, i_row, i_sector, i_spin, i_t, i_w, j_dir, m, n, &
          n_ao, n_grid, n_mo, n_occ, n_RI, n_t, ncol_local, nrow_local, row
       INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
-      REAL(KIND=dp)                                      :: delta, inv_sqrt_V, start_time, tau, &
+      REAL(KIND=dp)                                      :: delta, sqrt_V, start_time, tau, &
                                                             tau_E, w_hat
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: g_branch, scaling, y_loc
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: u_RI, w_grid
@@ -2852,7 +2852,10 @@ CONTAINS
       n_t = bs_env%num_time_freq_points
       n_mo = bs_env%n_mo_retained
       IF (n_mo <= 0) n_mo = n_ao
-      inv_sqrt_V = 1.0_dp/SQRT(gc%measure)
+      ! The wing carries ONE factor 1/√Ω from ⟨mn|ϕ_0⟩ and the Ω/(2π)³ of the cell average,
+      ! net 2√Ω in front of A_αβ (whose own definition holds the 1/(2π)³); the head and the
+      ! head-dipole term have |⟨mn|ϕ_0⟩|² ∝ 1/Ω, which the average cancels exactly.
+      sqrt_V = SQRT(gc%measure)
 
       ! Work matrices: n_MO x n_MO for d, V and Ŵ; n_AO x n_AO and n_AO x n_MO intermediates;
       ! n_RI x 3 for T(iω) and u = M⁻¹ T.
@@ -2957,7 +2960,7 @@ CONTAINS
                   DO j_dir = 1, 3
                      DO i_dir = 1, 3
                         w_hat = w_hat + gc%B_hd(i_dir, j_dir, i_w)*d_nm(i_dir)*d_nm(j_dir) + &
-                                2.0_dp*inv_sqrt_V*gc%A_wing(i_dir, j_dir, i_w)*v_nm(i_dir)*d_nm(j_dir)
+                                2.0_dp*sqrt_V*gc%A_wing(i_dir, j_dir, i_w)*v_nm(i_dir)*d_nm(j_dir)
                      END DO
                   END DO
                   IF (n == m) w_hat = w_hat + gc%head_pot_freq(i_w)
