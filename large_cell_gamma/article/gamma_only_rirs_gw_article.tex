@@ -934,7 +934,8 @@ terms carry the $O(\bq\cdot\mathbf d_{mn})$ corrections of the same expansion.
 \label{sec:activation}
 
 The correction lives in the module \texttt{gw\_gamma\_correction} and is switched on
-automatically for the RI-RS large-cell $\Gamma$ code when (i) the system is a slab
+automatically for the large-cell $\Gamma$ drivers, the RI-RS one and the exact-RI tensor one
+(\texttt{gw\_tensor\_large\_cell\_gamma}), when (i) the system is a slab
 (\texttt{PERIODIC XY}, head $2\pi/q$) or a bulk cell (\texttt{PERIODIC XYZ}, head $4\pi/q^2$),
 and (ii) the mesh for $\chi$, $\varepsilon$, $W$ is \texttt{KPOINTS\_W 1 1 1}. Only the
 $1\times1\times1$ mesh samples $\bq=0$: the setup keeps $n_1n_2n_3/2$ points of an
@@ -942,7 +943,12 @@ $n_1\times n_2\times n_3$ mesh, one per $\pm\bk$ pair, and for odd $n>1$ the int
 drops the self-paired $\Gamma$ point. For this case the extrapolation mesh is dropped (otherwise
 $\Gamma$ would enter the $s$--$s$ elements of $W$ with the extrapolation weight $-2.414$ and
 every other element with weight 0). Wires and slabs whose vacuum direction is not $z$ are not
-implemented. There is no input keyword.
+implemented. There is no input keyword. In the tensor driver only the optical response
+$S_{\alpha\beta}$, $T_{P\alpha}$ of Sec.~\ref{sec:charge} is evaluated on the RI-RS grid, which
+is built for that purpose; $\chi$, the body of $W$ and $\Sigma^c$ remain exact-RI tensor
+contractions. This gives a reference in which the RI-RS fit enters only through the
+correction, and it is used in Sec.~\ref{sec:results} to separate fit errors from the
+$\Gamma$-point model.
 
 \subsection{Call sequence}
 \label{sec:calls}
@@ -950,7 +956,8 @@ implemented. There is no input keyword.
 Table~\ref{tab:calls} lists the routines in the order in which the $GW$ driver calls them.
 \texttt{gamma\_corr\_init} runs before the $Z_{\ell P}$ fit and sets only geometric quantities
 (layer area or cell volume, reciprocal vectors, metric head). The Coulomb side, the response and
-the cell integrals are built in step 4b of \texttt{gw\_ri\_rs\_large\_cell\_gamma}, after
+the cell integrals are built in step 4b of the $\Gamma$ driver
+(\texttt{gw\_ri\_rs\_large\_cell\_gamma} or \texttt{gw\_tensor\_large\_cell\_gamma}), after
 $\chi_{PQ}(\Gamma,\ii\tau)$ exists and before \texttt{get\_W\_MIC} consumes it. The $V(0)$ of
 \texttt{gamma\_corr\_coulomb\_at\_zero} is kept distributed and reused by the regular $W$ path
 instead of repeating the lattice sum. In 2D, \texttt{gamma\_corr\_add\_to\_W} adds
@@ -969,12 +976,12 @@ dimension-specific branches.}
 caller & routine & computes \\
 \colrule
 \texttt{ri\_rs\_setup} & \texttt{gamma\_corr\_init} & activation; $A$ or $\Omega$, $\mathbf b_i$, metric head; dense-algebra mode\\
-\texttt{gw\_ri\_rs\_large\_cell\_gamma}, step 4b & \texttt{gamma\_corr\_build\_coulomb\_maps} & $c$, $\Pi$, $V_b$, $F^\dens$, $G^\ext$; $V(0)$ via \texttt{gamma\_corr\_coulomb\_at\_zero}\\
+$\Gamma$ driver, step 4b & \texttt{gamma\_corr\_build\_coulomb\_maps} & $c$, $\Pi$, $V_b$, $F^\dens$, $G^\ext$; $V(0)$ via \texttt{gamma\_corr\_coulomb\_at\_zero}\\
  & \texttt{gamma\_corr\_response} & dipoles, $Y$, $X$, $B$, $E$; $S_{\alpha\beta}(\ii\omega)$, $T_{P\alpha}(\ii\omega)$\\
  & \texttt{gamma\_corr\_tabulate} & 2D: $K_\head(\bR)$, $K_\wing(\bR)$ tables; 3D: \texttt{gamma\_corr\_direction\_coefficients}\\
 \texttt{gw\_compute\_V\_and\_W} & \texttt{gamma\_corr\_subtract\_divergent\_head} & 2D only: $V(0)-D_\mathrm{box}cc^\Tr$, Eq.~\eqref{eq:Vreg}\\
 \texttt{compute\_W\_MIC} & \texttt{gamma\_corr\_add\_to\_W} & 2D: $W^\MIC_{PQ}(\ii\tau) \mathrel{+}= \Delta W_{PQ}(\ii\tau)$, Eq.~\eqref{eq:DeltaW}\\
-\texttt{gw\_ri\_rs\_large\_cell\_gamma}, after $\Sigma^c$ & \texttt{gamma\_corr\_add\_to\_sigma} & 3D: $\Sigma^c_{\mu\nu}(\pm\ii|\tau|) \mathrel{+}= \Delta\Sigma^c_{\mu\nu}$, Eq.~\eqref{eq:dSigma_ao}\\
+$\Gamma$ driver, after $\Sigma^c$ & \texttt{gamma\_corr\_add\_to\_sigma} & 3D: $\Sigma^c_{\mu\nu}(\pm\ii|\tau|) \mathrel{+}= \Delta\Sigma^c_{\mu\nu}$, Eq.~\eqref{eq:dSigma_ao}\\
 \end{tabular}
 \end{ruledtabular}
 \end{table*}
@@ -1098,13 +1105,23 @@ The $\Gamma$-only cells are $9\times9$ (162 atoms; the folded manifold contains 
 $12\times12$ (288 atoms); the PR meshes contain $K$ as well. Table~\ref{tab:res2d} lists the
 indirect gap over the sampled points. Three of the four materials agree with the converged
 reference to $16$--$75$~meV, and the $12\times12$ cells show that the $\Gamma$-only results are
-cell-converged to a few meV. h-AlN deviates by $0.25$~eV; state by state the difference sits
-at its nearly-free-electron conduction minimum at $\Gamma$ ($\Sigma^c$ $-2.48$ vs $-2.39$~eV,
-$\Sigma^x$ $-4.89$ vs $-4.83$~eV) and at the valence maximum at $K$ ($+0.10$~eV). $\Sigma^x$
-differs between the two codes by $\pm0.07$~eV in every system, without a trend, which is the
-level of the RI-RS grid differences; the extra $0.09$~eV in $\Sigma^c$ of the diffuse AlN
-state is specific to a state that extends into the vacuum and is discussed in
-Sec.~\ref{sec:disc_approx}.
+cell-converged to a few meV. h-AlN deviates by $0.25$~eV. State by state ($9\times9$ against PR $24\times24$) the
+difference is spread over four contributions of the same sign: $\Sigma^x$ at the valence
+maximum at $K$ ($+0.07$~eV) and at the nearly-free-electron conduction minimum at $\Gamma$
+($-0.05$~eV), and $\Sigma^c$ at the conduction minimum ($-2.48$ vs $-2.39$~eV) and at the
+valence maximum ($+0.03$~eV). Neither grid is responsible. The PR grid is converged for AlN
+(\texttt{RS\_AO\_RATIO} 20 gives 6.318~eV against 6.319~eV at the default ratio 7), and our
+$\Sigma^x$ is converged with the truncated-Coulomb radius (12.1~\AA\ at $9\times9$, 16.2~\AA\
+at $12\times12$: 6~meV). On our side the exact-RI tensor driver with the same $\Gamma$-only $W$
+and the same correction (Sec.~\ref{sec:activation}) reproduces the RI-RS result of the
+$6\times6$ AlN cell to 1~meV in every occupied and low-lying virtual state: gap 6.013~eV in
+both, and $\varepsilon^\mathrm{DFT}$, $\Sigma^c$, $\Sigma^x$, $v^{xc}$ of the two band edges identical
+to the printed meV ($2.641$, $-19.063$, $-15.173$~eV at the valence maximum; $-2.529$,
+$-4.901$, $-8.832$~eV at the conduction minimum), at ten times the cost per $\chi$ time point
+(33 vs 3~s) and six times the memory. The remaining AlN difference therefore lies in the
+$\Gamma$-point treatment itself, or in the supercell-$\Gamma$ versus full-$k$ formulation
+(32~\AA\ Coulomb truncation in the PR, folded spectrum on the minimax grid here), and not in
+the numerics of either code; see Sec.~\ref{sec:disc_approx}.
 
 \begin{table}[h]
 \caption{2D benchmark, DZVP basis ($a$ = 2.502, 3.090, 3.210, 3.110~\AA): indirect $G_0W_0$ gap
@@ -1147,10 +1164,27 @@ RI-space application of the same head, by contrast, gave $-96$~eV. Degeneracies 
 manifold are preserved to 3~meV. With the full kernel the $\Gamma$-only gap converges as
 $9.041\to9.782\to9.934$~eV (54, 128, 250 atoms), the PR as $9.200\to9.444\to9.511$~eV
 ($4^3$, $6^3$, $8^3$ meshes); both exchange series converge to the same 15.3~eV, so the
-remaining $0.4$~eV at convergence is in $\Sigma^c$. The standard tensor $k$-point $GW$ of CP2K
-on the primitive cell is the independent arbiter; its $6\times6\times6$ and $8\times8\times8$
-runs (\texttt{KPOINTS\_W} set explicitly, 12071 cells of three-centre integrals) were still
-running when this version was written and will be added in a follow-up.
+remaining $0.4$~eV at convergence is in $\Sigma^c$.
+
+Two further checks bound the numerics on our side. First, the exact-RI tensor driver with the
+same $\Gamma$-only $W$ and the same orbital-basis correction (Sec.~\ref{sec:activation}) was
+run on the 54-atom cell. Its gap is 9.386~eV against 9.039~eV from the RI-RS grid, but the
+difference is almost entirely exchange: the Hartree--Fock gaps are 15.074 and 14.838~eV, the
+RI-RS $\Sigma^x$ is too negative by 0.06~eV on average over the occupied states and by 0.14~eV
+over the lowest virtuals, whereas $\Sigma^c$ at the two band edges agrees to 0.004 and
+0.036~eV. The $3\times3\times3$ cell truncates the Coulomb operator of $\Sigma^x$ at 3.1~\AA,
+the same length as the 3.0~\AA\ RI-metric cutoff that defines the fit, and the grid
+representation of such a short truncated operator is where the RI-RS fit is weakest; at
+$4\times4\times4$ (4.1~\AA) the RI-RS and exact-RI $\Sigma^x$ agree to 1~meV, as stated
+above. The 54-atom RI-RS entries of Table~\ref{tab:res3d} are therefore grid-limited by
+$\sim0.3$~eV, the larger cells are not, and the correction itself is consistent between
+the two representations. Second, the standard tensor $k$-point $GW$ of CP2K on the primitive
+cell was attempted as an independent arbiter; with the 9~\AA\ orbital and RI radii its
+real-space lattice sums (1607 cells of three-centre integrals, 12071 cells $\Delta\bR$)
+cost 10.5 and 21.7~h per imaginary-time point on 8 ranks for the $6^3$ and $8^3$ meshes,
+the code has no $\chi$ restart, and the runs were abandoned at the 24~h limit. The 0.4~eV
+between the two $\Gamma$-point treatments at convergence is thus not settled by a third
+code; what is settled is that it is not a fit error of either.
 
 \begin{table}[h]
 \caption{Diamond, SZV basis: indirect $G_0W_0$ gap over the folded $\Gamma$ manifold (eV) for
@@ -1163,6 +1197,7 @@ truncated Coulomb operator of each run.}
 cell & atoms & none & head & +h.-dip. & full & HF\\
 \colrule
 $3^3$ & 54  & 12.249 & 8.871 & 9.066 & 9.041 & 14.838\\
+$3^3$, exact RI & 54 & & & & 9.386 & 15.074\\
 $4^3$ & 128 &        & 9.722 &       & 9.782 & 15.123\\
 $5^3$ & 250 &        & 9.910 &       & 9.934 & 15.216\\
 $6^3$ & 432 &        & --    &       &       & \\
@@ -1325,12 +1360,16 @@ dispersion across the small Brillouin zone is not corrected; this error decrease
 size, and the cells for which the method is intended have a flat body. (ii) In 2D, the
 constant-function head carries no $\ee^{-q|z-z'|}$ form factor for the finite thickness of the
 layer: a state that extends several \AA\ into the vacuum couples to the charge mode with a
-factor $\ee^{-q|z|}$ that is $0.7$ at $q=0.1$~\AA$^{-1}$ and $z=4$~\AA. Our integral runs
-over the whole small Brillouin zone ($q\le\pi/9a$ for a $9\times9$ cell) while the PR applies
-its model only to the cells adjacent to $\Gamma$ ($q\le\pi/24a$), so the two schemes are
-affected differently; this is the natural explanation of the $0.09$~eV difference in
-$\Sigma^c$ of the nearly-free-electron conduction state of h-AlN (Sec.~\ref{sec:res2d}),
-and it is not a property of the box of the lattice sum: the subtracted constant
+factor $\ee^{-q|z|}$ that is $0.7$ at $q=0.1$~\AA$^{-1}$ and $z=4$~\AA. This was the first
+candidate for the AlN difference of Sec.~\ref{sec:res2d}, but it does not survive the cell
+test: the missing factor is first order in $q$ and its effect would shrink with the radius of
+the small Brillouin zone, by about one half from the $9\times9$ to the $12\times12$ cell,
+whereas the gap moves by 8~meV; and the exact-RI tensor driver reproduces the RI-RS value, so no
+fit error is involved either. Our integral runs over the whole small Brillouin zone
+($q\le\pi/9a$ for a $9\times9$ cell) while the PR applies its model only to the cells adjacent
+to $\Gamma$ ($q\le\pi/24a$); which of the two $\Gamma$-point treatments is closer to the
+full-$k$ limit for a diffuse state is not settled by the present data. The difference is not a
+property of the box of the lattice sum: the subtracted constant
 $D_\mathrm{box}$ grows with the box while the finite remainder of the charge channel does not
 (h-BN, $8\times8$: $s=4$ and $s=5$ boxes differ by 1~meV in the gap). (iii) In 3D, the
 small-$q$ expansion of the pair phase, Eq.~\eqref{eq:pair_phi0}, holds for $|\bq\cdot\mathbf
@@ -1360,13 +1399,16 @@ activated automatically by \texttt{KPOINTS\_W 1 1 1} for \texttt{PERIODIC XY} an
 estimate. The earlier $k$-mesh large-cell scheme carries a spurious charge leak of the fitted
 pair densities and should not be used as a reference for 2D systems.
 Numerically, the slab correction reproduces the converged full-$k$ RI-RS $GW$ of PR~\#6447
-to 15--75~meV for h-BN (two bases), SiC and h-GaN, with a 0.25~eV deviation for the
-nearly-free-electron conduction state of h-AlN. For diamond the exchange of the $\Gamma$-only
+to 15--75~meV for h-BN (two bases), SiC and h-GaN, with a 0.25~eV deviation for h-AlN that
+the exact-RI tensor driver reproduces to 1~meV, so it is a property of the $\Gamma$-point
+models and not of the RI-RS fit. For diamond the exchange of the $\Gamma$-only
 RI-RS code is identical to the exact-RI tensor result, the dipole terms of the bulk kernel
 scale as $1/\Omega$ as derived, and the gap converges with the cell to within 0.1~eV by 250
-atoms; the 0.4~eV that separates the two codes at convergence lies in $\Sigma^c$; the standard
-tensor $k$-point $GW$ reference that arbitrates it is pending. The correction costs about 1~\% of a
-128-atom run.
+atoms; the 0.4~eV that separates the two codes at convergence lies in $\Sigma^c$ and is not a
+fit error of either code: the exact-RI tensor driver reproduces the RI-RS correction to
+0.04~eV at the band edges (the 54-atom cell is exchange-limited by its 3.1~\AA\ truncation,
+the larger cells are not), and the standard tensor $k$-point reference proved too costly to
+complete. The correction costs about 1~\% of a 128-atom run.
 
 \begin{acknowledgments}
 The full-$k$ reference calculations use the implementation of J.~Wilhelm (cp2k PR~\#6447).

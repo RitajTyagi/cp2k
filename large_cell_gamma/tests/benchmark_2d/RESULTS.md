@@ -38,3 +38,26 @@ Notes
   the strictly in-plane charge model (phi_0 = 1/sqrt(A), no exp(-q|z|)) for a state that
   extends into the vacuum, which enters our whole-small-BZ integral but only the near-Gamma
   cells of the PR.
+
+## AlN follow-up (2026-11-07)
+
+- PR grid is converged for AlN too: 12x12 with RS_AO_RATIO 20 gives 6.318 eV (direct 7.200)
+  vs 6.319 (7.198) at ratio 7; CBM(Gamma) Sigma^c -2.376 / Sigma^x -4.837 at ratio 20. So the
+  0.25 eV is not on the PR grid side (dir aln/pr_kp12_ratio20, 33 s on one largemem node).
+- Decomposition of ours - PR24 (gap -0.257): Sigma^x VBM(K) +0.071 and CBM(Gamma) -0.054 (both
+  close the gap, 0.125 together), Sigma^c CBM -0.09, Sigma^c VBM +0.033. The e^{-q|z|}
+  thickness form factor would scale with the small-BZ radius and should shrink the Sigma^c part
+  by ~half from 9x9 to 12x12; observed shift 8 meV. It is therefore unlikely to be the cause.
+- Arbiter on our side: tensor (exact-RI) driver with the same Gamma-only W + 2D correction
+  (commit 9263cd4925), AlN 6x6 (aln/tensor_6x6) vs RI-RS 6x6 (aln/gamma_6x6): isolates the
+  RI-RS grid fit from the Gamma model. Results below when available.
+- RESULT (2026-11-07): AlN 6x6 (72 atoms, DZVP) RI-RS vs tensor exact-RI, both with the Gamma-only
+  W + 2D head/wing correction (same binary, 9263cd4925): gap 6.013 vs 6.013 eV; VBM(K) state 144
+  eps_DFT -5.231, Sigma^c 2.641, Sigma^x -19.063, v_xc -15.173, GW -6.480 in BOTH; CBM(Gamma)
+  state 145 -1.868 / -2.529 / -4.901 / -8.832 / -0.466 in BOTH; all occupied and the first ~40
+  virtual states agree to <= 1 meV (band files in results/aln_6x6/). Cost: RI-RS 326 s / 7.7 GB,
+  tensor 1133 s / 44 GB per rank (chi 3.1 s vs 33 s per time point). So the RI-RS grid fit is
+  NOT the origin of the AlN difference to the PR; it lies in the Gamma-point model (whole-small-BZ
+  analytic head+wing with the charge projector vs the PR's near-Gamma cell model) or in the
+  supercell-Gamma vs full-k formulation (Sigma^x truncation 8-16 A vs 32 A, folded spectra on the
+  minimax grid), not in numerics on either side.

@@ -75,3 +75,34 @@ contribution to the gap); the standard CP2K tensor k-point GW on the primitive c
 ## Pending
 - ours 4x4x4 (128 atoms, largemem), 5x5x5 (250 atoms, largemem).
 - 3D wings / head-dipole terms (O(q.d), ~1/Omega) not yet included in the AO-basis scheme.
+
+## Standard tensor k-point references (cn_tensorkp6, cn_tensorkp8): not completed
+
+Primitive 2-atom cell, SCF mesh = W mesh = 6x6x6 / 8x8x8 (gw_tensor_small_cell_full_kp.F, no
+supercell, no Gamma correction; W from the k-mesh extrapolation). Both jobs hit the 24 h limit on
+one largemem node (8 ranks x 16 threads) after the FIRST of 10 chi time points: 37870 s (6^3) and
+77988 s (8^3) per point, 87 GB peak per rank. The cost is the real-space lattice sums (1607 cells
+for the 3c integrals, 12071 cells Delta R from the 9.0 / 9.6 A orbital / RI radii), not the basis
+(SZV, 40 RI functions). The k-point code has no chi restart, so the runs cannot be chained;
+a complete 6^3 run needs ~5 node-days. Dropped. The arbiter used instead is the tensor
+large-cell Gamma driver with the Gamma-only W and the same head-and-wing correction
+(exact-RI chi, W body and Sigma^c; only the optical response on the RI-RS grid), see below.
+
+## Exact-RI tensor driver vs RI-RS, 3x3x3 (54 atoms), same binary 9263cd4925, same Gamma-only W + correction
+
+| | RI-RS (cn_rgc_3x3x3) | tensor exact RI (cn_tgc_3x3x3_lm) |
+|---|---:|---:|
+| G0W0 gap (eV) | 9.039 | 9.386 |
+| HF gap (eV) | 14.838 | 15.074 |
+| VBM: Sigma^c / Sigma^x (eV) | 2.192 / -19.149 | 2.188 / -19.090 |
+| CBM: Sigma^c / Sigma^x (eV) | -3.491 / -10.021 | -3.455 / -9.943 |
+| correction diagnostics (K_h(0)/Omega, A_xx, B_xx) | identical | identical |
+| wall time, 8 ranks | 1680 s (login node, shared) | 5025 s (largemem) |
+
+State by state (results/exact_ri_3x3x3/): occupied states Sigma^x differs by -0.063 eV on average
+(max 0.19), lowest 32 virtuals by -0.144 (max 0.27); Sigma^c at the band edges 0.004 / 0.036 eV.
+The difference is the RI-RS grid representation of the truncated Coulomb operator of Sigma^x at
+the 3.1 A cutoff of this cell (= the 3.0 A RI-metric cutoff); at 4x4x4 (4.1 A) RI-RS and exact
+RI Sigma^x agree to 1 meV (cn_tensor_4x4x4 vs cn_v6_full_4x4x4: -18.956/-9.767 both). So the
+54-atom RI-RS gap is exchange-limited by ~0.3 eV, the 128/250-atom gaps are not, and the
+orbital-basis correction is consistent between grid and exact RI.
