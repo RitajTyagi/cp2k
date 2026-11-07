@@ -1165,6 +1165,7 @@ CONTAINS
          CALL dbcsr_release(tmpB)
          CALL dbcsr_release(LA_panC)
 
+         ! W_ll' <- W_ll' + DeltaW_ll', the Gamma-point head-and-wing correction.
          DO i_A = 1, SIZE(M_A)
             ! Reuse A_pan storage for its Hadamard product with the shared B panel.
             CALL hadamard_product_inplace(A_pan(i_A), B_pan, scale)

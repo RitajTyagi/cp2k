@@ -1046,8 +1046,8 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'setup_kpoints_chi_eps_W'
 
-      INTEGER                                            :: handle, i_dim, n_dim, nkp, nkp_extra, &
-                                                            nkp_orig, u
+      INTEGER                                            :: handle, i_batch, i_dim, n_dim, nkp, &
+                                                            nkp_extra, nkp_orig, u
       INTEGER, DIMENSION(3)                              :: nkp_grid, nkp_grid_extra, periodic
       REAL(KIND=dp)                                      :: exp_s_p, n_dim_inv
 
@@ -1081,6 +1081,19 @@ CONTAINS
                CPABORT("Error in periodicity.")
             END SELECT
          END DO
+
+         ! Gamma-only RI-RS or tensor GW for a 2D slab or a 3D bulk cell (KPOINTS_W 1 1 1): no extrapolation
+         ! mesh. W is then W(Gamma) plus the analytic head-and-wing integral over the whole small
+         ! Brillouin zone (gw_gamma_correction). With the extrapolation mesh kept, Gamma would
+         ! enter the s-s elements of W with weight 1/(1 - sqrt(2)) = -2.414 and all other
+         ! elements with weight zero, i.e. it would be a 2x2 calculation with a sign-flipped,
+         ! amplified Gamma term.
+         IF ((bs_env%gw_implementation == ri_rs_large_cell_Gamma .OR. &
+              bs_env%gw_implementation == tensor_large_cell_Gamma) .AND. &
+             (ALL(periodic == [1, 1, 0]) .OR. ALL(periodic == [1, 1, 1])) .AND. &
+             ALL(nkp_grid == 1)) THEN
+            nkp_grid_extra(1:3) = 1
+         END IF
 
       ELSE IF (bs_env%nkp_grid_chi_eps_W_input(1) == -1 .AND. &
                bs_env%nkp_grid_chi_eps_W_input(2) == -1 .AND. &
@@ -1163,15 +1176,21 @@ CONTAINS
 
          n_dim_inv = 1.0_dp/REAL(n_dim, KIND=dp)
 
-         ! k-point weights are chosen to automatically extrapolate the k-point mesh
-         CALL compute_wkp(kpoints_chi_eps_W%wkp(1:nkp_orig), nkp_orig, nkp_extra, n_dim_inv)
-         CALL compute_wkp(kpoints_chi_eps_W%wkp(nkp_orig + 1:nkp), &
-                          nkp_extra, nkp_orig, n_dim_inv)
+         IF (nkp_extra == 0) THEN
+            ! Gamma only: one point, weight one, for every element class of W.
+            kpoints_chi_eps_W%wkp(1:nkp_orig) = 1.0_dp/REAL(nkp_orig, KIND=dp)
+            bs_env%wkp_no_extra(1:nkp_orig) = 1.0_dp/REAL(nkp_orig, KIND=dp)
+         ELSE
+            ! k-point weights are chosen to automatically extrapolate the k-point mesh
+            CALL compute_wkp(kpoints_chi_eps_W%wkp(1:nkp_orig), nkp_orig, nkp_extra, n_dim_inv)
+            CALL compute_wkp(kpoints_chi_eps_W%wkp(nkp_orig + 1:nkp), &
+                             nkp_extra, nkp_orig, n_dim_inv)
 
-         bs_env%wkp_no_extra(1:nkp_orig) = 0.0_dp
-         bs_env%wkp_no_extra(nkp_orig + 1:nkp) = 1.0_dp/REAL(nkp_extra, KIND=dp)
+            bs_env%wkp_no_extra(1:nkp_orig) = 0.0_dp
+            bs_env%wkp_no_extra(nkp_orig + 1:nkp) = 1.0_dp/REAL(nkp_extra, KIND=dp)
+         END IF
 
-         IF (n_dim == 3) THEN
+         IF (n_dim == 3 .AND. nkp_extra > 0) THEN
             ! W_PQ(k) for an s-function P and a p-function Q diverges as 1/k at k=0
             ! (instead of 1/k^2 for P and Q both being s-functions).
             exp_s_p = 2.0_dp*n_dim_inv
@@ -1190,7 +1209,20 @@ CONTAINS
       ! heuristic parameter: how many k-points for χ, ε, and W are used simultaneously
       ! (less simultaneous k-points: less memory, but more computational effort because of
       !  recomputation of V(k))
-      bs_env%nkp_chi_eps_W_batch = 4
+      !
+      ! compute_V_k_by_lattice_sum builds V(k) one batch at a time and takes the real-space
+      ! lattice-sum box from whichever of the two k-meshes the batch belongs to, so a batch
+      ! straddling the boundary at nkp_chi_eps_W_orig has no well-defined box and aborts. Use the
+      ! largest batch size up to the heuristic 4 that divides nkp_orig, which puts a batch
+      ! boundary exactly on the mesh boundary. Without this, small meshes abort: KPOINTS_W 2 2 1
+      ! gives nkp_orig = 2 and the first batch of 4 would span both meshes.
+      bs_env%nkp_chi_eps_W_batch = 1
+      DO i_batch = MIN(4, bs_env%nkp_chi_eps_W_orig), 2, -1
+         IF (MODULO(bs_env%nkp_chi_eps_W_orig, i_batch) == 0) THEN
+            bs_env%nkp_chi_eps_W_batch = i_batch
+            EXIT
+         END IF
+      END DO
 
       bs_env%num_chi_eps_W_batches = (bs_env%nkp_chi_eps_W_orig_plus_extra - 1)/ &
                                      bs_env%nkp_chi_eps_W_batch + 1
@@ -1204,8 +1236,13 @@ CONTAINS
             WRITE (u, '(T2,A,T71,3I4)') "K-point mesh for χ, ε, W", nkp_grid
          CASE DEFAULT
             WRITE (u, FMT="(T2,1A,T71,3I4)") "K-point mesh 1 for χ, ε, W", nkp_grid(1:3)
-            WRITE (u, FMT="(T2,2A,T71,3I4)") "K-point mesh 2 for χ, ε, W ", &
-               "(for k-point extrapolation of W)", nkp_grid_extra(1:3)
+            IF (nkp_extra > 0) THEN
+               WRITE (u, FMT="(T2,2A,T71,3I4)") "K-point mesh 2 for χ, ε, W ", &
+                  "(for k-point extrapolation of W)", nkp_grid_extra(1:3)
+            ELSE
+               WRITE (u, FMT="(T2,A)") "K-point mesh 2 for χ, ε, W: none, Gamma-only W with the " &
+                  //"analytic head-and-wing integral"
+            END IF
             WRITE (u, FMT="(T2,A,T80,L)") "Approximate the k-point extrapolation", &
                bs_env%approx_kp_extrapol
          END SELECT
@@ -1903,12 +1940,17 @@ CONTAINS
          CPASSERT(bs_env%auto_ri%ready)
          CALL cp_fm_to_fm(bs_env%auto_ri%M_pq_inv, bs_env%fm_Minv_Gamma)
       ELSE
+         ! M^-1(k=0) is folded into W by compute_W_MIC (fm_contract_ABA), so it has to be
+         ! built the same way for every implementation of the same physics. The tensor
+         ! large-cell-Gamma path regularizes it nowhere -- heuristic_RI_regularization is
+         ! reached only by tensor_small_cell_full_kp -- so the RI-RS path must not either,
+         ! otherwise the two differ in W alone. REGULARIZATION_RI still defaults to 1.0E-2
+         ! for periodic systems and is applied to M(k) in compute_MinvVsqrt_Vsqrt, which both
+         ! codes share; applying it here as well made periodic RI-RS disagree with the tensor
+         ! reference by up to 3.8 eV in Sigma^c while chi and Sigma^c themselves agree to
+         ! 4-10 meV. For molecules regularization_RI is 0 anyway, so nothing changes there.
          metric_regularization = 0.0_dp
          eigenvalue_threshold = 0.0_dp
-         IF (bs_env%do_gw_ri_rs) THEN
-            metric_regularization = bs_env%regularization_RI
-            eigenvalue_threshold = bs_env%eps_eigval_mat_RI
-         END IF
          CALL RI_2c_integral_mat(qs_env, fm_M, bs_env%fm_RI_RI%matrix_struct, bs_env%n_RI, &
                                  bs_env%ri_metric, &
                                  regularization_RI=metric_regularization)

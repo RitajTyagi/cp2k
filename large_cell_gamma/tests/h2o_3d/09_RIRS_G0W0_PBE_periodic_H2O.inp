@@ -1,0 +1,79 @@
+# Periodic Gamma-point RI-RS G0W0: water in a 6 Angstrom cube, 3D periodic, GAPW.
+# The tensor implementation gives 23.312 eV for the same system and settings, so this test
+# also pins the RI-RS approximation error (0.017 eV) for the periodic path.
+&GLOBAL
+  PRINT_LEVEL SILENT
+  PROJECT RIRS-G0W0-PBE-periodic-H2O
+  RUN_TYPE ENERGY
+&END GLOBAL
+
+&FORCE_EVAL
+  METHOD Quickstep
+  &DFT
+    BASIS_SET_FILE_NAME REGTEST_BASIS
+    POTENTIAL_FILE_NAME POTENTIAL
+    &MGRID
+      CUTOFF 300
+      REL_CUTOFF 30
+    &END MGRID
+    &POISSON
+      PERIODIC XYZ
+      POISSON_SOLVER PERIODIC
+    &END POISSON
+    &QS
+      METHOD GAPW
+    &END QS
+    &SCF
+      EPS_SCF 1E-6
+      MAX_SCF 500
+      SCF_GUESS ATOMIC
+      &DIAGONALIZATION ON
+        ALGORITHM STANDARD
+      &END DIAGONALIZATION
+      &MIXING T
+        ALPHA 0.2
+        BETA 1.5
+        METHOD BROYDEN_MIXING
+        NBUFFER 8
+      &END MIXING
+    &END SCF
+    &XC
+      &XC_FUNCTIONAL PBE
+      &END XC_FUNCTIONAL
+    &END XC
+  &END DFT
+  &PROPERTIES
+    &BANDSTRUCTURE
+      &GW
+        KPOINTS_W 2 2 2
+        FREQ_MAX_FIT 27.211
+        NUM_TIME_FREQ_POINTS 10
+        &RI_RS
+          GRID_SELECT 1
+        &END RI_RS
+      &END GW
+    &END BANDSTRUCTURE
+  &END PROPERTIES
+  &SUBSYS
+    &CELL
+      ABC 6 6 6
+      MULTIPLE_UNIT_CELL 1 1 1
+      PERIODIC XYZ
+    &END CELL
+    &COORD
+      O  3.0000 3.0000 3.0000
+      H  3.7571 3.0000 3.5861
+      H  2.2429 3.0000 3.5861
+    &END COORD
+    &KIND H
+      BASIS_SET H_MINI
+      BASIS_SET RI_AUX RI_H_MINI
+      POTENTIAL ALL
+    &END KIND
+    &KIND O
+      BASIS_SET O_MINI
+      BASIS_SET RI_AUX RI_O_MINI
+      POTENTIAL ALL
+    &END KIND
+  &END SUBSYS
+&END FORCE_EVAL

@@ -56,6 +56,14 @@ MODULE gw_ri_rs_non_periodic
 
    PUBLIC :: gw_calc_ri_rs_non_periodic
 
+   ! shared with the periodic Gamma-point driver, which runs the same evGW0 loop but has to
+   ! use the periodic compute_QP_energies; the two cannot be in scope under the same name
+   PUBLIC :: init_evGW0, &
+             update_eigenvalues_G, &
+             reset_and_clean_bs_env, &
+             print_evGW0_band_edges, &
+             print_ri_rs_memory_estimate
+
 CONTAINS
 
 ! **************************************************************************************************

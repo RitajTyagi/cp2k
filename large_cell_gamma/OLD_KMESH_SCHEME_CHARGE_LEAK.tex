@@ -1,0 +1,145 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb,booktabs,microtype}
+\usepackage[dvipsnames]{xcolor}
+\usepackage[colorlinks=true,linkcolor=MidnightBlue,urlcolor=MidnightBlue]{hyperref}
+\newcommand{\bq}{\mathbf{q}}
+\newcommand{\br}{\mathbf{r}}
+\title{Why the old large-cell $\Gamma$ scheme is not a reference for 2D GW:\\the spurious charge of fitted pair densities}
+\author{Ritaj Tyagi, University of Regensburg}
+\date{6 November 2026}
+\begin{document}
+\maketitle
+
+\paragraph{Summary.}
+The large-cell $\Gamma$-point GW implementations in CP2K (\texttt{tensor\_large\_cell\_Gamma},
+\texttt{ri\_rs\_large\_cell\_Gamma}) build the screened interaction of a 2D supercell on a
+k-mesh \texttt{KPOINTS\_W}~$n\,n\,1$ of the supercell's small Brillouin zone, with a second
+``extrapolation'' mesh of $2n$ points and a Coulomb matrix $V(\bq)$ from a minimum-image
+truncated real-space lattice sum. Band gaps from this scheme were used as the reference against
+which the new $\Gamma$-only scheme (one real k-point plus an analytic head-and-wing correction)
+was judged, and the two differ by $0.12$~eV on the largest cell we can afford. This note
+documents that the old scheme carries the systematic error, that the error is the spurious net
+charge of RI-fitted pair densities identified by J.~Wilhelm in cp2k PR~\#6447, and that the
+$\Gamma$-only numbers are confirmed by his full-k-point code to about 15~meV. Numbers that came
+out of the old scheme for 2D systems should therefore not be used as references.
+
+\section{The observation}
+
+Monolayer h-BN, $a = 2.502$~\AA, 15~\AA\ vacuum, PBE, aug-SZV-MOLOPT-GTH tier-1 orbital and RI
+bases, 10 minimax points, \texttt{CUTOFF\_RADIUS\_RI}~5~\AA, identical in every code and run.
+``Gap'' is the direct G$_0$W$_0$ gap at the k-point $P = (11/32, 11/32)$ of the primitive zone,
+the point nearest to $K$ that an $8\times8$ supercell with a $2\times2$ DOS mesh samples.
+
+\begin{center}
+\begin{tabular}{llr}
+\toprule
+scheme & cell / mesh & gap (eV)\\
+\midrule
+old large-cell scheme, \texttt{KPOINTS\_W 4 4 1} + extrapolation & $8\times8$ supercell & 8.152\\
+old large-cell scheme, \texttt{KPOINTS\_W 4 4 1} + extrapolation & $14\times14$ supercell & 6.582\\
+old large-cell scheme, \texttt{KPOINTS\_W 2 2 1} + extrapolation & $14\times14$ supercell & 6.595\\
+\midrule
+$\Gamma$-only + head/wing correction (this work) & $8\times8$ supercell & 6.710\\
+$\Gamma$-only + head/wing correction & $10\times10$ supercell & 6.705\\
+$\Gamma$-only + head/wing correction & $14\times14$ supercell & 6.699\\
+\midrule
+full-k RI-RS GW, PR \#6447 (primitive cell) & $6\times6$ mesh & 6.590\\
+full-k RI-RS GW, PR \#6447 & $8\times8$ mesh & 6.658\\
+full-k RI-RS GW, PR \#6447 & $12\times12$ mesh & 6.681\\
+full-k RI-RS GW, PR \#6447 & $16\times16$ mesh & 6.684\\
+full-k RI-RS GW, PR \#6447 & $20\times20$ mesh & 6.687\\
+full-k RI-RS GW, PR \#6447 & $24\times24$ mesh & 6.690\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Three things stand out. (i) The old scheme is not converged with the cell: $8.15$~eV at
+$8\times8$ against $6.58$~eV at $14\times14$, and an earlier sweep with the tier-2 basis
+(11.85, 9.74, 9.66, 9.43, 8.63, 7.54~eV for $n = 5, 6, 7, 8, 10, 12$) was still falling at
+30~\AA. (ii) The $\Gamma$-only scheme is converged to 5~meV in the gap from $8\times8$ on.
+(iii) The independent full-k-point code converges from below onto the $\Gamma$-only value;
+state by state at the supercell $\Gamma$ point the absolute G$_0$W$_0$ energies agree to 5~meV
+(valence) and 14~meV (conduction) with the $24\times24$ mesh, with identical $\Sigma^x$ and
+$v^{xc}$ and $\Sigma^c$ within 10~meV. The old scheme sits $0.12$~eV below both at
+$14\times14$ and is still drifting downwards, so the $0.12$~eV is its error, not the new
+code's.
+
+\section{The mechanism: a spurious charge in the fitted pair densities}
+
+In the real-space RI (RI-RS) a product of two orbitals is interpolated from its values on the
+atom-centred grid points $\br_\ell$ and fitted to the auxiliary basis through the fit
+coefficients $Z_{\ell P}$,
+\begin{equation}
+  \psi_i(\br)\psi_a(\br) \approx \sum_{P}\Big[\sum_\ell Z_{\ell P}\,\psi_i(\br_\ell)\psi_a(\br_\ell)\Big]\varphi_P(\br)
+  \equiv \sum_P d_{ia,P}\,\varphi_P(\br).
+\end{equation}
+The exact transition density is neutral, $\int\psi_i\psi_a = 0$ by orthogonality. The fitted one
+is not: its charge $m_{ia} = \sum_P c_P\,d_{ia,P}$, with $c_P = \int\varphi_P$, is a small but
+nonzero number set by the grid and the fit (the grid cannot represent orthogonality, and the
+fit is regularised). This was found by J.~Wilhelm while converging his full-k-point RI-RS GW
+(cp2k PR~\#6447, commit \texttt{a2a9da4c91}).
+
+A spurious charge is harmless for a molecule and nearly harmless for a 3D crystal, but not in
+two dimensions. On the $\bq$ mesh of a 2D calculation the Coulomb kernel in the charge channel
+is $v(\bq) = 2\pi/(Aq)$, so the charge mode of $\chi$ enters the dielectric function as
+\begin{equation}
+  \varepsilon_{00}(\bq) - 1 \;\sim\; \frac{2\pi}{Aq}\sum_{ia}\frac{2\,|m_{ia}|^2\,\Delta_{ia}}{\Delta_{ia}^2+\omega^2}
+  \;=\; \frac{C}{q},
+\end{equation}
+a $1/q$ divergence with a spurious prefactor. Summed over a 2D mesh the mesh points approach
+$\bq = 0$ as $1/N$, and $\sum_\bq 1/q$ over an $N\times N$ mesh grows like $\ln N$: the
+screening, and with it the gap, drifts logarithmically with the mesh instead of converging. His
+numbers: the WSe$_2$ gap moved from 2.222 to 2.197~eV with the mesh; after projecting the charge
+out of every fitted density, $d' = d - c\,(c^\dagger d)/(c^\dagger c)$, it is 2.233~eV and
+stable; the 2D h-BN regression reference moved by $+0.92$~eV. The fix is in his PR.
+
+The old large-cell scheme has the same fitted densities with the same spurious charge, but its
+Coulomb matrix is not $2\pi/(Aq)$. $V(\bq)$ is a real-space lattice sum truncated at the
+minimum-image radius $R_c \approx L/2$ of the supercell, whose charge-channel value is finite,
+$\int_0^{R_c}\!2\pi r\,\mathrm{d}r/r = 2\pi R_c$ per cell area. The leak therefore does not
+diverge; it produces a finite spurious screening proportional to $|m|^2 R_c/A \propto 1/L$,
+i.e.\ a uniform downward shift of $\Sigma^c$ that decays only as the inverse cell size. That is
+exactly the signature in the table: a gap that is too small, converges slowly from below, and
+is still moving at 30~\AA. The sign of Wilhelm's fix ($+0.92$~eV for h-BN with his settings) and
+the sign of our discrepancy (old scheme below) agree.
+
+\section{Why the $\Gamma$-only scheme is immune}
+
+The $\Gamma$-only implementation never lets a fitted density interact through the charge
+channel of a sampled $V(\bq)$:
+\begin{itemize}
+\item the body of the dielectric matrix is built with the neutral projector,
+      $V_b = \Pi V(0)\Pi$, $\Pi = 1 - \hat c\hat c^{\mathrm T}$, so the charge direction of the
+      auxiliary basis carries no Coulomb interaction at all in the body;
+\item the head and wings of $\varepsilon$ in the charge channel are built from the exact
+      velocity-gauge transition dipoles $\langle a|[H,\br]|i\rangle/(\epsilon_a-\epsilon_i)$,
+      checked by the Thomas--Reiche--Kuhn sum rule, and integrated analytically over the whole
+      small Brillouin zone with the $2\pi/q$ kernel;
+\item the regular $W(\Gamma)$ uses $V(0)$ with only the divergent $G = 0$ constant removed, and
+      the charge direction of that matrix is quenched in $\varepsilon^{-1}$ (its Cholesky
+      factorisation drops the negative mode).
+\end{itemize}
+This is the same treatment of the charge channel as Wilhelm's $\Gamma$ model, which is why the
+two codes agree once his leak is removed. The agreement (15~meV at $8\times8$ versus
+$24\times24$, with the remaining difference of the size expected from the $8\times8$ cell) is
+the actual validation of the $\Gamma$-only scheme; the old large-cell numbers are not.
+
+\section{Consequences}
+
+\begin{enumerate}
+\item Band gaps of 2D systems produced by \texttt{tensor\_large\_cell\_Gamma} or
+      \texttt{ri\_rs\_large\_cell\_Gamma} with \texttt{KPOINTS\_W} $n\,n\,1$ ($n>1$) carry a
+      cell-size-dependent error of order $0.1$~eV at 30~\AA\ and more than 1~eV on cells of
+      20~\AA, and should not be used as references or regression values.
+\item The $0.12$~eV difference between the two large-cell schemes at $14\times14$ is the old
+      scheme's residual leak, consistent with the independent full-k-point result.
+\item For 2D the large-cell code should be run $\Gamma$-only (\texttt{KPOINTS\_W 1 1 1}), which
+      activates the head-and-wing correction; the same now holds for 3D cells
+      (\texttt{PERIODIC XYZ}), where $V(0)$ is an Ewald sum with the $G=0$ term omitted.
+\end{enumerate}
+
+\paragraph{Data.} All inputs and outputs are in \texttt{large\_cell\_gamma/tests/881} of the
+branch \texttt{rirs\_periodic\_gamma} (\texttt{github.com/RitajTyagi/cp2k}); the full-k
+reference runs and the state-by-state table are in \texttt{881/kpoint\_ref\_pr6447/RESULTS.md}.
+\end{document}

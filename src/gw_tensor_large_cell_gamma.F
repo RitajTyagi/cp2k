@@ -45,6 +45,11 @@ MODULE gw_tensor_large_cell_Gamma
    USE gw_compute_V_and_W,              ONLY: fm_read,&
                                               fm_write,&
                                               get_W_MIC
+   USE gw_gamma_correction,             ONLY: gamma_corr_add_to_sigma,&
+                                              gamma_corr_build_coulomb_maps,&
+                                              gamma_corr_requested,&
+                                              gamma_corr_response,&
+                                              gamma_corr_tabulate
    USE gw_utils,                        ONLY: G_occ_vir,&
                                               analyt_conti_and_print,&
                                               de_init_bs_env
@@ -70,6 +75,7 @@ MODULE gw_tensor_large_cell_Gamma
    USE qs_tensors,                      ONLY: build_3c_integrals,&
                                               compress_tensor,&
                                               decompress_tensor
+   USE ri_rs_setup,                     ONLY: ensure_ri_rs_representation
    USE time_frequency_grids,            ONLY: negative_time,&
                                               positive_time,&
                                               transform_time_to_frequency
@@ -134,6 +140,29 @@ CONTAINS
       CALL get_mat_chi_Gamma_tau(bs_env, qs_env, bs_env%mat_chi_Gamma_tau)
       CALL store_3c_finish(bs_env, bs_env%store_3c_chi)
 
+      ! Gamma-only W (PERIODIC XY or XYZ with KPOINTS_W 1 1 1): the mesh for χ, ε, W contains
+      ! q = 0, where V_PQ(q) between charged auxiliary functions is singular. The same
+      ! head-and-wing correction as in the RI-RS driver is used (gw_gamma_correction):
+      !   2D: V_b = Π V(0) Π, ΔW^c_PQ(iτ) added to W^MIC_PQ(iτ) in RI space inside get_W_MIC
+      !   3D: V(0) = Ewald sum without its G = 0 term; head, head-dipole and wings enter Σ^c
+      !       in the orbital basis (gamma_corr_add_to_sigma below)
+      ! Only the optical response S_αβ(iω), T_Pα(iω) is evaluated on the RI-RS grid; χ, the
+      ! body of W and Σ^c stay exact-RI tensor contractions. This isolates the RI-RS grid fit
+      ! from the Γ-point model when the two drivers are compared.
+      IF (gamma_corr_requested(bs_env)) THEN
+         ! grid r_l, ϕ_μ(r_l), Z_lP and gamma_corr_init (sets gamma_corr%enabled, geometry)
+         CALL ensure_ri_rs_representation(qs_env, bs_env)
+         IF (bs_env%ri_rs%gamma_corr%enabled) THEN
+            ! c, Π, V_b^(±1/2), F_density = M^-1 Π V_b^(1/2), G_extern = V(0) Π V_b^(-1/2)
+            CALL gamma_corr_build_coulomb_maps(qs_env, bs_env)
+            ! S_αβ(iω) = Y - Eᵀ B^-1 E and T_Pα(iω) from the velocity-gauge dipoles and χ_PQ(Γ,iτ)
+            CALL gamma_corr_response(bs_env, qs_env, bs_env%mat_chi_Gamma_tau)
+            ! 2D: K_h(R,iω), K_w(R,iω) tables; 3D: per-direction coefficients of the BZ integrals
+            CALL gamma_corr_tabulate(bs_env, n_tab=128)
+            bs_env%ri_rs%gamma_corr%ready = .TRUE.
+         END IF
+      END IF
+
       ! χ_PQ(iτ,k=0) -> χ_PQ(iω,k) -> ε_PQ(iω,k) -> W_PQ(iω,k) -> W^MIC_PQ(iτ) -> M^-1*W^MIC*M^-1
       CALL get_W_MIC(bs_env, qs_env, bs_env%mat_chi_Gamma_tau, fm_W_MIC_time)
 
@@ -149,6 +178,11 @@ CONTAINS
       ! Σ^c_λσ(iτ,k=0) = sum_νQ [sum_P (νσ|P) W^MIC_PQ(iτ)] [sum_µ (λµ|Q) G^vir_µν(i|τ|)], τ > 0
       CALL get_Sigma_c(bs_env, qs_env, fm_W_MIC_time, fm_Sigma_c_Gamma_time)
       CALL store_3c_finish(bs_env, bs_env%store_3c_W, bs_env%store_3c_Sigma)
+
+      ! 3D Gamma-point correction: ΔΣ^c_n(∓|τ|) = ∓ Σ_m^occ/vir e^(-|τ||ϵ_m-ϵ_F|) Ŵ_nm(τ) with the
+      ! orbital-pair kernel Ŵ_nm = w δ_nm + B:d d + 2√Ω A:V d + Ω A:V V, added as (SC) diag (SC)ᵀ
+      IF (bs_env%ri_rs%gamma_corr%enabled .AND. .NOT. bs_env%ri_rs%gamma_corr%slab) &
+         CALL gamma_corr_add_to_sigma(bs_env, qs_env, fm_Sigma_c_Gamma_time)
 
       ! Σ^c_λσ(iτ,k=0) -> Σ^c_nn(ϵ,k); ϵ_nk^GW = ϵ_nk^DFT + Σ^c_nn(ϵ,k) + Σ^x_nn(k) - v^xc_nn(k)
       CALL compute_QP_energies(bs_env, qs_env, fm_Sigma_x_Gamma, fm_Sigma_c_Gamma_time)
@@ -1570,13 +1604,15 @@ CONTAINS
 !> \param qs_env ...
 !> \param fm_Sigma_x_Gamma ...
 !> \param fm_Sigma_c_Gamma_time ...
+!> \param i_iter (optional) evGW0 iteration index, passed on to the analytic continuation
 ! **************************************************************************************************
-   SUBROUTINE compute_QP_energies(bs_env, qs_env, fm_Sigma_x_Gamma, fm_Sigma_c_Gamma_time)
+   SUBROUTINE compute_QP_energies(bs_env, qs_env, fm_Sigma_x_Gamma, fm_Sigma_c_Gamma_time, i_iter)
 
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_Sigma_x_Gamma
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :, :)  :: fm_Sigma_c_Gamma_time
+      INTEGER, INTENT(IN), OPTIONAL                      :: i_iter
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_QP_energies'
 
@@ -1637,7 +1673,7 @@ CONTAINS
             ! 8. Analytic continuation Σ^c_nn(k_i,iω) -> Σ^c_nn(k_i,ϵ) and
             !    ϵ_nk_i^GW = ϵ_nk_i^DFT + Σ^c_nn(k_i,ϵ) + Σ^x_nn(k_i) - v^xc_nn(k_i)
             CALL analyt_conti_and_print(bs_env, Sigma_c_ikp_n_freq, Sigma_x_ikp_n, V_xc_ikp_n, &
-                                        bs_env%eigenval_scf(:, ikp, ispin), ikp, ispin)
+                                        bs_env%eigenval_scf(:, ikp, ispin), ikp, ispin, i_iter)
 
          END DO ! ikp_DOS
 

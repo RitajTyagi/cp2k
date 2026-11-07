@@ -55,6 +55,8 @@ MODULE gw_compute_V_and_W
                                               cp_print_key_should_output,&
                                               cp_print_key_unit_nr
    USE distribution_2d_types,           ONLY: distribution_2d_type
+   USE gw_gamma_correction,             ONLY: gamma_corr_add_to_W,&
+                                              gamma_corr_subtract_divergent_head
    USE gw_utils_fm,                     ONLY: cfm_contract_ABA,&
                                               fm_contract_ABA,&
                                               fm_sqrt
@@ -305,6 +307,13 @@ CONTAINS
          CALL apply_extrapol_factor(bs_env, fm_W_MIC_time)
       END IF
 
+      ! Gamma-point head-and-wing correction (2D, Gamma-only W): ΔW^c_PQ(iτ) added to
+      ! W^MIC_PQ(iτ) here, in the projection representation, so that it is folded with the
+      ! same M^-1 and the same fit Z as the regular W.
+      IF (bs_env%ri_rs%gamma_corr%enabled) THEN
+         CALL gamma_corr_add_to_W(bs_env, qs_env, fm_W_MIC_time)
+      END IF
+
       ! M^-1(k=0) W^MIC(iτ) M^-1(k=0) -> fm_W_MIC_time
       CALL fm_contract_ABA(bs_env%fm_Minv_Gamma, fm_W_MIC_time)
 
@@ -348,6 +357,7 @@ CONTAINS
 
       INTEGER                                            :: handle, ikp, ikp_end, ikp_start, &
                                                             nkp_chi_eps_W_batch, re_im
+      LOGICAL                                            :: use_cached_V
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_fm_type)                                   :: fm_V_kp_work
@@ -398,17 +408,26 @@ CONTAINS
 
       END IF
 
-      CALL build_2c_coulomb_matrix_kp(mat_V_kp, &
-                                      bs_env%kpoints_chi_eps_W, &
-                                      basis_type="RI_AUX", &
-                                      cell=cell, &
-                                      particle_set=particle_set, &
-                                      qs_kind_set=qs_kind_set, &
-                                      atomic_kind_set=atomic_kind_set, &
-                                      size_lattice_sum=bs_env%size_lattice_sum_V, &
-                                      operator_type=operator_coulomb, &
-                                      ikp_start=ikp_start, &
-                                      ikp_end=ikp_end)
+      ! With the Gamma-point correction active the mesh is Gamma only and V(q=0) was already
+      ! built by gamma_corr_coulomb_at_zero (2D: the identical lattice sum, same operator, same
+      ! image box, same basis; 3D: the Ewald sum without its G = 0 term, which the regular path
+      ! must use as well): reuse it instead of summing the images a second time.
+      use_cached_V = bs_env%ri_rs%gamma_corr%enabled .AND. bs_env%ri_rs%gamma_corr%V_zero_cached
+      IF (use_cached_V) THEN
+         CPASSERT(ikp_start == 1 .AND. ikp_end == 1)
+      ELSE
+         CALL build_2c_coulomb_matrix_kp(mat_V_kp, &
+                                         bs_env%kpoints_chi_eps_W, &
+                                         basis_type="RI_AUX", &
+                                         cell=cell, &
+                                         particle_set=particle_set, &
+                                         qs_kind_set=qs_kind_set, &
+                                         atomic_kind_set=atomic_kind_set, &
+                                         size_lattice_sum=bs_env%size_lattice_sum_V, &
+                                         operator_type=operator_coulomb, &
+                                         ikp_start=ikp_start, &
+                                         ikp_end=ikp_end)
+      END IF
 
       bs_env%kpoints_chi_eps_W%nkp_grid = bs_env%nkp_grid_chi_eps_W_orig
 
@@ -416,14 +435,39 @@ CONTAINS
       CALL cp_fm_create(fm_V_kp_work, bs_env%fm_RI_RI%matrix_struct)
       DO ikp = ikp_start, ikp_end
          CALL cp_cfm_create(cfm_V_kp(ikp), bs_env%fm_RI_RI%matrix_struct)
-         CALL cp_fm_set_all(fm_V_kp_work, 0.0_dp)
-         CALL copy_dbcsr_to_fm(mat_V_kp(ikp, 1)%matrix, fm_V_kp_work)
-         cfm_V_kp(ikp)%local_data = CMPLX(fm_V_kp_work%local_data, 0.0_dp, KIND=dp)
+         IF (use_cached_V) THEN
+            ! Real by construction at q = 0 (gamma_corr_coulomb_at_zero checks the imaginary part).
+            cfm_V_kp(ikp)%local_data = CMPLX(bs_env%ri_rs%gamma_corr%fm_V_zero%local_data, &
+                                             0.0_dp, KIND=dp)
+            CALL cp_fm_release(bs_env%ri_rs%gamma_corr%fm_V_zero)
+            bs_env%ri_rs%gamma_corr%V_zero_cached = .FALSE.
+         ELSE
+            CALL cp_fm_set_all(fm_V_kp_work, 0.0_dp)
+            CALL copy_dbcsr_to_fm(mat_V_kp(ikp, 1)%matrix, fm_V_kp_work)
+            cfm_V_kp(ikp)%local_data = CMPLX(fm_V_kp_work%local_data, 0.0_dp, KIND=dp)
 
-         CALL cp_fm_set_all(fm_V_kp_work, 0.0_dp)
-         CALL copy_dbcsr_to_fm(mat_V_kp(ikp, 2)%matrix, fm_V_kp_work)
-         cfm_V_kp(ikp)%local_data = CMPLX(REAL(cfm_V_kp(ikp)%local_data, KIND=dp), &
-                                          fm_V_kp_work%local_data, KIND=dp)
+            CALL cp_fm_set_all(fm_V_kp_work, 0.0_dp)
+            CALL copy_dbcsr_to_fm(mat_V_kp(ikp, 2)%matrix, fm_V_kp_work)
+            cfm_V_kp(ikp)%local_data = CMPLX(REAL(cfm_V_kp(ikp)%local_data, KIND=dp), &
+                                             fm_V_kp_work%local_data, KIND=dp)
+         END IF
+
+         ! V(0) <- V(0) - D_box c c^T when the 2D Gamma-point correction is active: the mesh is
+         ! then Gamma only, and at q = 0 the charged lattice sum carries a constant that grows with
+         ! the summation range. Only that constant goes; the head and wings DeltaW adds back are
+         ! its analytic replacement. NOT the projector Pi V Pi, which would also delete the finite
+         ! G /= 0 interactions of the charged direction.
+         ! With the correction enabled the W mesh is Gamma only, so every ikp here must be q = 0;
+         ! the assertion guards against subtracting the q = 0 constant at a finite q. The charge
+         ! vector it needs was built in step 4b (gamma_corr_build_coulomb_maps), which runs
+         ! before get_W_MIC reaches this routine.
+         ! 3D: nothing to subtract; the cached V(0) is the Ewald sum without its G = 0 term
+         ! (gamma_corr_coulomb_at_zero), which is exactly the body the head-and-wing model needs.
+         IF (bs_env%ri_rs%gamma_corr%enabled) THEN
+            CPASSERT(ALL(ABS(bs_env%kpoints_chi_eps_W%xkp(:, ikp)) < 1.0E-12_dp))
+            IF (bs_env%ri_rs%gamma_corr%slab) &
+               CALL gamma_corr_subtract_divergent_head(bs_env, cfm_V_kp(ikp))
+         END IF
       END DO
       CALL cp_fm_release(fm_V_kp_work)
       CALL dbcsr_deallocate_matrix_set(mat_V_kp)
@@ -544,7 +588,9 @@ CONTAINS
 
       ! 2. W(iw,k) = V^0.5(k)*(epsilon^-1(iw,k)-Id)*V^0.5(k)
 
-      ! 2. a) Cholesky-factorize epsilon before inversion.
+      ! 2. a) Cholesky-factorize epsilon before inversion. The caller clipped chi into the
+      !       positive semidefinite cone, so epsilon = Id + V^0.5 M^-1 chi M^-1 V^0.5 >= Id and
+      !       every pivot is >= 1; the check only guards against that invariant being broken.
       CALL cp_cfm_cholesky_decompose(matrix=cfm_chi_eps_W_ikp_freq_j, n=bs_env%n_RI, info_out=info)
       CPASSERT(info == 0)
 
@@ -681,7 +727,16 @@ CONTAINS
       CALL cfm_ikp_from_fm_Gamma(cfm_chi_eps_W_ikp_freq_j, bs_env%fm_chi_Gamma_freq, &
                                  ikp, qs_env, bs_env%kpoints_chi_eps_W, "RI_AUX")
 
-      ! 2. Remove all negative eigenvalues from χ_PQ(iω_j,k_i)
+      ! 2. Remove the negative eigenvalues of χ_PQ(iω_j,k_i). The physical χ is a Gram matrix
+      !    of occupied-virtual products and so exactly positive semidefinite; the negative
+      !    modes are an artifact of reconstructing χ(k) from χ(Γ) with the minimum image
+      !    convention, i.e. χ(k) = M(k) ∘ χ(Γ) with the phase M_PQ = exp(i k·R^MIC_PQ). M is a
+      !    rank-1 u u^H, hence positive semidefinite, hence harmless by the Schur product
+      !    theorem -- but only while R^MIC does not wrap, which on any production-sized cell it
+      !    does. The clipping repairs that reconstruction and is therefore part of the method,
+      !    not a numerical safeguard: skipping it wherever ε happens to stay positive definite
+      !    runs 1.5x faster on the W stage and moves the QP gap of a 392-atom h-BN supercell by
+      !    55 meV. It is also what the Cholesky factorization of ε in step 3 relies on.
       CALL cp_cfm_power(cfm_chi_eps_W_ikp_freq_j, threshold=0.0_dp, exponent=1.0_dp)
 
       ! 3. ε(iω_j,k_i) = Id - V^0.5(k_i)*M^-1(k_i)*χ(iω_j,k_i)*M^-1(k_i)*V^0.5(k_i)
