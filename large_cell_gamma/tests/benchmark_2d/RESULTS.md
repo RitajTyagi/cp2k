@@ -61,3 +61,16 @@ Notes
   analytic head+wing with the charge projector vs the PR's near-Gamma cell model) or in the
   supercell-Gamma vs full-k formulation (Sigma^x truncation 8-16 A vs 32 A, folded spectra on the
   minimax grid), not in numerics on either side.
+
+## Rebase validation (branch rirs_periodic_gamma_v2 on upstream master after PR 6447, 2026-11-07)
+
+Same inputs, binary from the rebased branch (Noctua periodic_3d_test/cp2k-v2):
+- regtests QS/regtest-gw-realspace: 45/49 correct; the 4 "wrong" were our periodic H2O
+  references, shifted by upstream #6474 (averaged Padé orders, unconditional); HF edges identical,
+  references updated (23.312 -> 23.519, evGW0 -6.003/17.865/23.868 -> -6.011/17.943/23.953).
+- AlN 6x6 RI-RS: gap 6.241 (was 6.013); HF 11.184 (identical), Sigma^x -19.063/-4.901 (identical),
+  v_xc identical; Sigma^c 2.641 -> 2.460 (VBM), -2.529 -> -2.482 (CBM): continuation only.
+- diamond 3x3x3 RI-RS: 9.210 (was 9.039); HF 14.833 (was 14.838); correction diagnostics identical.
+NOTE: every GW number on master now carries the averaged Padé continuation; the 2D benchmark table
+above and the PR comparisons were made with the standard Padé on both sides and must be rerun
+with one build on both sides before being compared to master numbers.
