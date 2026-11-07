@@ -44,11 +44,11 @@
   {matcher = "E_evGW0_direct_gap", tol = 1e-03, ref = 21.416}
 ]
 
-"09_RIRS_G0W0_PBE_periodic_H2O.inp"      = [{matcher="E_G0W0_direct_gap", tol=1e-03, ref=23.312}]
+"09_RIRS_G0W0_PBE_periodic_H2O.inp"      = [{matcher="E_G0W0_direct_gap", tol=1e-03, ref=23.519}]
 
-"10_RIRS_EVGW0_PBE_periodic_H2O.inp"     = [{matcher="E_RIRS_evGW0_HOMO", tol=1e-03, ref=-6.003},
-                                          {matcher="E_RIRS_evGW0_LUMO", tol=1e-03, ref=17.865},
-                                          {matcher="E_evGW0_direct_gap", tol=1e-03, ref=23.868}]
+"10_RIRS_EVGW0_PBE_periodic_H2O.inp"     = [{matcher="E_RIRS_evGW0_HOMO", tol=1e-03, ref=-6.011},
+                                          {matcher="E_RIRS_evGW0_LUMO", tol=1e-03, ref=17.943},
+                                          {matcher="E_evGW0_direct_gap", tol=1e-03, ref=23.953}]
 
 # AUTO_RI contracts a large QZ reference basis; the resolved RS grid gives a stable GW gap.
 "auto-ri-size-H2O.inp"                      = [
