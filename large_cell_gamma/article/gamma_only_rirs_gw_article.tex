@@ -1076,28 +1076,37 @@ Table~\ref{tab:resval} compares the $\Gamma$-only $8\times8$ h-BN supercell (128
 aug-SZV-MOLOPT-GTH tier-1 orbital and RI bases, 15~\AA\ vacuum, cutoff 600~Ry, 10 minimax
 points) with the PR at increasing meshes, at the primitive point $P=(11/32,11/32)$ nearest to
 $K$ that the supercell samples, and state by state at the point $Q$ that the supercell folds
-onto its $\Gamma$. The full-$k$ gap converges from below onto the $\Gamma$-only value; at
-$24\times24$ the absolute quasiparticle energies agree to 5~meV (valence) and 14~meV
-(conduction), with identical $\Sigma^x$ and $v^{xc}$. Larger $\Gamma$-only cells ($10\times10$,
-$14\times14$) move the gap by less than 10~meV, i.e.\ the $8\times8$ result is cell-converged.
+onto its $\Gamma$. The full-$k$ gap converges from below towards the $\Gamma$-only value; at
+$24\times24$ the absolute quasiparticle energies at $Q$ agree to 16~meV (valence) and 24~meV
+(conduction), with identical $\Sigma^x$ and $v^{xc}$, and the gap at $P$ to 56~meV. The larger
+$\Gamma$-only cells sample a different point nearest to $K$ ($13/40$ and $19/56$ instead of
+$11/32$) and move the gap by 11 and 34~meV; the full-$k$ gap itself differs by 37~meV between
+$K$ and $P$, so these are sampling shifts rather than cell convergence. With the standard
+Pad\'e continuation of our earlier builds the same comparison gave 5 and 14~meV at $Q$ and
+20~meV at $P$ (Table~\ref{tab:oldscheme}); the averaged continuation amplifies the small
+$\Sigma^c$ differences between the folded supercell spectrum and the primitive-cell spectrum
+(2.043 vs 2.082~eV at the valence state of $Q$ at the same 8.7~\AA\ exchange cutoff).
 
 \begin{table}[h]
 \caption{h-BN monolayer, aug-SZV tier-1 basis: direct $G_0W_0$ gap at $P$ and quasiparticle
-energies at $Q$ (eV). $\Gamma$-only: $8\times8$ supercell with the head-and-wing correction.
-PR: primitive cell, $N\times N$ mesh.}
+energies at $Q$ (eV); one master build, averaged Pad\'e continuation in both codes.
+$\Gamma$-only: $8\times8$ supercell with the head-and-wing correction (the $10\times10$ and
+$14\times14$ entries are the gap at the sampled point nearest to $K$ of those cells, $13/40$
+and $19/56$). PR: primitive cell, $N\times N$ mesh.}
 \label{tab:resval}
 \begin{ruledtabular}
 \begin{tabular}{lcccc}
  & gap($P$) & VB($Q$) & CB($Q$) & $\Sigma^c$ VB / CB\\
 \colrule
-PR $6\times6$   & 6.590 &        &       & \\
-PR $8\times8$   & 6.658 & $-4.974$ & 2.109 & 2.160 / $-3.164$\\
-PR $12\times12$ & 6.681 &        &       & \\
-PR $16\times16$ & 6.684 &        &       & \\
-PR $24\times24$ & 6.690 & $-5.034$ & 2.067 & 2.225 / $-3.222$\\
-$\Gamma$-only $8\times8$ & 6.710 & $-5.039$ & 2.081 & 2.131 / $-3.210$\\
-$\Gamma$-only $10\times10$ & 6.705 & & & \\
-$\Gamma$-only $14\times14$ & 6.699 & & & \\
+PR $6\times6$   & 6.714 & $-5.013$ & 2.169 & 2.050 / $-3.088$\\
+PR $8\times8$   & 6.780 & $-5.051$ & 2.161 & 2.082 / $-3.113$\\
+PR $12\times12$ & 6.801 & $-5.082$ & 2.143 & 2.118 / $-3.146$\\
+PR $16\times16$ & 6.804 & $-5.096$ & 2.129 & 2.134 / $-3.161$\\
+PR $20\times20$ & 6.807 & $-5.105$ & 2.122 & 2.142 / $-3.168$\\
+PR $24\times24$ & 6.810 & $-5.112$ & 2.119 & 2.146 / $-3.172$\\
+$\Gamma$-only $8\times8$ & 6.866 & $-5.128$ & 2.143 & 2.043 / $-3.148$\\
+$\Gamma$-only $10\times10$ & 6.855 & & & \\
+$\Gamma$-only $14\times14$ & 6.832 & & & \\
 \end{tabular}
 \end{ruledtabular}
 \end{table}
@@ -1253,7 +1262,7 @@ used as the reference against which the $\Gamma$-only scheme was judged, and the
 $0.12$~eV on the largest cell we can afford. The old scheme carries the systematic error; the
 error is the spurious net charge of RI-fitted pair densities identified by J.~Wilhelm in
 \cpk{} PR~\#6447~\cite{pr6447}; and the $\Gamma$-only numbers are confirmed by his
-full-$k$-point code to about 15~meV. Numbers that came out of the old scheme for 2D systems
+full-$k$-point code to 15--60~meV (Sec.~\ref{sec:resval}). Numbers that came out of the old scheme for 2D systems
 should therefore not be used as references.
 
 \paragraph{The observation.} Monolayer h-BN, $a = 2.502$~\AA, 15~\AA\ vacuum, PBE,
@@ -1265,7 +1274,9 @@ $K$ that an $8\times8$ supercell with a $2\times2$ DOS mesh samples (Table~\ref{
 \begin{table}[h]
 \caption{Direct $G_0W_0$ gap of monolayer h-BN at $P=(11/32,11/32)$ from the old large-cell
 scheme, the $\Gamma$-only scheme of this work, and the full-$k$ RI-RS $GW$ of
-PR~\#6447 (primitive cell).}
+PR~\#6447 (primitive cell). All entries of this table are from the development builds with
+the standard Pad\'e continuation, which is the only way to compare with the old scheme; the
+one-build numbers are in Table~\ref{tab:resval}.}
 \label{tab:oldscheme}
 \begin{ruledtabular}
 \begin{tabular}{llr}
@@ -1426,7 +1437,7 @@ activated automatically by \texttt{KPOINTS\_W 1 1 1} for \texttt{PERIODIC XY} an
 estimate. The earlier $k$-mesh large-cell scheme carries a spurious charge leak of the fitted
 pair densities and should not be used as a reference for 2D systems.
 Numerically, with one master build on both sides, the slab correction reproduces the
-converged full-$k$ RI-RS $GW$ of PR~\#6447 to 15--75~meV for h-BN (two bases), SiC and
+converged full-$k$ RI-RS $GW$ of PR~\#6447 to 20--75~meV for h-BN (two bases), SiC and
 h-GaN, with a 0.28~eV deviation for h-AlN that the exact-RI tensor driver reproduces to 1~meV,
 so it is a property of the $\Gamma$-point models and not of the RI-RS fit. For diamond the
 $\Gamma$-only RI-RS result of the 128-atom cell, exchange, correlation and correction, is

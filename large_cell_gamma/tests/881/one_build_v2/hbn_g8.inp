@@ -1,0 +1,103 @@
+&GLOBAL
+  RUN_TYPE     ENERGY
+  PROJECT      hbn_g8
+  PRINT_LEVEL  MEDIUM
+  &TIMINGS
+    THRESHOLD 0.001
+  &END TIMINGS
+&END GLOBAL
+
+&FORCE_EVAL
+
+  METHOD QS
+
+  &DFT
+
+    BASIS_SET_FILE_NAME  my_gth_basis
+    POTENTIAL_FILE_NAME  POTENTIAL
+
+    &MGRID
+      CUTOFF 600
+      REL_CUTOFF 60
+    &END MGRID
+
+    &QS
+      METHOD GPW
+      EPS_DEFAULT 1.0E-12
+      EPS_PGF_ORB 1.0E-12
+    &END QS
+
+    &SCF
+      SCF_GUESS ATOMIC
+      EPS_SCF 1.0E-7
+      MAX_SCF 100
+      &MIXING
+        METHOD BROYDEN_MIXING
+        ALPHA 0.4
+        NBROYDEN 4
+      &END MIXING
+    &END SCF
+
+    &XC
+      &XC_FUNCTIONAL PBE
+      &END XC_FUNCTIONAL
+    &END XC
+
+    &POISSON
+      PERIODIC XY
+      POISSON_SOLVER MT
+    &END POISSON
+
+  &END DFT
+
+  &PROPERTIES
+    &BANDSTRUCTURE
+      &GW
+        NUM_TIME_FREQ_POINTS      10
+        EPS_FILTER           1.0E-10
+        CUTOFF_RADIUS_RI           5
+        KPOINTS_W              1 1 1
+        SIZE_LATTICE_SUM           4
+        &RI_RS
+        &END
+      &END GW
+      &BANDSTRUCTURE_PATH
+        SPECIAL_POINT GAMMA 0.0 0.0 0.0
+      &END
+    &END BANDSTRUCTURE
+  &END PROPERTIES
+
+  &SUBSYS
+
+    &CELL
+      PERIODIC XY
+      ABC  2.50223 2.50223 15.0
+      ALPHA_BETA_GAMMA 90.0 90.0 120.0
+      MULTIPLE_UNIT_CELL  8 8 1
+    &END CELL
+
+    &COORD
+      SCALED
+      B 0.0000 0.0000 0.0000
+      N 0.3333 0.6667 0.0000
+    &END COORD
+
+    &TOPOLOGY
+      MULTIPLE_UNIT_CELL  8 8 1
+    &END TOPOLOGY
+
+    &KIND B
+      BASIS_SET aug-SZV-MOLOPT-GTH-tier-1
+      BASIS_SET RI_AUX RI_aug-SZV-MOLOPT-GTH-tier-1_1
+      POTENTIAL GTH-PBE-q3
+    &END KIND
+
+    &KIND N
+      BASIS_SET aug-SZV-MOLOPT-GTH-tier-1
+      BASIS_SET RI_AUX RI_aug-SZV-MOLOPT-GTH-tier-1_1
+      POTENTIAL GTH-PBE-q5
+    &END KIND
+
+  &END SUBSYS
+
+&END FORCE_EVAL
