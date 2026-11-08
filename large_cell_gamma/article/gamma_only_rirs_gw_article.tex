@@ -1052,15 +1052,22 @@ $n_\mathrm{AO}^2n_\mathrm{MO}$ transforms once per spin.
 \label{sec:results}
 %======================================================================================
 
-All reference calculations use the full-$k$-point RI-RS $GW$ of cp2k PR~\#6447 at its head
-\texttt{4e0d03c43b} (standard 16-parameter Pad\'e continuation; an earlier head averaged
-several Pad\'e orders, which moved 2D gaps by up to $0.4$~eV and has since been moved to a
-separate PR), with the same orbital and auxiliary bases, pseudopotentials, cutoffs, minimax
-grid and RI settings as the $\Gamma$-only runs. The PR requires its own optimised RI-RS grid
+All reference calculations use the full-$k$-point RI-RS $GW$ of J.~Wilhelm, cp2k
+PR~\#6447, in the form in which it was merged into the \cpk{} master branch (commit
+\texttt{7b88fc63f1}). The $\Gamma$-only code was rebased onto the same master, so that every
+number of this section, ours and the reference, comes from one binary. That master also
+carries a change of the analytic continuation (PR~\#6474: the quasiparticle energy is the
+average over several central Pad\'e orders instead of a single 16-parameter fit), which
+shifts every $G_0W_0$ gap of this section by $+0.2$ to $+0.4$~eV relative to our earlier
+standard-Pad\'e numbers, identically in both codes, and leaves Hartree--Fock energies
+untouched; the differences between the two codes are unchanged within 6~meV. Both codes use
+the same orbital and auxiliary bases, pseudopotentials, cutoffs, minimax grid and RI
+settings. The PR requires its own optimised RI-RS grid
 (\texttt{RS\_AO\_RATIO}~7, about 90 points per atom with a DZVP basis); a three times denser
 grid changes the h-BN gap by 2~meV. Our runs use the tabulated atom-centred grids of CP2K
 (\texttt{data/ri\_rs\_grid}, about 340 points per atom). Odd meshes of the PR abort in its own
-$\Gamma$ treatment, so its series are $12$, $18$ and $24$ (2D) and $4$, $6$ and $8$ (3D).
+$\Gamma$ treatment, so its series are $12$ to $36$ in steps of 6 (2D) and $4$ to $12$ in
+steps of 2 (3D).
 
 \subsection{Validation of the slab correction: h-BN with the aug-SZV basis}
 \label{sec:resval}
@@ -1103,40 +1110,47 @@ bases and MOLOPT RI sets at the $2\cdot10^{-3}$ fit-error level, 15~\AA\ vacuum,
 500~Ry, 10 minimax points, \texttt{CUTOFF\_RADIUS\_RI} 5~\AA, \texttt{SIZE\_LATTICE\_SUM}~4.
 The $\Gamma$-only cells are $9\times9$ (162 atoms; the folded manifold contains $K$) and
 $12\times12$ (288 atoms); the PR meshes contain $K$ as well. Table~\ref{tab:res2d} lists the
-indirect gap over the sampled points. Three of the four materials agree with the converged
-reference to $16$--$75$~meV, and the $12\times12$ cells show that the $\Gamma$-only results are
-cell-converged to a few meV. h-AlN deviates by $0.25$~eV. State by state ($9\times9$ against PR $24\times24$) the
-difference is spread over four contributions of the same sign: $\Sigma^x$ at the valence
-maximum at $K$ ($+0.07$~eV) and at the nearly-free-electron conduction minimum at $\Gamma$
-($-0.05$~eV), and $\Sigma^c$ at the conduction minimum ($-2.48$ vs $-2.39$~eV) and at the
-valence maximum ($+0.03$~eV). Neither grid is responsible. The PR grid is converged for AlN
+indirect gap over the sampled points. The PR series is converged to 5~meV between
+$30\times30$ and $36\times36$, the $\Gamma$-only results to 3--15~meV between $9\times9$ and
+$12\times12$. Three of the four materials agree with the converged reference to
+$22$--$74$~meV, and their Hartree--Fock gaps to $0.01$--$0.05$~eV (h-BN 13.267 vs 13.278, SiC
+8.399 vs 8.373, h-GaN 9.733 vs 9.779~eV). h-AlN deviates by $0.28$~eV in the $G_0W_0$ gap and
+by $0.13$~eV in the Hartree--Fock gap. State by state ($9\times9$ against PR $36\times36$)
+the difference is spread over four contributions of the same sign: $\Sigma^x$ at the valence
+maximum at $K$ ($-19.081$ vs $-19.149$~eV) and at the nearly-free-electron conduction minimum
+at $\Gamma$ ($-4.894$ vs $-4.834$~eV), together $0.13$~eV, and $\Sigma^c$ at the valence
+maximum ($2.463$ vs $2.414$~eV) and at the conduction minimum ($-2.448$ vs $-2.347$~eV),
+together $0.15$~eV; $\varepsilon^\mathrm{DFT}$ and $v^{xc}$ of the four states are identical
+to the meV. Neither grid is responsible. The PR grid is converged for AlN
 (\texttt{RS\_AO\_RATIO} 20 gives 6.318~eV against 6.319~eV at the default ratio 7), and our
 $\Sigma^x$ is converged with the truncated-Coulomb radius (12.1~\AA\ at $9\times9$, 16.2~\AA\
-at $12\times12$: 6~meV). On our side the exact-RI tensor driver with the same $\Gamma$-only $W$
+at $12\times12$: 4~meV). On our side the exact-RI tensor driver with the same $\Gamma$-only $W$
 and the same correction (Sec.~\ref{sec:activation}) reproduces the RI-RS result of the
-$6\times6$ AlN cell to 1~meV in every occupied and low-lying virtual state: gap 6.013~eV in
+$6\times6$ AlN cell to 1~meV in every occupied and low-lying virtual state: gap 6.241~eV in
 both, and $\varepsilon^\mathrm{DFT}$, $\Sigma^c$, $\Sigma^x$, $v^{xc}$ of the two band edges identical
-to the printed meV ($2.641$, $-19.063$, $-15.173$~eV at the valence maximum; $-2.529$,
-$-4.901$, $-8.832$~eV at the conduction minimum), at ten times the cost per $\chi$ time point
-(33 vs 3~s) and six times the memory. The remaining AlN difference therefore lies in the
+to the printed meV ($-19.063$ and $-15.173$~eV at the valence maximum, $-4.901$ and
+$-8.832$~eV at the conduction minimum for $\Sigma^x$ and $v^{xc}$), at ten times the cost per
+$\chi$ time point (33 vs 3~s) and six times the memory. The remaining AlN difference therefore lies in the
 $\Gamma$-point treatment itself, or in the supercell-$\Gamma$ versus full-$k$ formulation
-(32~\AA\ Coulomb truncation in the PR, folded spectrum on the minimax grid here), and not in
+(32--56~\AA\ Coulomb truncation in the PR against 12--16~\AA\ here, folded spectrum on the
+minimax grid here), and not in
 the numerics of either code; see Sec.~\ref{sec:disc_approx}.
 
 \begin{table}[h]
 \caption{2D benchmark, DZVP basis ($a$ = 2.502, 3.090, 3.210, 3.110~\AA): indirect $G_0W_0$ gap
 (eV) of the $\Gamma$-only supercell with the head-and-wing correction against the full-$k$ PR
-at $N\times N$ meshes. Last column: $\Gamma$-only ($9\times9$) minus PR $24\times24$.}
+at $N\times N$ meshes; one master build, averaged Pad\'e continuation in both codes. Last
+column: $\Gamma$-only ($9\times9$) minus PR $36\times36$.}
 \label{tab:res2d}
 \begin{ruledtabular}
-\small
-\begin{tabular}{lcccccc}
-system & $9\times9$ & $12\times12$ & PR 12 & PR 18 & PR 24 & $\Delta$\\
+\footnotesize
+\begin{tabular}{lcccccccc}
+system & $9\times9$ & $12\times12$ & PR 12 & PR 18 & PR 24 & PR 30 & PR 36 & $\Delta$\\
 \colrule
-h-BN  & 7.435 &       & 7.434 & 7.444 & 7.451 & $-0.016$\\
-SiC   & 3.982 & 3.980 & 4.021 & 4.029 & 4.031 & $-0.049$\\
-h-GaN & 4.345 & 4.363 & 4.402 & 4.416 & 4.420 & $-0.075$\\
-h-AlN & 6.082 & 6.090 & 6.319 & 6.331 & 6.339 & $-0.257$\\
+h-BN  & 7.837 & 7.834 & 7.827 & 7.839 & 7.847 & 7.854 & 7.859 & $-0.022$\\
+SiC   & 4.224 & 4.221 & 4.261 & 4.270 & 4.273 & 4.275 & 4.278 & $-0.054$\\
+h-GaN & 4.464 & 4.479 & 4.514 & 4.527 & 4.532 & 4.535 & 4.538 & $-0.074$\\
+h-AlN & 6.299 & 6.303 & 6.541 & 6.555 & 6.565 & 6.571 & 6.576 & $-0.277$\\
 \end{tabular}
 \end{ruledtabular}
 \end{table}
@@ -1146,8 +1160,9 @@ h-AlN & 6.082 & 6.090 & 6.319 & 6.331 & 6.339 & $-0.257$\\
 
 Diamond ($a=3.567$~\AA, primitive two-atom cell, SZV-MOLOPT-SR-GTH, RI set
 \texttt{RI\_20\_2\_2\_1\_1\_0\_0\_0}, cutoff 400~Ry, 10 minimax points,
-\texttt{SIZE\_LATTICE\_SUM}~2, default RI-metric cutoff of half the cell height) in
-$n\times n\times n$ supercells of 54, 128, 250 and 432 atoms. Table~\ref{tab:res3d} shows the
+\texttt{SIZE\_LATTICE\_SUM}~2, RI-metric cutoff 3.0~\AA, $\Sigma^x$ truncated at half the
+cell height) in $n\times n\times n$ supercells of 54, 128 and 250 atoms (the 432-atom cell was
+abandoned after seven hours on four nodes, still in the fit stage). Table~\ref{tab:res3d} shows the
 indirect $G_0W_0$ gap over the folded $\Gamma$ manifold for the successive stages of the
 bulk correction, together with the PR at $N\times N\times N$ meshes and the Hartree--Fock
 gaps. Two things are established independently of the PR. First, the exchange: the exact-RI
@@ -1161,15 +1176,23 @@ potential with $w=-3.5$~eV, $\varepsilon_\infty=3.05$); the head-dipole term add
 to the gap at 54 atoms and $+0.06$~eV at 128 atoms, the wing $-0.03$ and $-0.00$~eV, and the
 wing-wing term $-0.002$~eV, i.e.\ the dipole terms scale as $1/\Omega$ as they should. The
 RI-space application of the same head, by contrast, gave $-96$~eV. Degeneracies of the folded
-manifold are preserved to 3~meV. With the full kernel the $\Gamma$-only gap converges as
-$9.041\to9.782\to9.934$~eV (54, 128, 250 atoms), the PR as $9.200\to9.444\to9.511$~eV
-($4^3$, $6^3$, $8^3$ meshes); both exchange series converge to the same 15.3~eV, so the
-remaining $0.4$~eV at convergence is in $\Sigma^c$.
+manifold are preserved to 3~meV. With the full kernel and the one master build the
+$\Gamma$-only gap runs $9.210\to9.970\to10.100$~eV (54, 128, 250 atoms; the last step
+$+0.13$~eV), the PR $9.239\to9.519\to9.593\to9.553\to9.565$~eV ($4^3$ to $12^3$ meshes),
+converged to 0.01~eV from $8^3$ on. The Hartree--Fock gaps rise on both sides towards the same
+value, $15.216$~eV at 250 atoms and $15.120$~eV at $12^3$ with $+0.04$~eV per step left in the
+PR, so the exchange is consistent to 0.1~eV while the $G_0W_0$ gap of the $\Gamma$-only cell
+lies $0.5$~eV above the converged full-$k$ value at 250 atoms. The whole of that difference is
+in $\Sigma^c$.
 
 Two further checks bound the numerics on our side. First, the exact-RI tensor driver with the
 same $\Gamma$-only $W$ and the same orbital-basis correction (Sec.~\ref{sec:activation}) was
-run on the 54-atom cell. Its gap is 9.386~eV against 9.039~eV from the RI-RS grid, but the
-difference is almost entirely exchange: the Hartree--Fock gaps are 15.074 and 14.838~eV, the
+run on the 54- and 128-atom cells. On the 128-atom cell it gives the same gap as the RI-RS
+code, 9.970~eV, and $\varepsilon^\mathrm{DFT}$, $\Sigma^c$, $\Sigma^x$, $v^{xc}$ of every
+state of the valence triplet and of the conduction minimum identical to the printed meV
+($1.950/1.932/1.932$, $-18.957$, $-17.093$~eV and $-3.206$, $-9.767$, $-16.568$~eV). On the
+54-atom cell (standard-Pad\'e builds) its gap is 9.386~eV against 9.039~eV from the RI-RS
+grid, but the difference is almost entirely exchange: the Hartree--Fock gaps are 15.074 and 14.838~eV, the
 RI-RS $\Sigma^x$ is too negative by 0.06~eV on average over the occupied states and by 0.14~eV
 over the lowest virtuals, whereas $\Sigma^c$ at the two band edges agrees to 0.004 and
 0.036~eV. The $3\times3\times3$ cell truncates the Coulomb operator of $\Sigma^x$ at 3.1~\AA,
@@ -1177,34 +1200,38 @@ the same length as the 3.0~\AA\ RI-metric cutoff that defines the fit, and the g
 representation of such a short truncated operator is where the RI-RS fit is weakest; at
 $4\times4\times4$ (4.1~\AA) the RI-RS and exact-RI $\Sigma^x$ agree to 1~meV, as stated
 above. The 54-atom RI-RS entries of Table~\ref{tab:res3d} are therefore grid-limited by
-$\sim0.3$~eV, the larger cells are not, and the correction itself is consistent between
-the two representations. Second, the standard tensor $k$-point $GW$ of CP2K on the primitive
+$\sim0.2$~eV, the larger cells are not, and the $\Gamma$-only result of the 128-atom cell,
+including the correction, is independent of the RI-RS fit. Second, the standard tensor $k$-point $GW$ of CP2K on the primitive
 cell was attempted as an independent arbiter; with the 9~\AA\ orbital and RI radii its
 real-space lattice sums (1607 cells of three-centre integrals, 12071 cells $\Delta\bR$)
 cost 10.5 and 21.7~h per imaginary-time point on 8 ranks for the $6^3$ and $8^3$ meshes,
-the code has no $\chi$ restart, and the runs were abandoned at the 24~h limit. The 0.4~eV
+the code has no $\chi$ restart, and the runs were abandoned at the 24~h limit. The 0.5~eV
 between the two $\Gamma$-point treatments at convergence is thus not settled by a third
 code; what is settled is that it is not a fit error of either.
 
 \begin{table}[h]
 \caption{Diamond, SZV basis: indirect $G_0W_0$ gap over the folded $\Gamma$ manifold (eV) for
-the stages of the bulk correction, and the full-$k$ PR. HF: Hartree--Fock gap with the
-truncated Coulomb operator of each run.}
+the stages of the bulk correction (columns none to full: development builds with the standard
+Pad\'e continuation), the full kernel with the one master build and the averaged Pad\'e
+continuation (full$^\ast$), and the full-$k$ PR from the same master build. HF: Hartree--Fock
+gap with the truncated Coulomb operator of each run (master build).}
 \label{tab:res3d}
 \begin{ruledtabular}
 \footnotesize
-\begin{tabular}{lcccccc}
-cell & atoms & none & head & +h.-dip. & full & HF\\
+\begin{tabular}{lccccccc}
+cell & atoms & none & head & +h.-dip. & full & full$^\ast$ & HF\\
 \colrule
-$3^3$ & 54  & 12.249 & 8.871 & 9.066 & 9.041 & 14.838\\
-$3^3$, exact RI & 54 & & & & 9.386 & 15.074\\
-$4^3$ & 128 &        & 9.722 &       & 9.782 & 15.123\\
-$5^3$ & 250 &        & 9.910 &       & 9.934 & 15.216\\
-$6^3$ & 432 &        & --    &       &       & \\
+$3^3$ & 54  & 12.249 & 8.871 & 9.066 & 9.041 & 9.210 & 14.833\\
+$3^3$, exact RI & 54 & & & & 9.386 & & 15.074\\
+$4^3$ & 128 &        & 9.722 &       & 9.782 & 9.970 & 15.123\\
+$4^3$, exact RI & 128 & & & & & 9.970 & 15.125\\
+$5^3$ & 250 &        & 9.910 &       & 9.934 & 10.100 & 15.216\\
 \colrule
-PR $4^3$ & & & & & 9.200 & 14.275\\
-PR $6^3$ & & & & & 9.444 & 14.981\\
-PR $8^3$ & & & & & 9.511 & 15.167\\
+PR $4^3$    & & & & & & 9.239 & 14.116\\
+PR $6^3$    & & & & & & 9.519 & 14.784\\
+PR $8^3$    & & & & & & 9.593 & 15.011\\
+PR $10^3$   & & & & & & 9.553 & 15.077\\
+PR $12^3$   & & & & & & 9.565 & 15.120\\
 \end{tabular}
 \end{ruledtabular}
 \end{table}
@@ -1364,10 +1391,10 @@ factor $\ee^{-q|z|}$ that is $0.7$ at $q=0.1$~\AA$^{-1}$ and $z=4$~\AA. This was
 candidate for the AlN difference of Sec.~\ref{sec:res2d}, but it does not survive the cell
 test: the missing factor is first order in $q$ and its effect would shrink with the radius of
 the small Brillouin zone, by about one half from the $9\times9$ to the $12\times12$ cell,
-whereas the gap moves by 8~meV; and the exact-RI tensor driver reproduces the RI-RS value, so no
+whereas the gap moves by 4~meV; and the exact-RI tensor driver reproduces the RI-RS value, so no
 fit error is involved either. Our integral runs over the whole small Brillouin zone
 ($q\le\pi/9a$ for a $9\times9$ cell) while the PR applies its model only to the cells adjacent
-to $\Gamma$ ($q\le\pi/24a$); which of the two $\Gamma$-point treatments is closer to the
+to $\Gamma$ ($q\le\pi/36a$); which of the two $\Gamma$-point treatments is closer to the
 full-$k$ limit for a diffuse state is not settled by the present data. The difference is not a
 property of the box of the lattice sum: the subtracted constant
 $D_\mathrm{box}$ grows with the box while the finite remainder of the charge channel does not
@@ -1398,17 +1425,18 @@ activated automatically by \texttt{KPOINTS\_W 1 1 1} for \texttt{PERIODIC XY} an
 \texttt{PERIODIC XYZ}, and chooses replicated or distributed dense algebra from a memory
 estimate. The earlier $k$-mesh large-cell scheme carries a spurious charge leak of the fitted
 pair densities and should not be used as a reference for 2D systems.
-Numerically, the slab correction reproduces the converged full-$k$ RI-RS $GW$ of PR~\#6447
-to 15--75~meV for h-BN (two bases), SiC and h-GaN, with a 0.25~eV deviation for h-AlN that
-the exact-RI tensor driver reproduces to 1~meV, so it is a property of the $\Gamma$-point
-models and not of the RI-RS fit. For diamond the exchange of the $\Gamma$-only
-RI-RS code is identical to the exact-RI tensor result, the dipole terms of the bulk kernel
-scale as $1/\Omega$ as derived, and the gap converges with the cell to within 0.1~eV by 250
-atoms; the 0.4~eV that separates the two codes at convergence lies in $\Sigma^c$ and is not a
-fit error of either code: the exact-RI tensor driver reproduces the RI-RS correction to
-0.04~eV at the band edges (the 54-atom cell is exchange-limited by its 3.1~\AA\ truncation,
-the larger cells are not), and the standard tensor $k$-point reference proved too costly to
-complete. The correction costs about 1~\% of a 128-atom run.
+Numerically, with one master build on both sides, the slab correction reproduces the
+converged full-$k$ RI-RS $GW$ of PR~\#6447 to 15--75~meV for h-BN (two bases), SiC and
+h-GaN, with a 0.28~eV deviation for h-AlN that the exact-RI tensor driver reproduces to 1~meV,
+so it is a property of the $\Gamma$-point models and not of the RI-RS fit. For diamond the
+$\Gamma$-only RI-RS result of the 128-atom cell, exchange, correlation and correction, is
+identical to the exact-RI tensor result to the meV, and the dipole terms of the bulk kernel
+scale as $1/\Omega$ as derived; but the gap is still rising by 0.13~eV from 128 to 250 atoms
+and lies 0.5~eV above the converged full-$k$ value there, entirely in $\Sigma^c$. The bulk
+$\Gamma$-point model is therefore validated as an implementation and not yet as a reference:
+which of the two $\Gamma$-point treatments is closer to the full-$k$ limit remains open, and
+the standard tensor $k$-point reference proved too costly to decide it. The correction costs
+about 1~\% of a 128-atom run.
 
 \begin{acknowledgments}
 The full-$k$ reference calculations use the implementation of J.~Wilhelm (cp2k PR~\#6447).

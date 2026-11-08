@@ -1,5 +1,9 @@
 # 2D benchmark: Gamma-only RI-RS GW (KPOINTS_W 1 1 1 + head-and-wing correction, 9x9 supercell)
 # vs the full-k RI-RS GW of PR 6447 (head 4e0d03c43b, standard 16-parameter Padé), primitive cell
+#
+# SUPERSEDED by the one-build benchmark at the end of this file (2026-11-08): both codes from
+# the same master build (PR 6447 merged, averaged Padé). The tables below are kept as the record
+# of the standard-Padé comparison; the model differences are the same in both.
 
 Settings identical in both codes: DZVP-MOLOPT-SR-GTH, RI sets at ~2e-3 (B RI_20_4, N RI_26,
 Si RI_26, C RI_26, Ga RI_61, Al RI_20_4), GTH-PBE, CUTOFF 500 / REL 50, MT Poisson, 15 A
@@ -74,3 +78,31 @@ Same inputs, binary from the rebased branch (Noctua periodic_3d_test/cp2k-v2):
 NOTE: every GW number on master now carries the averaged Padé continuation; the 2D benchmark table
 above and the PR comparisons were made with the standard Padé on both sides and must be rerun
 with one build on both sides before being compared to master numbers.
+
+## One-build benchmark (2026-11-08): master build (cp2k-v2, PR 6447 merged, averaged Padé on both sides)
+
+Same inputs as above; both codes from the rebased branch rirs_periodic_gamma_v2 (= upstream master
+2509026b65 + the Gamma-only port), binary periodic_3d_test/cp2k-v2. Dirs: benchmark_2d/<sys>/
+{gamma_9x9_v2, gamma_12x12_v2, pr_kp{12,18,24,30,36}_v2}; band files of the 12x12 cells in
+results/gamma_12x12/. Indirect G0W0 gap (HF gap in brackets), eV.
+
+| system | ours 9x9 | ours 12x12 | PR 12 | PR 18 | PR 24 | PR 30 | PR 36 | 9x9 - PR36 | 12x12 - PR36 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| h-BN  | 7.837 (13.267) | 7.834 (13.267) | 7.827 (13.173) | 7.839 (13.229) | 7.847 (13.254) | 7.854 (13.269) | 7.859 (13.278) | -0.022 | -0.025 |
+| SiC   | 4.224 (8.399)  | 4.221 (8.383)  | 4.261 (8.285)  | 4.270 (8.335)  | 4.273 (8.355)  | 4.275 (8.366)  | 4.278 (8.373)  | -0.054 | -0.057 |
+| h-GaN | 4.464 (9.733)  | 4.479 (9.735)  | 4.514 (9.677)  | 4.527 (9.737)  | 4.532 (9.759)  | 4.535 (9.771)  | 4.538 (9.779)  | -0.074 | -0.059 |
+| h-AlN | 6.299 (11.209) | 6.303 (11.194) | 6.541 (11.254) | 6.555 (11.297) | 6.565 (11.317) | 6.571 (11.329) | 6.576 (11.337) | -0.277 | -0.273 |
+
+- The averaged Padé shifts every G0W0 gap by +0.2 to +0.4 eV relative to the standard-Padé tables
+  above (both codes alike); the Gamma-only minus PR differences are unchanged within 6 meV
+  (-0.016/-0.049/-0.075/-0.257 before, -0.022/-0.054/-0.074/-0.277 now).
+- The PR is converged to ~5 meV between 30x30 and 36x36; the Gamma-only cells are converged to
+  3-15 meV between 9x9 and 12x12.
+- HF gaps: ours vs PR 36x36 -0.011 (hBN), +0.026/+0.010 (SiC), -0.046/-0.044 (GaN), -0.128/-0.143
+  (AlN). The AlN outlier is half exchange (0.13 eV) and half Sigma^c of the CBM at Gamma, as
+  decomposed above; the exact-RI tensor driver reproduces our RI-RS numbers to 1 meV (AlN 6x6:
+  6.241 vs 6.241 with this build), so it is the Gamma model, not numerics.
+- Wall times, 8 ranks x 16 threads per node: 12x12 cells 2680 s (SiC, 2 nodes) to 5760 s (hBN,
+  1 node); PR 36x36 primitive cell < 2 min. The SIGABRT printed after the timing report of some
+  runs is the known MPI-finalize abort in the diagonalisation library (not GW); every run had
+  completed and printed its band structure.
