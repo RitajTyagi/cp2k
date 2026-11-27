@@ -29,13 +29,15 @@ MODULE ri_rs_setup
    USE cp_output_handling,              ONLY: cp_p_file,&
                                               cp_print_key_should_output
    USE gw_auto_ri_types,                ONLY: auto_ri_type
-   USE gw_utils_compute_integrals,      ONLY: build_3c_integral_block_ctx,&
+   USE gw_gamma_correction,             ONLY: gamma_corr_init
+   USE gw_utils_compute_integrals,      ONLY: build_3c_integral_block_images,&
                                               gw_3c_ctx_create,&
                                               gw_3c_ctx_release,&
                                               gw_3c_ctx_type,&
                                               gw_3c_ws_create,&
                                               gw_3c_ws_release,&
                                               gw_3c_ws_type
+   USE input_constants,                 ONLY: ri_rs_large_cell_Gamma
    USE input_section_types,             ONLY: section_vals_type
    USE kinds,                           ONLY: dp,&
                                               max_line_length
@@ -51,8 +53,10 @@ MODULE ri_rs_setup
    USE qs_kind_types,                   ONLY: qs_kind_type
    USE ri_rs_fitting,                   ONLY: solve_ri_rs_fit,&
                                               store_Z_lP_columns
+   USE ri_rs_grid_initialization,       ONLY: translation_atom_images
    USE ri_rs_grid_setup,                ONLY: setup_ri_rs_grid
    USE ri_rs_matrices,                  ONLY: atomic_basis_at_grid_point,&
+                                              place_blocks_on_owners,&
                                               print_matrix_occupation
    USE ri_rs_types,                     ONLY: ri_rs_env
    USE ri_rs_utils,                     ONLY: evaluate_ao_basis_on_points,&
@@ -68,6 +72,13 @@ MODULE ri_rs_setup
 
    PUBLIC :: compute_Z_lP, ensure_ri_rs_representation
 
+   ! Fitted Z_lP columns of one atom on the sphere rows grid_idx, kept for its translated images
+   TYPE z_lp_fit_type
+      INTEGER                                            :: atom = 0
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: grid_idx
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: Z
+   END TYPE z_lp_fit_type
+
 CONTAINS
 
 ! **************************************************************************************************
@@ -82,6 +93,7 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'ensure_ri_rs_representation'
 
+      CHARACTER(LEN=200)                                 :: message
       INTEGER                                            :: handle
       REAL(KIND=dp)                                      :: build_start
 
@@ -97,13 +109,25 @@ CONTAINS
          END IF
          ! Place atom-centered RI-RS grids at r_l = R_A + r_l^(A), then flatten them into one grid.
          CALL setup_ri_rs_grid(bs_env, bs_env%ri_rs%grid_points)
+         ! χ_PQ = Zᵀ χ_grid Z has rank ≤ n_grid: n_grid ≤ n_RI leaves RI directions unscreened.
+         IF (bs_env%gw_implementation == ri_rs_large_cell_Gamma .AND. &
+             bs_env%ri_rs%n_grid_points <= bs_env%n_RI) THEN
+            WRITE (message, '(A,I0,A,I0,A)') 'RI-RS grid has ', bs_env%ri_rs%n_grid_points, &
+               ' points, not more than the ', bs_env%n_RI, ' RI basis functions: '// &
+               'chi_PQ = Z^T chi(r,r'') Z is rank deficient. Increase RS_AO_RATIO.'
+            CPABORT(TRIM(message))
+         END IF
          ! Collocation matrix ϕ_μl = ϕ_μ(r_l), including neighbouring AO images for Gamma.
          CALL atomic_basis_at_grid_point(bs_env%ri_rs, bs_env%basis_set_AO, &
                                          bs_env%mat_ao_ao%matrix, bs_env%para_env, bs_env%eps_filter, &
                                          bs_env%dbcsr_msg_elem_limit, bs_env%unit_nr, &
-                                         periodic_images=bs_env%do_periodic)
+                                         periodic_images=bs_env%do_periodic, &
+                                         periodic_pair_cutoff=(bs_env%gw_implementation == &
+                                                               ri_rs_large_cell_Gamma .AND. &
+                                                               bs_env%ri_rs%cutoff_radius_v_w > 0.0_dp))
          CALL print_matrix_occupation(bs_env%ri_rs%mat_phi_mu_l, 'ϕ_μ(r_l)', &
                                       bs_env%para_env, bs_env%unit_nr, bs_env%dbcsr_msg_elem_limit)
+         CALL gamma_corr_init(bs_env)
          ! Fit Z_lP using the integration domains and RI basis described in compute_Z_lP below.
          CALL compute_Z_lP(qs_env, bs_env, bs_env%ri_rs%grid_points, &
                            bs_env%ri_rs%mat_phi_mu_l, bs_env%ri_rs%mat_Z_lP, &
@@ -111,8 +135,7 @@ CONTAINS
          bs_env%ri_rs%grid_built = .TRUE.
          IF (bs_env%unit_nr > 0) THEN
             WRITE (bs_env%unit_nr, '(T2,A,T58,A,F7.1,A)') &
-               'Built RI-RS representation,', ' Execution time', m_walltime() - build_start, ' s'
-            WRITE (bs_env%unit_nr, '(A)') ' '
+               'Built RI-RS representation,', 'Execution time', m_walltime() - build_start, ' s'
          END IF
       END IF
       CALL timestop(handle)
@@ -136,14 +159,16 @@ CONTAINS
 !>        See Duchemin and Blase, arXiv:1902.00066, Sec. II.3 for the least-squares construction
 !>        and balancing, and solve_ri_rs_fit for the common floor and regularization convention.
 !>
-!>        The Gamma path uses image-summed AO values and three-center integrals, with RI
-!>        atom P fixed in the reference cell. Molecular and Gamma sphere cutoffs are retained.
+!>        The Γ path uses image-summed AO values Φ_µ(r_l) = Σ_R ϕ_µ(r_l − A_µ − R) and
+!>        three-center integrals, with RI atom P fixed in the reference cell. Both paths use the
+!>        same integration sphere cutoff_ri(P) = r_c + r_RI(P).
 !>
 !>        Work is distributed over atoms in two phases (planned by classify_z_lp_atoms and
 !>        lpt_assign_atoms): Phase A solves "small" atoms with single-rank LAPACK
 !>        (dpotrf/dpotrs); Phase B solves "big" atoms, whose dense matrix D'_ll' would exceed one
 !>        rank's memory, with ScaLAPACK (pdpotrf/pdpotrs) over rank subgroups of size G.
-!>        The solved Z columns are scattered into the sparse global mat_Z_lP.
+!>        The solved Z columns are scattered into the sparse global mat_Z_lP, whose blocks are
+!>        then moved to their owner ranks (place_blocks_on_owners).
 !>        If a Z_lP restart file exists, it is read instead and the solve is skipped entirely.
 !> \param qs_env ...
 !> \param bs_env ...
@@ -163,17 +188,21 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: key = 'PROPERTIES%BANDSTRUCTURE%GW%PRINT%RESTART', &
          routineN = 'compute_Z_lP'
+      REAL(KIND=dp), PARAMETER                           :: imbalance_factor = 1.3_dp
 
       INTEGER :: atom_j_mepos, atom_j_stride, atom_P, G, handle, i_blk, iatom, idx, iphase, j, &
-         max_ao_size, my_group, n_big, n_done, n_groups, n_loc_ri, n_local_grid, n_my_atoms, &
-         n_ref_ri, n_small, natom, npcol_phi, num_grid_chunks, phase_hi
+         max_ao_size, my_group, n_big, n_done, n_fits, n_groups, n_loc_ri, n_local_grid, &
+         n_my_atoms, n_ref_ri, n_small, n_trans, natom, npcol_phi, num_grid_chunks, phase_hi, &
+         rank_fit_max
       INTEGER, ALLOCATABLE, DIMENSION(:) :: ao_atoms, ao_col_start, big_list, local_grid_idx, &
          my_atoms_A, my_atoms_B, n_local_grid_atom, ref_blk_sizes, row_offset, small_list
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: trans_images
       INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_dist_ri, r_blk_sizes, ri_blk_sizes, &
                                                             row_dist_grid
       LOGICAL                                            :: do_scatter, use_dist
-      LOGICAL, ALLOCATABLE                               :: ao_nonzero(:, :)
-      REAL(KIND=dp)                                      :: cutoff_ri, item_start_time, r_c, t1
+      LOGICAL, ALLOCATABLE                               :: ao_nonzero(:, :), fit_atom(:)
+      REAL(KIND=dp)                                      :: cutoff_ri, item_start_time, r_c, t1, &
+                                                            t_fit_max, t_fit_mean, t_fit_rank
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: cutoff_ri_per_atom
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: d_lp_local, d_lp_opt, phi_local, U_Pp
       TYPE(cell_type), POINTER                           :: cell
@@ -185,6 +214,7 @@ CONTAINS
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
       TYPE(section_vals_type), POINTER                   :: input
+      TYPE(z_lp_fit_type), ALLOCATABLE, DIMENSION(:)     :: fits
 
       CALL timeset(routineN, handle)
 
@@ -262,29 +292,48 @@ CONTAINS
                               bs_env%i_ao_start_from_atom(j) + 1)
          END DO
 
-         ! Keep each path's integration domain: r_c + r_RI(P) for molecules,
-         ! r_c + r_AO(P) for the Gamma image-summed approximation.
+         ! Per-atom RI-RS integration sphere cutoff_ri(P) = r_c + r_RI(P), with r_c the range of
+         ! the RI metric and r_RI(P) the radius of the most diffuse RI Gaussian on P.
          ALLOCATE (cutoff_ri_per_atom(natom))
 
          r_c = bs_env%ri_metric%cutoff_radius
          DO iatom = 1, natom
-            IF (periodic_images) THEN
-               cutoff_ri_per_atom(iatom) = r_c + bs_env%ri_rs%radius_ao_per_atom(iatom)
-            ELSE
-               cutoff_ri_per_atom(iatom) = r_c + bs_env%ri_rs%radius_ri_per_atom(iatom)
-            END IF
+            cutoff_ri_per_atom(iatom) = r_c + bs_env%ri_rs%radius_ri_per_atom(iatom)
          END DO
 
          CALL print_sphere_cutoff_table(bs_env, cutoff_ri_per_atom)
 
          ! =========================================================================
-         ! 2. PER-ATOM SOLVER CLASSIFICATION
-         !    Split the atoms into "small" (single-rank LAPACK, Phase A) and "big"
+         ! 2. TRANSLATION ORBITS
+         !    The grid of a translated atom B(A,t) is the grid of A shifted by t (see
+         !    find_translation_orbits), so the fit of an image is the fit of its representative
+         !    rep = min_t B(rep,t) with the grid rows mapped (copy_Z_lP_to_images):
+         !       Z_{l',B(rep,t)} = Z_{l,rep},  l' = l - first_row(C) + first_row(B(C,t)),
+         !    with C the atom of grid row l. Only representatives are fitted. AUTO_RI contracts
+         !    the RI functions of every atom separately and therefore fits every atom.
+         ! =========================================================================
+         IF (periodic_images .AND. .NOT. bs_env%auto_ri%enabled) THEN
+            CALL translation_atom_images(bs_env, trans_images)
+         ELSE
+            ALLOCATE (trans_images(natom, 1))
+            trans_images(:, 1) = [(iatom, iatom=1, natom)]
+         END IF
+         n_trans = SIZE(trans_images, 2)
+         ALLOCATE (fit_atom(natom))
+         DO iatom = 1, natom
+            fit_atom(iatom) = MINVAL(trans_images(iatom, :)) == iatom
+         END DO
+
+         ! =========================================================================
+         ! 3. PER-ATOM SOLVER CLASSIFICATION
+         !    Split the fitted atoms into "small" (single-rank LAPACK, Phase A) and "big"
          !    (distributed ScaLAPACK over subgroups of G ranks, Phase B) by comparing
          !    each atom's estimated solve peak memory against the measured budget.
+         !    With translation orbits, fewer atoms than ranks are all solved in Phase B.
          ! =========================================================================
          CALL classify_z_lp_atoms(bs_env, ri_rs_grid_points, cutoff_ri_per_atom, ref_blk_sizes, &
-                                  n_local_grid_atom, small_list, n_small, big_list, n_big, G, periodic_images)
+                                  fit_atom, n_trans > 1, n_local_grid_atom, small_list, n_small, &
+                                  big_list, n_big, G, periodic_images)
 
          ! LPT scheduling: sort the atoms of each phase by estimated solve cost
          ! (n_local_grid^3, Cholesky-dominated) and greedily assign to the least-loaded
@@ -303,6 +352,10 @@ CONTAINS
          ! Atoms this rank will process across both phases for rank-0 progress
          n_my_atoms = SIZE(my_atoms_A) + SIZE(my_atoms_B)
          n_done = 0
+         t_fit_rank = 0.0_dp
+         ! Fits kept by this rank for the translated images
+         ALLOCATE (fits(n_my_atoms))
+         n_fits = 0
 
          ! Shared context for the three-center integrals (μν|P) of the RHS build
          CALL gw_3c_ctx_create(ctx_3c, bs_env, bs_env%ri_metric, &
@@ -310,7 +363,7 @@ CONTAINS
                                basis_i=bs_env%basis_set_RI)
 
          ! =========================================================================
-         ! 3. TWO-PHASE LOOP OVER ATOMS
+         ! 4. TWO-PHASE LOOP OVER ATOMS
          !    Phase A processes the "small" atoms with the single-rank BLAS path
          !    Phase B processes the "big" atoms with the distributed ScaLAPACK path
          !    over rank subgroups of size G. phi_local for each atom's cutoff sphere
@@ -361,7 +414,7 @@ CONTAINS
                                         ao_atoms, ao_col_start, periodic_images=periodic_images, ao_nonzero=ao_nonzero)
 
                ! ---------------------------------------------------------------------
-               ! B. Right-hand side  d_lP = Σ_μν ϕ_μ(r_l) ϕ_ν(r_l) (μν|P)
+               ! B. Right-hand side  d_lP = Σ_μν ϕ_μ(r_l) ϕ_ν(r_l) (μν|P).
                ! ---------------------------------------------------------------------
                ALLOCATE (d_lp_local(n_local_grid, n_ref_ri))
                d_lp_local = 0.0_dp
@@ -404,14 +457,22 @@ CONTAINS
                   CALL store_Z_lP_columns(mat_Z_lP, d_lp_local, local_grid_idx, n_local_grid, &
                                           n_loc_ri, atom_P, r_blk_sizes, row_offset, &
                                           bs_env%eps_filter)
+                  IF (n_trans > 1) THEN
+                     n_fits = n_fits + 1
+                     fits(n_fits)%atom = atom_P
+                     CALL MOVE_ALLOC(local_grid_idx, fits(n_fits)%grid_idx)
+                     CALL MOVE_ALLOC(d_lp_local, fits(n_fits)%Z)
+                  END IF
                END IF
 
-               DEALLOCATE (d_lp_local)
-               DEALLOCATE (local_grid_idx, phi_local)
+               IF (ALLOCATED(d_lp_local)) DEALLOCATE (d_lp_local)
+               IF (ALLOCATED(local_grid_idx)) DEALLOCATE (local_grid_idx)
+               DEALLOCATE (phi_local)
 
                ! Report each atom completed by the printing rank. No inter-rank communication is
                ! needed; the final message below is printed only after the global synchronization.
                n_done = n_done + 1
+               t_fit_rank = t_fit_rank + (m_walltime() - item_start_time)
                CALL print_Z_lP_progress(bs_env, n_done, n_my_atoms, &
                                         m_walltime() - item_start_time)
             END DO   ! idx: atoms of this phase owned by this rank / subgroup
@@ -429,11 +490,33 @@ CONTAINS
 
          CALL gw_3c_ctx_release(ctx_3c)
 
-         CALL dbcsr_finalize(mat_Z_lP)
+         IF (n_trans > 1) THEN
+            CALL copy_Z_lP_to_images(bs_env, mat_Z_lP, fits, n_fits, trans_images, ri_blk_sizes, &
+                                     r_blk_sizes, row_offset)
+         END IF
+         DEALLOCATE (fits, fit_atom, trans_images)
 
+         CALL dbcsr_finalize(mat_Z_lP)
          CALL para_env%sync()
+
+         CALL place_blocks_on_owners(mat_Z_lP)
+
          CALL print_Z_lP_progress(bs_env, natom, natom, m_walltime() - t1, &
                                   all_mpi_ranks=.TRUE.)
+
+         t_fit_max = t_fit_rank
+         t_fit_mean = t_fit_rank
+         CALL para_env%max(t_fit_max)
+         CALL para_env%sum(t_fit_mean)
+         t_fit_mean = t_fit_mean/REAL(para_env%num_pe, dp)
+         rank_fit_max = para_env%num_pe
+         IF (t_fit_rank >= t_fit_max) rank_fit_max = para_env%mepos
+         CALL para_env%min(rank_fit_max)
+         ! printed only for a clear imbalance (slowest rank > imbalance_factor × mean)
+         IF (bs_env%unit_nr > 0 .AND. t_fit_mean > 0.0_dp .AND. t_fit_max > imbalance_factor*t_fit_mean) THEN
+            WRITE (bs_env%unit_nr, '(T2,A,I0,A,F0.1,A,/)') 'Z_lP fit: slowest MPI rank ', rank_fit_max, &
+               ' took ', t_fit_max/t_fit_mean, ' times the mean rank time'
+         END IF
 
          logger => cp_get_default_logger()
 
@@ -449,6 +532,115 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE compute_Z_lP
+
+! **************************************************************************************************
+!> \brief Copies the Z_lP fits of the translation-orbit representatives to their images,
+!>          Z_{l',B(rep,t)} = Z_{l,rep},   l' = l - first_row(C) + first_row(B(C,t)),
+!>        with C the atom of grid row l, first_row(C) its first grid row and B(C,t) = trans_images(C,t).
+!> \param bs_env ...
+!> \param mat_Z_lP ...
+!> \param fits fits held by this rank
+!> \param n_fits number of fits held by this rank
+!> \param trans_images atom maps of the translations; column 1 is the identity
+!> \param ri_blk_sizes ...
+!> \param r_blk_sizes ...
+!> \param row_offset ...
+! **************************************************************************************************
+   SUBROUTINE copy_Z_lP_to_images(bs_env, mat_Z_lP, fits, n_fits, trans_images, ri_blk_sizes, &
+                                  r_blk_sizes, row_offset)
+
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat_Z_lP
+      TYPE(z_lp_fit_type), DIMENSION(:), INTENT(IN)      :: fits
+      INTEGER, INTENT(IN)                                :: n_fits
+      INTEGER, DIMENSION(:, :), INTENT(IN)               :: trans_images
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: ri_blk_sizes, r_blk_sizes, row_offset
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'copy_Z_lP_to_images'
+
+      INTEGER                                            :: atom_C, handle, i, i_fit, i_task, iatom, &
+                                                            ilayout, it, j, n_loc, n_ri, natom, &
+                                                            owner_rank, rep
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_of_row, first_row, grid_idx, &
+                                                            image_idx, owner, perm
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: Z, Z_image
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+
+      CALL timeset(routineN, handle)
+
+      para_env => bs_env%para_env
+      natom = bs_env%n_atom
+
+      ! The grid rows are grouped by atom, in the order grid_atom_order.
+      ALLOCATE (first_row(natom), atom_of_row(bs_env%ri_rs%n_grid_points))
+      DO ilayout = 1, natom
+         iatom = bs_env%ri_rs%grid_atom_order(ilayout)
+         first_row(iatom) = bs_env%ri_rs%grid_atom_boundaries(ilayout)
+         atom_of_row(bs_env%ri_rs%grid_atom_boundaries(ilayout): &
+                     bs_env%ri_rs%grid_atom_boundaries(ilayout + 1) - 1) = iatom
+      END DO
+
+      ! Rank holding the fit of each representative (-1: no fit, e.g. no RI functions).
+      ALLOCATE (owner(natom))
+      owner(:) = -1
+      DO i_fit = 1, n_fits
+         owner(fits(i_fit)%atom) = para_env%mepos
+      END DO
+      CALL para_env%max(owner)
+
+      i_task = 0
+      DO rep = 1, natom
+         owner_rank = owner(rep)
+         IF (owner_rank < 0) CYCLE
+         n_ri = ri_blk_sizes(rep)
+         i_fit = 0
+         n_loc = 0
+         IF (owner_rank == para_env%mepos) THEN
+            DO i_fit = 1, n_fits
+               IF (fits(i_fit)%atom == rep) EXIT
+            END DO
+            n_loc = SIZE(fits(i_fit)%grid_idx)
+         END IF
+         CALL para_env%bcast(n_loc, owner_rank)
+         ALLOCATE (grid_idx(n_loc), Z(n_loc, n_ri))
+         IF (owner_rank == para_env%mepos) THEN
+            grid_idx(:) = fits(i_fit)%grid_idx
+            Z(:, :) = fits(i_fit)%Z
+         END IF
+         CALL para_env%bcast(grid_idx, owner_rank)
+         CALL para_env%bcast(Z, owner_rank)
+
+         ALLOCATE (image_idx(n_loc), perm(n_loc), Z_image(n_loc, n_ri))
+         DO it = 2, SIZE(trans_images, 2)
+            i_task = i_task + 1
+            IF (MOD(i_task - 1, para_env%num_pe) /= para_env%mepos) CYCLE
+            DO i = 1, n_loc
+               atom_C = atom_of_row(grid_idx(i))
+               image_idx(i) = grid_idx(i) - first_row(atom_C) + first_row(trans_images(atom_C, it))
+            END DO
+            ! store_Z_lP_columns walks the rows in ascending order
+            CALL sort(image_idx, n_loc, perm)
+            DO j = 1, n_ri
+               Z_image(:, j) = Z(perm, j)
+            END DO
+            CALL store_Z_lP_columns(mat_Z_lP, Z_image, image_idx, n_loc, n_ri, trans_images(rep, it), &
+                                    r_blk_sizes, row_offset, bs_env%eps_filter)
+         END DO
+         DEALLOCATE (grid_idx, Z, image_idx, perm, Z_image)
+      END DO
+
+      IF (bs_env%unit_nr > 0) THEN
+         WRITE (bs_env%unit_nr, '(T2,A,T71,I10)') &
+            'Z_lP: atoms fitted (one per translation orbit)', COUNT(owner >= 0)
+         WRITE (bs_env%unit_nr, '(T2,A,T71,I10)') &
+            'Z_lP: atoms copied from their translated orbit atom', i_task
+      END IF
+
+      DEALLOCATE (first_row, atom_of_row, owner)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE copy_Z_lP_to_images
 
 ! **************************************************************************************************
 !> \brief Prints the per-kind maximum RI-RS integration-sphere cutoff table.
@@ -572,8 +764,8 @@ CONTAINS
 !>        or sum (mu_R nu_S|P_0) over nearest images for Gamma. Contract grid-chunked pair
 !>        densities into a thread-private d_lp partial, then reduce the partials into d_lp.
 !>        The shared integral context caches Libint/spherical-transform tables; each thread
-!>        owns its integral workspace. The kind-radius triangle screen in
-!>        build_3c_integral_block_ctx skips negligible image triples via the screened output.
+!>        owns its integral workspace. build_3c_integral_block_images skips negligible image
+!>        triples with the kind-radius triangle screen.
 !> \param bs_env ...
 !> \param ctx shared three-center integral context
 !> \param phi_val AO values on local-sphere grid rows and compact active-AO columns
@@ -592,6 +784,8 @@ CONTAINS
    SUBROUTINE compute_d_lp(bs_env, ctx, phi_val, ao_atoms, ao_col_start, ao_nonzero, d_lp, n_grid_total, n_loc_ri, atom_P, &
                            max_ao_size, atom_j_mepos, atom_j_stride, periodic_images)
 
+!$    USE OMP_LIB, ONLY: omp_get_num_threads, omp_get_thread_num
+
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(gw_3c_ctx_type), INTENT(IN)                   :: ctx
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: phi_val
@@ -606,12 +800,14 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_d_lp'
       INTEGER, PARAMETER                                 :: grid_chunk = 1024
 
-      INTEGER :: atom_j, atom_k, c, cell_R_vec(3), cell_S_vec(3), handle, handle2, &
-         image_extent(3), ix_R, ix_S, iy_R, iy_S, iz_R, iz_S, j, jj, jk_idx, jsize, jstart, k, kk, &
-         ksize, kstart, l, l0, n_grid_pair, point, ri
-      INTEGER, ALLOCATABLE                               :: grid_index(:)
-      LOGICAL                                            :: any_kept, screened
-      REAL(KIND=dp)                                      :: pair_factor
+      INTEGER :: atom_j, atom_k, c, handle, handle2, i_item, i_thr, image_extent(3), j, jj, &
+                 jk_idx, jsize, jstart, k, kk, ksize, kstart, l, l0, my_thr, n_grid_pair, n_items, &
+                 n_thr, point, ri, thr_min
+      INTEGER, ALLOCATABLE                               :: grid_index(:), item_order(:), &
+                                                            item_thread(:), n_rows_item(:)
+      REAL(KIND=dp), ALLOCATABLE                         :: item_cost(:), neg_cost(:), thread_load(:)
+      LOGICAL                                            :: any_kept
+      REAL(KIND=dp)                                      :: pair_factor, phi_k
       REAL(KIND=dp), ALLOCATABLE                         :: grid_result(:, :), int_3c_prv(:, :, :)
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: d_lp_prv, int_2d_prv, rho_chunk
       TYPE(gw_3c_ws_type)                                :: ws
@@ -620,28 +816,68 @@ CONTAINS
       image_extent = 0
       IF (periodic_images) image_extent = bs_env%ri_rs%cell%perd
 
+      n_items = SIZE(ao_atoms)
+      ALLOCATE (item_cost(n_items), item_order(n_items), item_thread(n_items), n_rows_item(n_items), &
+                neg_cost(n_items))
+      DO jj = 1, n_items
+         n_rows_item(jj) = COUNT(ao_nonzero(:, jj))
+      END DO
+      DO jj = 1, n_items
+         item_cost(jj) = 0.0_dp
+         IF (MOD(ao_atoms(jj) - 1, atom_j_stride) /= atom_j_mepos) CYCLE
+         jsize = ao_col_start(jj + 1) - ao_col_start(jj)
+         DO kk = jj, n_items
+            ksize = ao_col_start(kk + 1) - ao_col_start(kk)
+            item_cost(jj) = item_cost(jj) + REAL(jsize*ksize, dp)* &
+                            REAL(MIN(n_rows_item(jj), n_rows_item(kk)), dp)
+         END DO
+      END DO
+
       !$OMP PARALLEL DEFAULT(NONE) &
       !$OMP SHARED(bs_env, ctx, phi_val, ao_atoms, ao_col_start, ao_nonzero, d_lp, &
       !$OMP        n_grid_total, n_loc_ri, atom_P, max_ao_size, &
-      !$OMP        atom_j_mepos, atom_j_stride, image_extent) &
-      !$OMP PRIVATE(grid_index, grid_result, n_grid_pair, point, pair_factor, &
+      !$OMP        atom_j_mepos, atom_j_stride, image_extent, n_items, item_cost, item_order, &
+      !$OMP        item_thread, thread_load, neg_cost) &
+      !$OMP PRIVATE(grid_index, grid_result, n_grid_pair, point, pair_factor, phi_k, &
       !$OMP         jj, kk, atom_j, atom_k, c, handle2, j, jk_idx, jsize, jstart, k, ksize, kstart, &
-      !$OMP         l, l0, ri, screened, d_lp_prv, int_2d_prv, rho_chunk, int_3c_prv, ws, &
-      !$OMP         any_kept, ix_R, iy_R, iz_R, ix_S, iy_S, iz_S, cell_R_vec, cell_S_vec)
+      !$OMP         l, l0, ri, d_lp_prv, int_2d_prv, rho_chunk, int_3c_prv, ws, any_kept, &
+      !$OMP         i_thr, my_thr, n_thr, i_item, thr_min)
 
       ! The integral context is shared; all scratch arrays and the accumulating RHS are thread-private.
+      ! The grid point is the column index of rho_chunk, grid_result and the partial d_lp_prv(P, l),
+      ! so that ρ is built and d_Pl accumulated with unit stride.
       CALL gw_3c_ws_create(ws, ctx)
       ALLOCATE (int_3c_prv(max_ao_size, max_ao_size, n_loc_ri))
-      ALLOCATE (int_2d_prv(max_ao_size*max_ao_size, n_loc_ri))
-      ALLOCATE (rho_chunk(grid_chunk, max_ao_size*max_ao_size))
-      ALLOCATE (d_lp_prv(n_grid_total, n_loc_ri))
-      ALLOCATE (grid_index(n_grid_total), grid_result(grid_chunk, n_loc_ri))
+      ALLOCATE (int_2d_prv(n_loc_ri, max_ao_size*max_ao_size))
+      ALLOCATE (rho_chunk(max_ao_size*max_ao_size, grid_chunk))
+      ALLOCATE (d_lp_prv(n_loc_ri, n_grid_total))
+      ALLOCATE (grid_index(n_grid_total), grid_result(n_loc_ri, grid_chunk))
       d_lp_prv(:, :) = 0.0_dp
+
+      n_thr = 1
+      my_thr = 0
+!$    n_thr = omp_get_num_threads()
+!$    my_thr = omp_get_thread_num()
+
+      !$OMP SINGLE
+      ALLOCATE (thread_load(0:n_thr - 1))
+      thread_load(:) = 0.0_dp
+      ! order by decreasing cost, ties by increasing jj (sort is stable)
+      neg_cost(:) = -item_cost
+      CALL sort(neg_cost, n_items, item_order)
+      DO i_item = 1, n_items
+         jj = item_order(i_item)
+         ! least-loaded thread, the first one on ties
+         thr_min = MINLOC(thread_load, DIM=1) - 1
+         item_thread(jj) = thr_min
+         thread_load(thr_min) = thread_load(thr_min) + item_cost(jj)
+      END DO
+      !$OMP END SINGLE
 
       ! MPI assigns each unordered pair through its first atom; OpenMP divides those atoms.
       ! Skip only exact-zero pair-grid support, without a new screening threshold.
-      !$OMP DO SCHEDULE(DYNAMIC)
-      DO jj = 1, SIZE(ao_atoms)
+      DO jj = 1, n_items
+         IF (item_thread(jj) /= my_thr) CYCLE
          atom_j = ao_atoms(jj)
          IF (MOD(atom_j - 1, atom_j_stride) /= atom_j_mepos) CYCLE
          DO kk = jj, SIZE(ao_atoms)
@@ -665,82 +901,65 @@ CONTAINS
             ! For Gamma, sum (mu_R nu_S|P_0); the molecular path has only R=S=0.
             ! AO exchange symmetry applies to the complete image sum, so the same
             ! unordered atom pairs and pair_factor are used in both paths.
-            ! The integral builder accumulates in place, including across image triples.
-            ! Its kind-radius triangle screen rejects image triples beyond the integral cutoff.
+            ! The kind-radius triangle screen rejects image triples beyond the integral cutoff.
             int_3c_prv(1:jsize, 1:ksize, 1:n_loc_ri) = 0.0_dp
-            any_kept = .FALSE.
-            DO ix_R = -image_extent(1), image_extent(1)
-            DO iy_R = -image_extent(2), image_extent(2)
-            DO iz_R = -image_extent(3), image_extent(3)
-               cell_R_vec = [ix_R, iy_R, iz_R]
-               DO ix_S = -image_extent(1), image_extent(1)
-               DO iy_S = -image_extent(2), image_extent(2)
-               DO iz_S = -image_extent(3), image_extent(3)
-                  cell_S_vec = [ix_S, iy_S, iz_S]
-                  CALL build_3c_integral_block_ctx(int_3c_prv(1:jsize, 1:ksize, 1:n_loc_ri), &
-                                                   ctx, ws, atom_j=atom_j, atom_k=atom_k, atom_i=atom_P, &
-                                                   cell_j=cell_R_vec, cell_k=cell_S_vec, screened=screened)
-                  IF (screened) CYCLE
-                  any_kept = .TRUE.
-               END DO
-               END DO
-               END DO
-            END DO
-            END DO
-            END DO
+            CALL build_3c_integral_block_images(int_3c_prv(1:jsize, 1:ksize, 1:n_loc_ri), ctx, ws, &
+                                                atom_j, atom_k, atom_P, image_extent, any_kept)
             IF (.NOT. any_kept) CYCLE
 
-            ! Flatten (μν|P) to a matrix with combined AO index (ν-1)*jsize + μ for BLAS.
-            DO ri = 1, n_loc_ri
-               DO k = 1, ksize
-                  DO j = 1, jsize
-                     jk_idx = (k - 1)*jsize + j
-                     int_2d_prv(jk_idx, ri) = int_3c_prv(j, k, ri)
-                  END DO
+            ! (μν|P) as an n_RI x (jsize ksize) matrix with combined AO index (ν-1)*jsize + μ.
+            DO k = 1, ksize
+               DO j = 1, jsize
+                  jk_idx = (k - 1)*jsize + j
+                  int_2d_prv(1:n_loc_ri, jk_idx) = int_3c_prv(j, k, 1:n_loc_ri)
                END DO
             END DO
 
-            ! Pair density ρ(l, μν) = ϕ_μ(r_l) ϕ_ν(r_l) in grid chunks, contracted on the fly:
-            ! d_lP += Σ_μν ρ(l, μν) (μν|P), with the atom-pair multiplicity included in pair_factor.
+            ! Pair density ρ(μν, l) = ϕ_μ(r_l) ϕ_ν(r_l) in grid chunks, contracted on the fly:
+            ! d_Pl += Σ_μν (μν|P) ρ(μν, l), with the atom-pair multiplicity included in pair_factor.
             DO l0 = 1, n_grid_pair, grid_chunk
                c = MIN(grid_chunk, n_grid_pair - l0 + 1)
-               DO k = 1, ksize
-                  DO j = 1, jsize
-                     jk_idx = (k - 1)*jsize + j
-                     DO l = 1, c
-                        point = grid_index(l0 + l - 1)
-                        rho_chunk(l, jk_idx) = phi_val(point, jstart + j - 1)* &
-                                               phi_val(point, kstart + k - 1)
+               DO l = 1, c
+                  point = grid_index(l0 + l - 1)
+                  DO k = 1, ksize
+                     phi_k = phi_val(point, kstart + k - 1)
+                     DO j = 1, jsize
+                        rho_chunk((k - 1)*jsize + j, l) = phi_val(point, jstart + j - 1)*phi_k
                      END DO
                   END DO
                END DO
                CALL timeset(routineN//"_dgemm", handle2)
-               CALL dgemm("N", "N", c, n_loc_ri, jsize*ksize, &
-                          pair_factor, rho_chunk, grid_chunk, &
-                          int_2d_prv, max_ao_size*max_ao_size, &
-                          0.0_dp, grid_result, grid_chunk)
-               DO ri = 1, n_loc_ri
-                  DO l = 1, c
-                     point = grid_index(l0 + l - 1)
-                     d_lp_prv(point, ri) = d_lp_prv(point, ri) + grid_result(l, ri)
-                  END DO
+               CALL dgemm("N", "N", n_loc_ri, c, jsize*ksize, &
+                          pair_factor, int_2d_prv, n_loc_ri, &
+                          rho_chunk, max_ao_size*max_ao_size, &
+                          0.0_dp, grid_result, n_loc_ri)
+               DO l = 1, c
+                  point = grid_index(l0 + l - 1)
+                  d_lp_prv(1:n_loc_ri, point) = d_lp_prv(1:n_loc_ri, point) + grid_result(1:n_loc_ri, l)
                END DO
                CALL timestop(handle2)
             END DO
          END DO
       END DO
-      !$OMP END DO
+      !$OMP BARRIER
 
-      ! Reduce once per thread; distributed fits subsequently sum the rank partials in the subgroup.
-      !$OMP CRITICAL (compute_d_lp_reduce)
-      d_lp(1:n_grid_total, 1:n_loc_ri) = d_lp(1:n_grid_total, 1:n_loc_ri) + &
-                                         d_lp_prv(1:n_grid_total, 1:n_loc_ri)
-      !$OMP END CRITICAL (compute_d_lp_reduce)
+      ! Reduce once per thread in thread order, d_lp = ((d_lp_prv(0) + d_lp_prv(1)) + ...), so
+      ! that the sum is reproducible. Distributed fits subsequently sum the rank partials in the subgroup.
+      DO i_thr = 0, n_thr - 1
+         IF (i_thr == my_thr) THEN
+            DO ri = 1, n_loc_ri
+               d_lp(1:n_grid_total, ri) = d_lp(1:n_grid_total, ri) + d_lp_prv(ri, 1:n_grid_total)
+            END DO
+         END IF
+         !$OMP BARRIER
+      END DO
 
       DEALLOCATE (int_3c_prv, int_2d_prv, rho_chunk, d_lp_prv, grid_index, grid_result)
       CALL gw_3c_ws_release(ws)
 
       !$OMP END PARALLEL
+
+      DEALLOCATE (item_cost, item_order, item_thread, n_rows_item, thread_load, neg_cost)
 
       CALL timestop(handle)
 
@@ -820,12 +1039,16 @@ CONTAINS
 !>        fits alongside the replicated phi_local + d_lp. G is floored by the ScaLAPACK 32-bit
 !>        index limit (a local block-cyclic slice of ~n_local_grid^2/G elements must stay below
 !>        2^31 or pdpotrf segfaults).
+!>        With share_ranks, fewer fitted atoms than ranks all go to Phase B with
+!>        G >= num_pe/n_fit, so that every rank takes part in a fit.
 !>        Records and reports the memory estimates before the Z_lP solves.
 !> \param bs_env ...
 !> \param ri_rs_grid_points ...
 !> \param cutoff_ri_per_atom ...
 !> \param ri_blk_sizes per-atom ...
-!> \param n_local_grid_atom ...
+!> \param fit_atom atoms that are fitted; the others are left out
+!> \param share_ranks spread fewer fitted atoms than ranks over rank subgroups
+!> \param n_local_grid_atom sphere size of the fitted atoms (0 for the others)
 !> \param small_list ...
 !> \param n_small ...
 !> \param big_list ...
@@ -834,7 +1057,8 @@ CONTAINS
 !> \param periodic_images use minimum-image distances for the Gamma integration domain
 ! **************************************************************************************************
    SUBROUTINE classify_z_lp_atoms(bs_env, ri_rs_grid_points, cutoff_ri_per_atom, ri_blk_sizes, &
-                                  n_local_grid_atom, small_list, n_small, big_list, n_big, G, periodic_images)
+                                  fit_atom, share_ranks, n_local_grid_atom, small_list, n_small, &
+                                  big_list, n_big, G, periodic_images)
 
 !$    USE OMP_LIB, ONLY: omp_get_max_threads
 
@@ -843,6 +1067,8 @@ CONTAINS
 
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: cutoff_ri_per_atom
       INTEGER, DIMENSION(:), INTENT(IN)                  :: ri_blk_sizes
+      LOGICAL, DIMENSION(:), INTENT(IN)                  :: fit_atom
+      LOGICAL, INTENT(IN)                                :: share_ranks
       INTEGER, ALLOCATABLE, DIMENSION(:), INTENT(OUT)    :: n_local_grid_atom, small_list, big_list
       INTEGER, INTENT(OUT)                               :: n_small, n_big, G
       LOGICAL, INTENT(IN), OPTIONAL :: periodic_images
@@ -882,7 +1108,9 @@ CONTAINS
       ! It sets both the Gram matrix memory footprint (n_local_grid^2) and the solve
       ! cost (~n_local_grid^3), so it drives classification and the LPT load balancing.
       ALLOCATE (n_local_grid_atom(natom), small_list(natom), big_list(natom))
+      n_local_grid_atom(:) = 0
       DO P_loop_atom = 1, natom
+         IF (.NOT. fit_atom(P_loop_atom)) CYCLE
          pos_P(:) = particle_set(P_loop_atom)%r(:)
          cutoff_ri = cutoff_ri_per_atom(P_loop_atom)
          n_local_grid = 0
@@ -909,6 +1137,7 @@ CONTAINS
          CPWARN("RI-RS Z_lP: no meminfo; single-rank solve for all atoms")
       END IF
       DO P_loop_atom = 1, natom
+         IF (.NOT. fit_atom(P_loop_atom)) CYCLE
          ng = REAL(n_local_grid_atom(P_loop_atom), dp)
          nri = REAL(ri_blk_sizes(P_loop_atom), dp)
          CALL get_n_ao_in_sphere(bs_env, P_loop_atom, &
@@ -930,6 +1159,13 @@ CONTAINS
          END IF
       END DO
       CALL print_fit_memory_estimate(bs_env, mem_avail_GB)
+      IF (share_ranks .AND. n_small + n_big < para_env%num_pe) THEN
+         ! Fewer fits than ranks (translation orbits): subgroups of G >= num_pe/n_fit ranks.
+         G_atom = MAX(G_atom, para_env%num_pe/(n_small + n_big))
+         big_list(n_big + 1:n_big + n_small) = small_list(1:n_small)
+         n_big = n_big + n_small
+         n_small = 0
+      END IF
       IF (n_big > 0) THEN
          IF (G_atom > para_env%num_pe) THEN
             CALL cp_abort(__LOCATION__, &
@@ -1216,14 +1452,15 @@ CONTAINS
       mem_Zlp_peak_GB = bs_env%ri_rs%fit_peak_bytes*1.0E-9_dp
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A)') 'RI-RS fitting memory estimate per MPI process:'
-         WRITE (bs_env%unit_nr, '(T4,A,F37.2,A)') &
+         WRITE (bs_env%unit_nr, '(T4,A,T69,F9.2,A)') &
             'Available memory per process (system)', mem_avail_GB, ' GB'
-         WRITE (bs_env%unit_nr, '(T4,A,F17.2,A)') &
+         WRITE (bs_env%unit_nr, '(T4,A,T69,F9.2,A)') &
             'Required for Z_lP fit (Gram+phi+RHS, single-rank bound)', mem_Zlp_peak_GB, ' GB'
          WRITE (bs_env%unit_nr, '(T4,A,T69,I12)') &
             'Largest fitting-grid number of grid points:', bs_env%ri_rs%fit_max_grid
          WRITE (bs_env%unit_nr, '(T4,A,T69,F9.2,A)') &
             'Largest dense Gram matrix:', mem_gram_GB, ' GB'
+         WRITE (bs_env%unit_nr, '(A)') ' '
          CALL m_flush(bs_env%unit_nr)
       END IF
 

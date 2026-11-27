@@ -10,6 +10,7 @@
 ! **************************************************************************************************
 MODULE ri_rs_grid_initialization
    USE basis_set_types,                 ONLY: gto_basis_set_type
+   USE cell_types,                      ONLY: cell_type
    USE input_constants,                 ONLY: do_gapw_log,&
                                               ri_rs_small_cell_full_kp
    USE kinds,                           ONLY: default_string_length,&
@@ -35,7 +36,8 @@ MODULE ri_rs_grid_initialization
    PRIVATE
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'ri_rs_grid_initialization'
 
-   PUBLIC :: initialize_ri_rs_grid
+   PUBLIC :: initialize_ri_rs_grid, find_translation_orbits, rs_ao_ratio_of_kind, &
+             translation_atom_images
 
 CONTAINS
 
@@ -189,12 +191,17 @@ CONTAINS
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(rirs_grid_type), INTENT(IN)                   :: radial_lebedev_grids(:)
 
-      INTEGER                                            :: iatom, ikind, my_group, ngroups, npoints
+      INTEGER                                            :: iatom, icenter, ikind, my_group, &
+                                                            ncenters, ngroups, npoints
       TYPE(mp_comm_type)                                 :: atom_env
 
       CPASSERT(.NOT. ALLOCATED(bs_env%ri_rs%atomic_grids))
+      ! Translation orbits: only the representative atoms (grid_centers) get their own
+      ! Cholesky selection; images receive a copy in broadcast_ri_rs_grids.
+      CALL find_translation_orbits(bs_env)
+      ncenters = SIZE(bs_env%ri_rs%grid_opt%grid_centers)
       ALLOCATE (bs_env%ri_rs%atomic_grids(bs_env%n_atom))
-      ngroups = MIN(bs_env%n_atom, bs_env%para_env%num_pe)
+      ngroups = MIN(ncenters, bs_env%para_env%num_pe)
       my_group = MOD(bs_env%para_env%mepos, ngroups)
       CALL atom_env%from_split(bs_env%para_env, my_group)
       DO iatom = 1, bs_env%n_atom
@@ -203,9 +210,11 @@ CONTAINS
                            bs_env%basis_set_AO(ikind)%gto_basis_set%nsgf)
          bs_env%ri_rs%atomic_grids(iatom)%npts = npoints
          ALLOCATE (bs_env%ri_rs%atomic_grids(iatom)%raw_points(3, npoints))
-
-         IF (MOD(iatom - 1, ngroups) == my_group) THEN
-            CALL select_cholesky_grid_iatom(bs_env, radial_lebedev_grids, iatom, atom_env)
+      END DO
+      DO icenter = 1, ncenters
+         IF (MOD(icenter - 1, ngroups) == my_group) THEN
+            CALL select_cholesky_grid_iatom(bs_env, radial_lebedev_grids, &
+                                            bs_env%ri_rs%grid_opt%grid_centers(icenter), atom_env)
          END IF
       END DO
       CALL atom_env%free()
@@ -259,15 +268,17 @@ CONTAINS
                                       atom_n_ao, ao_values)
       ALLOCATE (selected_indices(bs_env%ri_rs%atomic_grids(iatom)%npts))
       CALL select_cholesky_grid_points(ao_point_indices, atom_point_offsets, atom_value_offsets, &
-                                       atom_n_ao, ao_values, npoints, &
-                                       inside_voronoi, selected_indices, atom_env)
+                                       atom_n_ao, ao_values, npoints, cluster_points, &
+                                       inside_voronoi, selected_indices, atom_env, &
+                                       bs_env%ri_rs%grid_opt%reproducible_ties)
       nretained = COUNT(selected_indices > 0)
       IF (nretained == 0) THEN
          WRITE (failure, '(A,I0,A)') 'Atom ', iatom, &
             ': Cholesky selection found no numerically independent point.'
          CPABORT(TRIM(failure))
       ELSE IF (nretained < SIZE(selected_indices)) THEN
-         CALL complete_grid_by_maximin_distance(cluster_points, inside_voronoi, selected_indices)
+         CALL complete_grid_by_maximin_distance(cluster_points, inside_voronoi, selected_indices, &
+                                                bs_env%ri_rs%grid_opt%reproducible_ties)
       END IF
       DO igrid_point = 1, SIZE(selected_indices)
          bs_env%ri_rs%atomic_grids(iatom)%raw_points(:, igrid_point) = &
@@ -283,13 +294,17 @@ CONTAINS
 !> \param cluster_points Coordinates r_l of all existing cluster-grid points.
 !> \param inside_voronoi True for points inside the atomic Voronoi cell V_A.
 !> \param selected_indices Cholesky indices on entry and the completed indices on exit.
+!> \param reproducible_ties Lexicographic tie rule (else the first point within 1e-8 of the maximum).
 ! **************************************************************************************************
-   SUBROUTINE complete_grid_by_maximin_distance(cluster_points, inside_voronoi, selected_indices)
+   SUBROUTINE complete_grid_by_maximin_distance(cluster_points, inside_voronoi, selected_indices, &
+                                                reproducible_ties)
       REAL(KIND=dp), INTENT(IN)                          :: cluster_points(:, :)
       LOGICAL, INTENT(IN)                                :: inside_voronoi(:)
       INTEGER, INTENT(INOUT)                             :: selected_indices(:)
+      LOGICAL, INTENT(IN)                                :: reproducible_ties
 
-      REAL(KIND=dp), PARAMETER                           :: tie_tolerance = 1.0E-8_dp
+      REAL(KIND=dp), PARAMETER :: tie_tolerance = 1.0E-8_dp, &
+         tie_tolerance_reproducible = 1.0E-10_dp
 
       INTEGER                                            :: igrid_point, inew_point, iselected, &
                                                             nretained
@@ -320,16 +335,21 @@ CONTAINS
       END DO
 
       DO WHILE (nretained < SIZE(selected_indices))
-         inew_point = 0
          largest_distance_sq = MAXVAL(nearest_distance_sq, MASK=unselected_inside)
-         DO igrid_point = 1, SIZE(inside_voronoi)
-            IF (.NOT. unselected_inside(igrid_point)) CYCLE
+         IF (reproducible_ties) THEN
+            inew_point = pick_tied_point(nearest_distance_sq, unselected_inside, cluster_points, &
+                                         tie_tolerance_reproducible*largest_distance_sq)
+         ELSE
             ! Ties up to rounding go to the first point, independent of the compiler.
-            IF (nearest_distance_sq(igrid_point) >= (1.0_dp - tie_tolerance)*largest_distance_sq) THEN
-               inew_point = igrid_point
-               EXIT
-            END IF
-         END DO
+            inew_point = 0
+            DO igrid_point = 1, SIZE(inside_voronoi)
+               IF (.NOT. unselected_inside(igrid_point)) CYCLE
+               IF (nearest_distance_sq(igrid_point) >= (1.0_dp - tie_tolerance)*largest_distance_sq) THEN
+                  inew_point = igrid_point
+                  EXIT
+               END IF
+            END DO
+         END IF
          CPASSERT(inew_point > 0)
 
          nretained = nretained + 1
@@ -491,37 +511,44 @@ CONTAINS
 !> \param atom_n_ao Number of AO functions for each atom.
 !> \param ao_values Compact atom-local values ϕ_μ(r_l).
 !> \param npoints Number of points in the cluster Lebedev grids.
+!> \param cluster_points Coordinates r_l of the cluster Lebedev points.
 !> \param inside_voronoi True for points inside the atomic Voronoi cell V_A.
 !> \param selected_indices Selected indices in V_A; zero denotes rank exhaustion.
 !> \param atom_env ...
+!> \param reproducible_ties Lexicographic tie rule (else the first point within 1e-8 of the maximum).
 ! **************************************************************************************************
    SUBROUTINE select_cholesky_grid_points(ao_point_indices, atom_point_offsets, atom_value_offsets, &
-                                          atom_n_ao, ao_values, npoints, inside_voronoi, &
-                                          selected_indices, atom_env)
+                                          atom_n_ao, ao_values, npoints, cluster_points, &
+                                          inside_voronoi, selected_indices, atom_env, &
+                                          reproducible_ties)
       INTEGER, INTENT(IN)                                :: ao_point_indices(:), &
                                                             atom_point_offsets(:), &
                                                             atom_value_offsets(:), atom_n_ao(:)
       REAL(KIND=dp), CONTIGUOUS, INTENT(IN), TARGET      :: ao_values(:)
       INTEGER, INTENT(IN)                                :: npoints
+      REAL(KIND=dp), INTENT(IN)                          :: cluster_points(3, npoints)
       LOGICAL, INTENT(IN)                                :: inside_voronoi(npoints)
       INTEGER, INTENT(OUT)                               :: selected_indices(:)
       TYPE(mp_comm_type), INTENT(IN)                     :: atom_env
+      LOGICAL, INTENT(IN)                                :: reproducible_ties
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'select_cholesky_grid_points'
-      REAL(KIND=dp), PARAMETER                           :: tie_tolerance = 1.0E-8_dp
+      REAL(KIND=dp), PARAMETER :: rank_eps_factor = 64.0_dp, tie_tolerance = 1.0E-8_dp, &
+         tie_tolerance_reproducible = 1.0E-12_dp
 
       INTEGER :: capacity, first_local, first_point, first_row, first_value, handle, iblock, &
          igrid_point, irow, last_local, last_point, last_row, last_value, n_ao, new_capacity, &
          nretained, nrows, nselected, selected_point
       INTEGER, ALLOCATABLE                               :: first_row_local(:), last_row_local(:)
-      REAL(KIND=dp)                                      :: rank_tolerance, selected_diagonal
-      REAL(KIND=dp), ALLOCATABLE :: diagonal(:), factor(:, :), grown(:, :), selected_ao_values(:), &
-         selected_factor_values(:), selection_matrix_column(:)
+      REAL(KIND=dp)                                      :: initial_max, rank_tolerance, &
+                                                            selected_diagonal, tie_tol
+      REAL(KIND=dp), ALLOCATABLE :: diagonal(:), factor(:, :), grown(:, :), initial_diagonal(:), &
+         selected_ao_values(:), selected_factor_values(:), selection_matrix_column(:)
       REAL(KIND=dp), POINTER                             :: atom_ao_values(:, :)
 
       CALL timeset(routineN, handle)
 
-      ALLOCATE (diagonal(npoints), selection_matrix_column(npoints))
+      ALLOCATE (diagonal(npoints), initial_diagonal(npoints), selection_matrix_column(npoints))
 
       ! d_l^(0) = D_ll = [Σ_μ ϕ_μ(r_l)^2]^2.
       diagonal(:) = 0.0_dp
@@ -538,9 +565,17 @@ CONTAINS
          END DO
       END DO
       diagonal(:) = diagonal**2
-      ! Residuals below N*eps*max(D_ll) are rounding noise (rank tolerance of LAPACK DPSTRF);
-      ! accepting them would let the compiler's rounding decide the grid.
-      rank_tolerance = REAL(npoints, dp)*EPSILON(1.0_dp)*MAXVAL(diagonal)
+      IF (reproducible_ties) THEN
+         ! Rank cut per point against d_l^(0) and tie tolerance against the initial maximum: the
+         ! round-off of the residual d_l^(k) stays at about eps * max_l d_l^(0) as d_l^(k) shrinks.
+         initial_diagonal(:) = diagonal
+         initial_max = MAXVAL(initial_diagonal)
+         tie_tol = tie_tolerance_reproducible*initial_max
+      ELSE
+         ! Residuals below N*eps*max(D_ll) are rounding noise (rank tolerance of LAPACK DPSTRF);
+         ! accepting them would let the compiler's rounding decide the grid.
+         rank_tolerance = REAL(npoints, dp)*EPSILON(1.0_dp)*MAXVAL(diagonal)
+      END IF
 
       capacity = MIN(32, npoints)
       ALLOCATE (factor(npoints, capacity), selected_ao_values(MAXVAL(atom_n_ao)), &
@@ -558,11 +593,18 @@ CONTAINS
       nselected = 0
       nretained = 0
       DO WHILE (nretained < SIZE(selected_indices) .AND. nselected < npoints)
-         ! Symmetry-equivalent points tie up to rounding; take the first of them so that the
-         ! grid does not depend on the compiler's floating-point evaluation (e.g. FMA).
+         ! Pivot q_k = argmax_l d_l^(k-1) (Eq. (8)). Lebedev candidates on a symmetric site are
+         ! degenerate over a symmetry orbit up to round-off, which must not decide the grid.
          selected_diagonal = MAXVAL(diagonal)
          IF (selected_diagonal <= 0.0_dp) EXIT
-         selected_point = FINDLOC(diagonal >= (1.0_dp - tie_tolerance)*selected_diagonal, .TRUE., DIM=1)
+         IF (reproducible_ties) THEN
+            ! T = {l : d_l > 0, d_l >= max - tol}; its lexicographically smallest relative r_l,
+            ! independent of absolute coordinates and of the atom order of the supercell
+            selected_point = pick_tied_point(diagonal, diagonal > 0.0_dp, cluster_points, tie_tol)
+         ELSE
+            ! the first point within the relative tolerance of the maximum
+            selected_point = FINDLOC(diagonal >= (1.0_dp - tie_tolerance)*selected_diagonal, .TRUE., DIM=1)
+         END IF
          selected_diagonal = diagonal(selected_point)
 
          IF (nselected == capacity) THEN
@@ -615,7 +657,11 @@ CONTAINS
          nselected = nselected + 1
          factor(:, nselected) = selection_matrix_column/SQRT(selected_diagonal)
          diagonal(:) = MAX(0.0_dp, diagonal - factor(:, nselected)**2)
-         WHERE (diagonal <= rank_tolerance) diagonal = 0.0_dp
+         IF (reproducible_ties) THEN
+            WHERE (diagonal <= rank_eps_factor*EPSILON(1.0_dp)*initial_diagonal) diagonal = 0.0_dp
+         ELSE
+            WHERE (diagonal <= rank_tolerance) diagonal = 0.0_dp
+         END IF
          diagonal(selected_point) = 0.0_dp
 
          IF (inside_voronoi(selected_point)) THEN
@@ -629,18 +675,78 @@ CONTAINS
    END SUBROUTINE select_cholesky_grid_points
 
 ! **************************************************************************************************
+!> \brief Reproducible argmax: among T = {l : eligible_l, values_l >= max_l' values_l' - tol},
+!>        return the point with the lexicographically smallest coordinate relative to the cluster
+!>        centre (x, then y, then z; compared as integers in units of 1e-8 bohr).
+!> \param values Quantity to maximize.
+!> \param eligible Candidate mask.
+!> \param points Relative coordinates r_l.
+!> \param tol Absolute tie tolerance.
+!> \return Selected index, 0 if no point is eligible.
+! **************************************************************************************************
+   FUNCTION pick_tied_point(values, eligible, points, tol) RESULT(ipick)
+      REAL(KIND=dp), INTENT(IN)                          :: values(:)
+      LOGICAL, INTENT(IN)                                :: eligible(:)
+      REAL(KIND=dp), INTENT(IN)                          :: points(:, :), tol
+      INTEGER                                            :: ipick
+
+      REAL(KIND=dp), PARAMETER                           :: quantum = 1.0E-8_dp
+
+      INTEGER                                            :: idim, l
+      INTEGER(KIND=int_8)                                :: qbest(3), ql(3)
+      LOGICAL                                            :: smaller
+      REAL(KIND=dp)                                      :: vmax
+
+      ipick = 0
+      IF (.NOT. ANY(eligible)) RETURN
+      vmax = MAXVAL(values, MASK=eligible)
+      qbest(:) = 0
+      DO l = 1, SIZE(values)
+         IF (.NOT. eligible(l)) CYCLE
+         IF (values(l) < vmax - tol) CYCLE
+         ql(:) = NINT(points(:, l)/quantum, KIND=int_8)
+         IF (ipick == 0) THEN
+            smaller = .TRUE.
+         ELSE
+            smaller = .FALSE.
+            DO idim = 1, 3
+               IF (ql(idim) /= qbest(idim)) THEN
+                  smaller = ql(idim) < qbest(idim)
+                  EXIT
+               END IF
+            END DO
+         END IF
+         IF (smaller) THEN
+            ipick = l
+            qbest(:) = ql
+         END IF
+      END DO
+   END FUNCTION pick_tied_point
+
+! **************************************************************************************************
 !> \brief Communicate the independently constructed atom grids after Eqs. (5)-(12).
 !> \param bs_env ...
 ! **************************************************************************************************
    SUBROUTINE broadcast_ri_rs_grids(bs_env)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
 
-      INTEGER                                            :: atom_mpi_rank, iatom, ngroups
+      INTEGER                                            :: atom_mpi_rank, iatom, icenter, ncenters, &
+                                                            ngroups
 
-      ngroups = MIN(bs_env%n_atom, bs_env%para_env%num_pe)
-      DO iatom = 1, bs_env%n_atom
-         atom_mpi_rank = MOD(iatom - 1, ngroups)
+      ncenters = SIZE(bs_env%ri_rs%grid_opt%grid_centers)
+      ngroups = MIN(ncenters, bs_env%para_env%num_pe)
+      DO icenter = 1, ncenters
+         iatom = bs_env%ri_rs%grid_opt%grid_centers(icenter)
+         atom_mpi_rank = MOD(icenter - 1, ngroups)
          CALL bs_env%para_env%bcast(bs_env%ri_rs%atomic_grids(iatom)%raw_points, atom_mpi_rank)
+      END DO
+      ! Atom-relative grids are translation invariant: an image A = rep(A) + t gets the grid
+      ! of its representative, r_l^A - R_A = r_l^rep(A) - R_rep(A).
+      DO iatom = 1, bs_env%n_atom
+         IF (bs_env%ri_rs%grid_opt%grid_rep(iatom) /= iatom) THEN
+            bs_env%ri_rs%atomic_grids(iatom)%raw_points(:, :) = &
+               bs_env%ri_rs%atomic_grids(bs_env%ri_rs%grid_opt%grid_rep(iatom))%raw_points
+         END IF
       END DO
    END SUBROUTINE broadcast_ri_rs_grids
 
@@ -676,5 +782,153 @@ CONTAINS
          ratio = 8.0_dp
       END SELECT
    END FUNCTION rs_ao_ratio_of_kind
+
+! **************************************************************************************************
+!> \brief Translation orbits of the atoms (grids of a primitive-cell atom copied to its images).
+!>
+!> With fractional coordinates s_A = h^-1 R_A, a vector t is a lattice translation of the
+!> structure if every atom A is mapped onto an atom B(A,t) of the same kind,
+!>
+!> (T1) | h (s_A + t - s_B) | < eps_trans,   s_A + t - s_B reduced modulo 1 along periodic
+!>                                            directions only; t has no non-periodic component.
+!>
+!> The candidates are t = s_B - s_1 for every atom B of the kind of atom 1; the valid ones form
+!> the translation group T (including t = 0). The orbit of A is {B(A,t) : t in T} and its
+!> representative is the smallest atom index in it,
+!>
+!> (T2) grid_rep(A) = min_{t in T} B(A,t),
+!>
+!> so grid_rep(A) <= A. A Gamma-only n1 x n2 x n3 supercell of a primitive cell has
+!> |T| = n1 n2 n3 and the representatives are the primitive-cell atoms.
+!> \param bs_env ...
+! **************************************************************************************************
+   SUBROUTINE find_translation_orbits(bs_env)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      INTEGER                                            :: iatom, natom, ncenters, ntrans
+      INTEGER, ALLOCATABLE                               :: images(:, :), rep(:)
+
+      natom = bs_env%n_atom
+      CALL translation_atom_images(bs_env, images)
+      ntrans = SIZE(images, 2)
+      ! Eq. (T2)
+      ALLOCATE (rep(natom))
+      DO iatom = 1, natom
+         rep(iatom) = MINVAL(images(iatom, :))
+      END DO
+      DEALLOCATE (images)
+
+      ncenters = COUNT([(rep(iatom) == iatom, iatom=1, natom)])
+      IF (ALLOCATED(bs_env%ri_rs%grid_opt%grid_rep)) DEALLOCATE (bs_env%ri_rs%grid_opt%grid_rep)
+      IF (ALLOCATED(bs_env%ri_rs%grid_opt%grid_centers)) DEALLOCATE (bs_env%ri_rs%grid_opt%grid_centers)
+      ALLOCATE (bs_env%ri_rs%grid_opt%grid_centers(ncenters))
+      bs_env%ri_rs%grid_opt%grid_centers(:) = PACK([(iatom, iatom=1, natom)], &
+                                                   [(rep(iatom) == iatom, iatom=1, natom)])
+      CALL MOVE_ALLOC(rep, bs_env%ri_rs%grid_opt%grid_rep)
+      ! The translations act freely, so every orbit has |T| atoms.
+      CPASSERT(ncenters*ntrans == natom)
+
+      IF (bs_env%unit_nr > 0 .AND. ntrans > 1) THEN
+         WRITE (bs_env%unit_nr, '(T2,A,T71,I10)') &
+            'RI-RS grid: primitive cells in the supercell (translations)', ntrans
+      END IF
+
+   END SUBROUTINE find_translation_orbits
+
+! **************************************************************************************************
+!> \brief Atom maps B(A,t) of the lattice translations t in T of Eq. (T1).
+!>
+!> Atoms are binned on an m^3 cell list in fractional coordinates (m ~ N^(1/3)), so each
+!> candidate t = s_B - s_1 is checked in O(N_atom) and the whole search costs O(N_atom^2).
+!> \param bs_env ...
+!> \param images images(A, t) = B(A, t); column 1 is the identity t = 0
+! **************************************************************************************************
+   SUBROUTINE translation_atom_images(bs_env, images)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      INTEGER, ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: images
+
+      REAL(KIND=dp), PARAMETER                           :: eps_trans = 1.0E-5_dp
+
+      INTEGER                                            :: d1, d2, d3, iatom, icand, jatom, natom, &
+                                                            nbin, ntrans
+      INTEGER, ALLOCATABLE                               :: head(:), image(:), kinds(:), next(:), &
+                                                            trans_images(:, :)
+      INTEGER, DIMENSION(3)                              :: ib, jb
+      LOGICAL                                            :: found, valid
+      LOGICAL, DIMENSION(3)                              :: periodic
+      REAL(KIND=dp), ALLOCATABLE                         :: s(:, :)
+      REAL(KIND=dp), DIMENSION(3)                        :: d, q, t
+      TYPE(cell_type), POINTER                           :: cell
+
+      natom = bs_env%n_atom
+      ntrans = 1
+      cell => bs_env%ri_rs%cell
+      periodic(:) = cell%perd(:) == 1
+      IF (natom > 1 .AND. ANY(periodic)) THEN
+         ALLOCATE (s(3, natom), kinds(natom), next(natom), image(natom))
+         DO iatom = 1, natom
+            s(:, iatom) = MATMUL(cell%h_inv, bs_env%ri_rs%particle_set(iatom)%r)
+            kinds(iatom) = bs_env%ri_rs%particle_set(iatom)%atomic_kind%kind_number
+         END DO
+         ! each translation maps atom 1 onto a different atom of its kind
+         ALLOCATE (trans_images(natom, COUNT(kinds == kinds(1))))
+         trans_images(:, 1) = [(iatom, iatom=1, natom)]
+         nbin = MAX(1, FLOOR(REAL(natom, dp)**(1.0_dp/3.0_dp)))
+         ALLOCATE (head(nbin**3))
+         head(:) = 0
+         DO iatom = 1, natom
+            ib(:) = MIN(nbin - 1, FLOOR(MODULO(s(:, iatom), 1.0_dp)*nbin))
+            next(iatom) = head(1 + ib(1) + nbin*(ib(2) + nbin*ib(3)))
+            head(1 + ib(1) + nbin*(ib(2) + nbin*ib(3))) = iatom
+         END DO
+         DO icand = 2, natom
+            IF (kinds(icand) /= kinds(1)) CYCLE
+            t(:) = s(:, icand) - s(:, 1)
+            ! no translations along non-periodic directions
+            IF (ANY(.NOT. periodic .AND. ABS(t)*NORM2(cell%hmat, DIM=1) > eps_trans)) CYCLE
+            valid = .TRUE.
+            DO iatom = 1, natom
+               q(:) = s(:, iatom) + t
+               ib(:) = MIN(nbin - 1, FLOOR(MODULO(q, 1.0_dp)*nbin))
+               found = .FALSE.
+               ! search the 27 neighbouring bins of q for B with Eq. (T1)
+               DO d3 = -1, 1
+                  DO d2 = -1, 1
+                     DO d1 = -1, 1
+                        jb(:) = MODULO(ib + [d1, d2, d3], nbin)
+                        jatom = head(1 + jb(1) + nbin*(jb(2) + nbin*jb(3)))
+                        DO WHILE (jatom > 0 .AND. .NOT. found)
+                           IF (kinds(jatom) == kinds(iatom)) THEN
+                              d(:) = q - s(:, jatom)
+                              WHERE (periodic) d = d - ANINT(d)
+                              IF (NORM2(MATMUL(cell%hmat, d)) < eps_trans) THEN
+                                 found = .TRUE.
+                                 image(iatom) = jatom
+                              END IF
+                           END IF
+                           jatom = next(jatom)
+                        END DO
+                     END DO
+                  END DO
+               END DO
+               IF (.NOT. found) THEN
+                  valid = .FALSE.
+                  EXIT
+               END IF
+            END DO
+            IF (valid) THEN
+               ntrans = ntrans + 1
+               trans_images(:, ntrans) = image
+            END IF
+         END DO
+         DEALLOCATE (s, kinds, next, image, head)
+         ALLOCATE (images(natom, ntrans), SOURCE=trans_images(:, 1:ntrans))
+         DEALLOCATE (trans_images)
+      ELSE
+         ALLOCATE (images(natom, 1))
+         images(:, 1) = [(iatom, iatom=1, natom)]
+      END IF
+
+   END SUBROUTINE translation_atom_images
 
 END MODULE ri_rs_grid_initialization

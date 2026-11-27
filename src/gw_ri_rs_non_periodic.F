@@ -12,7 +12,8 @@
 ! **************************************************************************************************
 
 MODULE gw_ri_rs_non_periodic
-   USE cp_dbcsr_api,                    ONLY: dbcsr_get_info
+   USE cp_dbcsr_api,                    ONLY: dbcsr_get_info,&
+                                              dbcsr_get_occupation
    USE cp_fm_diag,                      ONLY: cp_fm_geeig
    USE cp_fm_types,                     ONLY: cp_fm_create,&
                                               cp_fm_get_diag,&
@@ -55,7 +56,10 @@ MODULE gw_ri_rs_non_periodic
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_ri_rs_non_periodic'
 
-   PUBLIC :: gw_calc_ri_rs_non_periodic
+   PUBLIC :: gw_calc_ri_rs_non_periodic, &
+             init_evGW0, update_eigenvalues_G, &
+             reset_and_clean_bs_env, print_evGW0_band_edges, &
+             print_ri_rs_memory_estimate
 
 CONTAINS
 
@@ -78,7 +82,6 @@ CONTAINS
 
       ! Build the common grid, phi and Z representation with the system's boundary conditions.
       CALL ensure_ri_rs_representation(qs_env, bs_env)
-      IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(A)') ' '
       CALL print_ri_rs_memory_estimate(bs_env)
 
       CALL mp_print_mem_per_rank(bs_env%para_env, bs_env%unit_nr, &
@@ -399,10 +402,12 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Estimates and prints per-process memory requirements for the RI-RS GW calculation.
 !> \param bs_env ...
+!> \param panels_GB (optional) the panel term "Required for χ, W, Σ panels" per process (GB)
 ! **************************************************************************************************
-   SUBROUTINE print_ri_rs_memory_estimate(bs_env)
+   SUBROUTINE print_ri_rs_memory_estimate(bs_env, panels_GB)
 
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: panels_GB
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'print_ri_rs_memory_estimate'
 
@@ -415,7 +420,7 @@ CONTAINS
       LOGICAL                                            :: use_cutoff
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: grid_used
       REAL(KIND=dp)                                      :: mem_avail_GB, mem_pan_GB, mem_panels_GB, &
-                                                            mem_Z_lP_GB
+                                                            mem_Z_lP_GB, nnz_row
 
       CALL timeset(routineN, handle)
 
@@ -430,36 +435,33 @@ CONTAINS
       mem_Z_lP_GB = REAL(n_grid_total, dp)*REAL(n_RI, dp)*8.0_dp/ &
                     REAL(n_procs, dp)*1.0E-9_dp
 
-      ! Peak panel memory during Σ^c: two G panels (A_occ, A_vir) + one W panel plus the
-      ! grid × RI / grid × AO intermediates. With the CUTOFF_RADIUS_RL_W restriction the panel
-      ! matrices only allocate the geo-template blocks, so use the same nze-aware model as the
-      ! panel planner (panel_mem_estimate_GB); without the cutoff, dense panel_rows × n_grid.
-      ! Plus the n_RI × n_RI W_aux matrix. Distributed over n_procs ranks.
+      ! Peak panel memory during Σ^c
       use_cutoff = bs_env%ri_rs%cutoff_radius_v_w > 0.0_dp .AND. &
                    ALLOCATED(bs_env%ri_rs%chunk_centroids)
       CALL resolve_grid_panels(bs_env%ri_rs, bs_env%para_env, bs_env%dbcsr_msg_elem_limit, &
-                               pan_first, pan_last, bs_env%ri_rs%cutoff_radius_v_w)
+                               pan_first, pan_last, bs_env%ri_rs%cutoff_radius_v_w, unit_nr=bs_env%unit_nr)
+      nnz_row = dbcsr_get_occupation(bs_env%ri_rs%mat_phi_mu_l)*REAL(bs_env%n_ao, dp) + &
+                dbcsr_get_occupation(bs_env%ri_rs%mat_Z_lP)*REAL(n_RI, dp)
       mem_panels_GB = 0.0_dp
       DO ipan = 1, SIZE(pan_first)
          pan_rows = SUM(r_blk_sizes(pan_first(ipan):pan_last(ipan)))
          IF (use_cutoff) THEN
             CALL mask_grid_blocks_near_panel(bs_env%ri_rs%chunk_centroids, pan_first(ipan), &
                                              pan_last(ipan), bs_env%ri_rs%cutoff_radius_v_w, &
-                                             grid_used)
+                                             grid_used, cell=bs_env%ri_rs%cell)
             pan_width = SUM(r_blk_sizes, MASK=grid_used)
             CALL panel_template_elems(r_blk_sizes, bs_env%ri_rs%chunk_centroids, &
                                       grid_used, pan_first(ipan), pan_last(ipan), &
-                                      bs_env%ri_rs%cutoff_radius_v_w, nze_tmpl)
+                                      bs_env%ri_rs%cutoff_radius_v_w, nze_tmpl, cell=bs_env%ri_rs%cell)
          ELSE
             pan_width = n_grid_total
             nze_tmpl = INT(pan_rows, int_8)*INT(pan_width, int_8)
          END IF
          CALL panel_mem_estimate_GB(nze_tmpl, pan_rows, pan_width, n_grid_total, &
-                                    n_RI, bs_env%n_ao, n_procs, mem_pan_GB)
+                                    n_RI, bs_env%n_ao, n_procs, mem_pan_GB, nnz_row)
          mem_panels_GB = MAX(mem_panels_GB, mem_pan_GB)
       END DO
-      mem_panels_GB = mem_panels_GB + &
-                      REAL(n_RI, dp)*REAL(n_RI, dp)*8.0_dp/REAL(n_procs, dp)*1.0E-9_dp
+      IF (PRESENT(panels_GB)) panels_GB = mem_panels_GB
 
       ! Available memory per process = node MemLikelyFree / ranks-per-node, min across ranks
       ! (0 on non-Linux => warnings suppressed below).
@@ -468,15 +470,16 @@ CONTAINS
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(A)') ' '
          WRITE (bs_env%unit_nr, '(T2,A)') 'RI-RS memory estimate per MPI process:'
-         WRITE (bs_env%unit_nr, '(T4,A,F37.2,A)') &
+         WRITE (bs_env%unit_nr, '(T4,A,T69,F9.2,A)') &
             'Available memory per process (system)', mem_avail_GB, ' GB'
-         WRITE (bs_env%unit_nr, '(T4,A,F18.2,A)') &
+         WRITE (bs_env%unit_nr, '(T4,A,T69,F9.2,A)') &
             'Required for Z_lP (dense upper bound; actual is sparser)', mem_Z_lP_GB, ' GB'
-         WRITE (bs_env%unit_nr, '(T4,A,F25.2,A)') &
+         WRITE (bs_env%unit_nr, '(T4,A,T71,F9.2,A)') &
             'Required for χ, W, Σ panels (peak per panel step)', mem_panels_GB, ' GB'
          IF (bs_env%ri_rs%Z_lP_exists .AND. .NOT. bs_env%auto_ri%enabled) THEN
             WRITE (bs_env%unit_nr, '(T4,A)') 'Z_lP fitting skipped (matrix read from restart)'
          END IF
+         WRITE (bs_env%unit_nr, '(A)') ' '
 
       END IF
 

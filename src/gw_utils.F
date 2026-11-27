@@ -25,6 +25,7 @@ MODULE gw_utils
                                               Graml2024,&
                                               cite_reference
    USE cell_types,                      ONLY: cell_type,&
+                                              get_cell,&
                                               pbc,&
                                               scaled_to_real
    USE cp_blacs_env,                    ONLY: cp_blacs_env_create,&
@@ -50,6 +51,7 @@ MODULE gw_utils
    USE cp_fm_basic_linalg,              ONLY: cp_fm_scale_and_add
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
                                               cp_fm_struct_release,&
+                                              cp_fm_struct_retain,&
                                               cp_fm_struct_type
    USE cp_fm_types,                     ONLY: cp_fm_create,&
                                               cp_fm_get_diag,&
@@ -76,6 +78,7 @@ MODULE gw_utils
    USE gw_utils_compute_integrals,      ONLY: build_3c_integral_block
    USE gw_utils_fm,                     ONLY: cfm_contract_ABA,&
                                               fm_invert,&
+                                              fm_pseudo_inverse_relative,&
                                               local_complex_power
    USE hfx_types,                       ONLY: hfx_type
    USE input_constants,                 ONLY: &
@@ -141,7 +144,8 @@ MODULE gw_utils
                                               distribution_3d_create,&
                                               distribution_3d_type,&
                                               neighbor_list_3c_type
-   USE ri_rs_types,                     ONLY: ri_rs_env,&
+   USE ri_rs_types,                     ONLY: gamma_corr_type,&
+                                              ri_rs_env,&
                                               ri_rs_grid_opt_type
    USE rpa_gw,                          ONLY: continuation_pade
    USE rpa_gw_im_time_util,             ONLY: build_ao_propagator
@@ -305,7 +309,7 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'read_gw_input_parameters'
 
       INTEGER                                            :: handle
-      LOGICAL                                            :: do_evgw0
+      LOGICAL                                            :: cutoff_ri_explicit, do_evgw0
       TYPE(section_vals_type), POINTER                   :: auto_ri_sec, chi_sec, cohsex_sec, &
                                                             evgw0_sec, grid_opt_sec, gw_sec, &
                                                             ri_rs_sec
@@ -325,8 +329,16 @@ CONTAINS
       CALL section_vals_val_get(chi_sec, "NUM_TIME_FREQ_POINTS", i_val=bs_env%num_time_freq_points)
       CALL section_vals_val_get(chi_sec, "EPS_FILTER", r_val=bs_env%eps_filter)
       CALL section_vals_val_get(chi_sec, "REGULARIZATION_RI", r_val=bs_env%input_regularization_RI)
+      CALL section_vals_val_get(gw_sec, "REGULARIZATION_RI_CORRECTION", &
+                                r_val=bs_env%ri_rs%gamma_corr%metric_cut)
       CALL section_vals_val_get(chi_sec, "REGULARIZATION_MINIMAX", r_val=bs_env%input_regularization_minimax)
-      CALL section_vals_val_get(chi_sec, "CUTOFF_RADIUS_RI", r_val=bs_env%ri_metric%cutoff_radius)
+      CALL section_vals_val_get(chi_sec, "CUTOFF_RADIUS_RI", r_val=bs_env%ri_metric%cutoff_radius, &
+                                explicit=cutoff_ri_explicit)
+      ! Γ-only RI-RS uses the erfc metric, whose range follows from RI_CUTOFF_ATTENUATION
+      IF (cutoff_ri_explicit .AND. bs_env%gw_implementation == ri_rs_large_cell_Gamma) THEN
+         CALL cp_warn(__LOCATION__, "CUTOFF_RADIUS_RI is ignored in Gamma-only RI-RS GW: its RI "// &
+                      "metric is erfc(omega r)/r with omega = RI_CUTOFF_ATTENUATION")
+      END IF
       CALL section_vals_val_get(chi_sec, "RI_CUTOFF_ATTENUATION", r_val=bs_env%ri_metric%omega)
       CALL section_vals_val_get(gw_sec, "MEMORY_PER_PROC", r_val=bs_env%input_memory_per_proc_GB)
       CALL section_vals_val_get(gw_sec, "APPROX_KP_EXTRAPOL", l_val=bs_env%approx_kp_extrapol)
@@ -501,15 +513,21 @@ CONTAINS
             END IF
          END IF
       END IF
-      IF (bs_env%gw_implementation == ri_rs_small_cell_full_kp) THEN
-         IF (.NOT. (bs_env%ri_metric%omega > 0.0_dp)) THEN
-            CPABORT("RI_CUTOFF_ATTENUATION must be positive for periodic RI-RS GW")
-         END IF
+      IF (bs_env%gw_implementation == ri_rs_small_cell_full_kp .OR. &
+          bs_env%gw_implementation == ri_rs_large_cell_Gamma) THEN
          IF (.NOT. (ALL(bs_env%periodic == [1, 1, 0]) .OR. ALL(bs_env%periodic == 1))) THEN
             CPABORT("Periodic RI-RS GW requires PERIODIC XY or XYZ")
          END IF
          IF (bs_env%approx_kp_extrapol) THEN
             CPABORT("APPROX_KP_EXTRAPOL cannot be combined with RI-RS GW")
+         END IF
+      END IF
+      ! Gamma-only RI-RS GW: W = W(q = 0) plus the Gamma-point head-and-wing correction
+      ! (gw_gamma_correction), so KPOINTS_W must be 1 1 1 or the input default -1 -1 -1.
+      IF (bs_env%gw_implementation == ri_rs_large_cell_Gamma) THEN
+         IF (ANY(bs_env%nkp_grid_chi_eps_W_input /= 1) .AND. &
+             ANY(bs_env%nkp_grid_chi_eps_W_input /= -1)) THEN
+            CPABORT("Gamma-only RI-RS GW requires KPOINTS_W 1 1 1, which is its default")
          END IF
       END IF
       IF (.NOT. do_evgw0) bs_env%evgw0_n_iter = 1
@@ -662,6 +680,7 @@ CONTAINS
          END IF
          IF (bs_env%do_gw_ri_rs) CALL print_gw_rirs_input(bs_env)
          IF (bs_env%do_static_cohsex) THEN
+            IF (bs_env%do_gw_ri_rs) WRITE (u, '(A)') ' '
             IF (bs_env%cohsex_flavor == cohsex_qp_update) THEN
                WRITE (u, FMT="(T2,A,T71,A10)") "static COHSEX approximation (COHSEX)", "QP_UPDATE"
             ELSE
@@ -736,7 +755,6 @@ CONTAINS
          WRITE (unit_nr, '(T2,A,F42.5,A)') 'Input: evGW0 convergence threshold', &
             bs_env%evgw0_eps_iter*evolt, ' eV'
       END IF
-      WRITE (unit_nr, '(A)') ' '
 
       CALL timestop(handle)
 
@@ -825,6 +843,34 @@ CONTAINS
    END SUBROUTINE setup_AO_and_RI_basis_set
 
 ! **************************************************************************************************
+!> \brief Length of the shortest nonzero lattice vector L = n1 a1 + n2 a2 + n3 a3 with n_i = 0 in
+!>        non-periodic directions (|n_i| <= 2 covers any reasonably reduced cell).
+!> \param cell ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION shortest_periodic_lattice_vector(cell) RESULT(l_min)
+      TYPE(cell_type), POINTER                           :: cell
+      REAL(KIND=dp)                                      :: l_min
+
+      INTEGER                                            :: n1, n2, n3, nmax(3), periodic(3)
+      REAL(KIND=dp)                                      :: vec(3)
+
+      CALL get_cell(cell=cell, periodic=periodic)
+      nmax(:) = 2*periodic(:)
+      l_min = HUGE(1.0_dp)
+      DO n1 = -nmax(1), nmax(1)
+         DO n2 = -nmax(2), nmax(2)
+            DO n3 = -nmax(3), nmax(3)
+               IF (n1 == 0 .AND. n2 == 0 .AND. n3 == 0) CYCLE
+               vec(:) = REAL(n1, dp)*cell%hmat(:, 1) + REAL(n2, dp)*cell%hmat(:, 2) + &
+                        REAL(n3, dp)*cell%hmat(:, 3)
+               l_min = MIN(l_min, NORM2(vec))
+            END DO
+         END DO
+      END DO
+   END FUNCTION shortest_periodic_lattice_vector
+
+! **************************************************************************************************
 !> \brief Sets internal GW heuristics that are not exposed as user input.
 !> \param bs_env ...
 !> \param qs_env ...
@@ -834,9 +880,12 @@ CONTAINS
       TYPE(qs_environment_type), OPTIONAL, POINTER       :: qs_env
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'set_heuristic_parameters'
+      REAL(KIND=dp), PARAMETER :: omega_ri_full_kp = 0.3_dp, omega_ri_gamma = 0.8_dp, &
+         regularization_ri_gamma = 1.0E-8_dp
 
       INTEGER                                            :: exchange_grid(3), handle, u
       LOGICAL                                            :: do_BvK_cell
+      TYPE(cell_type), POINTER                           :: cell
 
       CALL timeset(routineN, handle)
 
@@ -875,14 +924,34 @@ CONTAINS
          bs_env%nevanlinna%qp_maxz_radius = 1.5_dp/evolt
       END IF
 
-      ! Resolution of the identity with the truncated Coulomb metric.
-      bs_env%ri_metric%potential_type = do_potential_truncated
-      bs_env%ri_metric%filename = "t_c_g.dat"
-      IF (bs_env%gw_implementation == ri_rs_small_cell_full_kp) THEN
+      ! Tie rule of the RI-RS grid selection: lexicographic in the atom-relative coordinates for
+      ! periodic Gamma-only RI-RS GW, whose grids are copied to translated images; elsewhere the
+      ! first point within 1e-8 of the maximum.
+      bs_env%ri_rs%grid_opt%reproducible_ties = &
+         bs_env%gw_implementation == ri_rs_large_cell_Gamma .AND. bs_env%do_periodic
+
+      ! Operator v of the RI metric M_PQ = (P|v|Q) and of the 3-center integrals (mu nu|v|P):
+      ! erfc(omega r)/r for full-k and for periodic Gamma-only RI-RS GW, truncated Coulomb
+      ! otherwise (the truncated-Coulomb v(k) vanishes on |k| = 2 pi j/R, where the fit is unconstrained).
+      IF (bs_env%gw_implementation == ri_rs_small_cell_full_kp .OR. &
+          (bs_env%gw_implementation == ri_rs_large_cell_Gamma .AND. bs_env%do_periodic)) THEN
+         ! v(r) = erfc(omega r)/r,  v(k) = 4 pi (1 - exp(-k^2/4omega^2))/k^2. Default
+         ! attenuation 0.3 bohr^-1 for full-k RI-RS, 0.8 bohr^-1 otherwise;
+         ! cutoff_radius = range where v drops below 1e-10 (screening)
+         IF (.NOT. (bs_env%ri_metric%omega > 0.0_dp)) THEN
+            IF (bs_env%gw_implementation == ri_rs_small_cell_full_kp) THEN
+               bs_env%ri_metric%omega = omega_ri_full_kp
+            ELSE
+               bs_env%ri_metric%omega = omega_ri_gamma
+            END IF
+         END IF
          bs_env%ri_metric%potential_type = do_potential_short
          CALL erfc_cutoff(1.0E-10_dp, bs_env%ri_metric%omega, bs_env%ri_metric%cutoff_radius)
          bs_env%ri_metric%filename = ""
       ELSE
+         ! v(r) = theta(R - r)/r,  v(k) = 4 pi (1 - cos kR)/k^2
+         bs_env%ri_metric%potential_type = do_potential_truncated
+         bs_env%ri_metric%filename = "t_c_g.dat"
          bs_env%ri_metric%omega = 0.0_dp
       END IF
 
@@ -893,6 +962,11 @@ CONTAINS
       ELSE IF (bs_env%gw_implementation == ri_rs_small_cell_full_kp) THEN
          ! periodic RI-RS: relative eigenvalue cutoff when inverting the RI metric M(q)
          bs_env%regularization_RI = 1.0E-4_dp
+      ELSE IF (bs_env%gw_implementation == ri_rs_large_cell_Gamma .AND. bs_env%do_periodic .AND. &
+               .NOT. bs_env%auto_ri%enabled) THEN
+         ! periodic Gamma-only RI-RS: relative eigenvalue cut x_g of the metric pseudo-inverse
+         ! (set_metric_pseudo_inverse)
+         bs_env%regularization_RI = regularization_ri_gamma
       ELSE
          ! default case:
 
@@ -920,6 +994,13 @@ CONTAINS
                                          rel_cutoff_trunc_coulomb_ri_x=0.5_dp, &
                                          cell_grid=exchange_grid, &
                                          do_BvK_cell=do_BvK_cell)
+
+         ! Gamma-only supercell: the lattice-summed truncated operator sum_L theta(R_c - |r + L|)/|r + L|
+         ! counts every pair separation once for R_c <= |L_min|/2, half the shortest lattice vector.
+         IF (bs_env%gw_implementation == ri_rs_large_cell_Gamma) THEN
+            CALL get_qs_env(qs_env, cell=cell)
+            bs_env%trunc_coulomb%cutoff_radius = 0.5_dp*shortest_periodic_lattice_vector(cell)
+         END IF
       ELSE
          bs_env%trunc_coulomb%potential_type = do_potential_coulomb
          bs_env%trunc_coulomb%cutoff_radius = -1.0_dp
@@ -985,6 +1066,8 @@ CONTAINS
 
       CALL set_AO_RI_basis_function_indices(qs_env, bs_env)
       CALL setup_kpoints_chi_eps_W(bs_env, bs_env%kpoints_chi_eps_W)
+      ! must precede compute_Minv_Gamma
+      CALL set_metric_pseudo_inverse(bs_env)
       IF (bs_env%gw_implementation == tensor_small_cell_full_kp .OR. &
           bs_env%gw_implementation == ri_rs_small_cell_full_kp) THEN
          CALL setup_cells_3c(qs_env, bs_env)
@@ -1100,9 +1183,10 @@ CONTAINS
       TYPE(kpoint_type), POINTER                         :: kpoints_chi_eps_W
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'setup_kpoints_chi_eps_W'
+      INTEGER, PARAMETER                                 :: max_kp_batch = 4
 
-      INTEGER                                            :: handle, i_dim, n_dim, nkp, nkp_extra, &
-                                                            nkp_orig, u
+      INTEGER                                            :: handle, i_batch, i_dim, n_dim, nkp, &
+                                                            nkp_extra, nkp_orig, u
       INTEGER, DIMENSION(3)                              :: nkp_grid, nkp_grid_extra, periodic
       REAL(KIND=dp)                                      :: exp_s_p, n_dim_inv
 
@@ -1123,6 +1207,13 @@ CONTAINS
 
          ! periodic RI-RS evaluates χ, ε and W on the SCF mesh
          nkp_grid(1:3) = bs_env%kpoints_scf_desymm%nkp_grid(1:3)
+         nkp_grid_extra(1:3) = 1
+
+      ELSE IF (bs_env%gw_implementation == ri_rs_large_cell_Gamma) THEN
+
+         ! 0. Γ-only RI-RS GW: the single point q = 0 without extrapolation mesh. W is W(Γ) plus
+         !    the analytic head-and-wing integral over the whole small Brillouin zone (gw_gamma_correction).
+         nkp_grid(1:3) = 1
          nkp_grid_extra(1:3) = 1
 
       ELSE IF (bs_env%nkp_grid_chi_eps_W_input(1) > 0 .AND. &
@@ -1160,7 +1251,7 @@ CONTAINS
                nkp_grid_extra(i_dim) = 1
             CASE (1)
                SELECT CASE (bs_env%gw_implementation)
-               CASE (tensor_large_cell_Gamma, ri_rs_large_cell_Gamma, ri_rs_non_periodic, tensor_static_cohsex)
+               CASE (tensor_large_cell_Gamma, ri_rs_non_periodic, tensor_static_cohsex)
                   nkp_grid(i_dim) = 4
                   nkp_grid_extra(i_dim) = 6
                CASE (tensor_small_cell_full_kp)
@@ -1221,15 +1312,21 @@ CONTAINS
 
          n_dim_inv = 1.0_dp/REAL(n_dim, KIND=dp)
 
-         ! k-point weights are chosen to automatically extrapolate the k-point mesh
-         CALL compute_wkp(kpoints_chi_eps_W%wkp(1:nkp_orig), nkp_orig, nkp_extra, n_dim_inv)
-         CALL compute_wkp(kpoints_chi_eps_W%wkp(nkp_orig + 1:nkp), &
-                          nkp_extra, nkp_orig, n_dim_inv)
+         IF (nkp_extra == 0) THEN
+            ! Gamma only: one point, weight one, for every element class of W.
+            kpoints_chi_eps_W%wkp(1:nkp_orig) = 1.0_dp/REAL(nkp_orig, KIND=dp)
+            bs_env%wkp_no_extra(1:nkp_orig) = 1.0_dp/REAL(nkp_orig, KIND=dp)
+         ELSE
+            ! k-point weights are chosen to automatically extrapolate the k-point mesh
+            CALL compute_wkp(kpoints_chi_eps_W%wkp(1:nkp_orig), nkp_orig, nkp_extra, n_dim_inv)
+            CALL compute_wkp(kpoints_chi_eps_W%wkp(nkp_orig + 1:nkp), &
+                             nkp_extra, nkp_orig, n_dim_inv)
 
-         bs_env%wkp_no_extra(1:nkp_orig) = 0.0_dp
-         bs_env%wkp_no_extra(nkp_orig + 1:nkp) = 1.0_dp/REAL(nkp_extra, KIND=dp)
+            bs_env%wkp_no_extra(1:nkp_orig) = 0.0_dp
+            bs_env%wkp_no_extra(nkp_orig + 1:nkp) = 1.0_dp/REAL(nkp_extra, KIND=dp)
+         END IF
 
-         IF (n_dim == 3) THEN
+         IF (n_dim == 3 .AND. nkp_extra > 0) THEN
             ! W_PQ(k) for an s-function P and a p-function Q diverges as 1/k at k=0
             ! (instead of 1/k^2 for P and Q both being s-functions).
             exp_s_p = 2.0_dp*n_dim_inv
@@ -1248,7 +1345,17 @@ CONTAINS
       ! heuristic parameter: how many k-points for χ, ε, and W are used simultaneously
       ! (less simultaneous k-points: less memory, but more computational effort because of
       !  recomputation of V(k))
-      bs_env%nkp_chi_eps_W_batch = 4
+      !
+      ! Largest batch size up to max_kp_batch that divides nkp_orig: a batch of
+      ! compute_V_k_by_lattice_sum must not straddle the two k-meshes, which use different
+      ! lattice-sum boxes.
+      bs_env%nkp_chi_eps_W_batch = 1
+      DO i_batch = MIN(max_kp_batch, bs_env%nkp_chi_eps_W_orig), 2, -1
+         IF (MODULO(bs_env%nkp_chi_eps_W_orig, i_batch) == 0) THEN
+            bs_env%nkp_chi_eps_W_batch = i_batch
+            EXIT
+         END IF
+      END DO
 
       bs_env%num_chi_eps_W_batches = (bs_env%nkp_chi_eps_W_orig_plus_extra - 1)/ &
                                      bs_env%nkp_chi_eps_W_batch + 1
@@ -1262,8 +1369,12 @@ CONTAINS
             WRITE (u, '(T2,A,T71,3I4)') "K-point mesh for χ, ε, W", nkp_grid
          CASE DEFAULT
             WRITE (u, FMT="(T2,1A,T71,3I4)") "K-point mesh 1 for χ, ε, W", nkp_grid(1:3)
-            WRITE (u, FMT="(T2,2A,T71,3I4)") "K-point mesh 2 for χ, ε, W ", &
-               "(for k-point extrapolation of W)", nkp_grid_extra(1:3)
+            IF (nkp_extra > 0) THEN
+               WRITE (u, FMT="(T2,2A,T71,3I4)") "K-point mesh 2 for χ, ε, W ", &
+                  "(for k-point extrapolation of W)", nkp_grid_extra(1:3)
+            ELSE
+               WRITE (u, FMT="(T2,A,T77,A)") "K-point mesh 2 for χ, ε, W", "Γ-only"
+            END IF
             WRITE (u, FMT="(T2,A,T80,L)") "Approximate the k-point extrapolation", &
                bs_env%approx_kp_extrapol
          END SELECT
@@ -1894,6 +2005,8 @@ CONTAINS
       CALL cp_fm_struct_create(fm_struct_RI_global, context=blacs_env, nrow_global=bs_env%n_RI, &
                                ncol_global=bs_env%n_RI, para_env=para_env)
       CALL cp_fm_create(bs_env%fm_RI_RI, fm_struct_RI_global)
+      bs_env%fm_struct_RI_RI => fm_struct_RI_global
+      CALL cp_fm_struct_retain(bs_env%fm_struct_RI_RI)
       CALL cp_fm_create(bs_env%fm_chi_Gamma_freq, fm_struct_RI_global)
       CALL cp_fm_create(bs_env%fm_W_MIC_freq, fm_struct_RI_global)
       IF (bs_env%approx_kp_extrapol) THEN
@@ -1939,7 +2052,29 @@ CONTAINS
    END SUBROUTINE allocate_matrices
 
 ! **************************************************************************************************
+!> \brief Decide whether M^-1 is the relative-cut pseudo-inverse (bs_env%metric_pinv).
+!>
+!>        REGULARIZATION_RI is then the relative cut x of M^+ = U diag(1/m_i, m_i >= x m_max) U^T,
+!>        used for M^-1 everywhere, with no diagonal shift; the cut removes near-linear dependences
+!>        of the RI basis. Active for periodic Gamma-only RI-RS GW without AUTO_RI and for x > 0.
+!> \param bs_env band-structure environment
+! **************************************************************************************************
+   SUBROUTINE set_metric_pseudo_inverse(bs_env)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      bs_env%metric_pinv = bs_env%gw_implementation == ri_rs_large_cell_Gamma .AND. &
+                           bs_env%do_periodic .AND. .NOT. bs_env%auto_ri%enabled .AND. &
+                           bs_env%regularization_RI > 0.0_dp
+
+   END SUBROUTINE set_metric_pseudo_inverse
+
+! **************************************************************************************************
 !> \brief Computes and stores the inverse RI metric at the Γ point.
+!>
+!>        With metric_pinv: M⁺ = Σ_{i∈K} u_i u_iᵀ/m_i, K = {i : m_i ≥ x_g m_max},
+!>        x_g = REGULARIZATION_RI. For x_g < x_c = REGULARIZATION_RI_CORRECTION, the modes
+!>        L = {i ∈ K : m_i < x_c m_max} are kept as U_L, m_L in bs_env%ri_rs%gamma_corr for the
+!>        correction's own inverse M⁺_c = M⁺ − U_L diag(1/m_L) U_Lᵀ.
 !> \param qs_env ...
 !> \param bs_env ...
 ! **************************************************************************************************
@@ -1949,28 +2084,57 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_Minv_Gamma'
 
-      INTEGER                                            :: handle
-      REAL(KIND=dp)                                      :: eigenvalue_threshold, &
+      INTEGER                                            :: handle, n_dropped
+      LOGICAL                                            :: corr_cut
+      REAL(KIND=dp)                                      :: eigenvalue_threshold, m_kept, m_max, &
                                                             metric_regularization
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_M
+      TYPE(gamma_corr_type), POINTER                     :: gc
 
       CALL timeset(routineN, handle)
 
-      CALL cp_fm_create(bs_env%fm_Minv_Gamma, bs_env%fm_RI_RI%matrix_struct)
+      CALL cp_fm_create(bs_env%fm_Minv_Gamma, bs_env%fm_struct_RI_RI)
       IF (bs_env%auto_ri%enabled) THEN
          CPASSERT(bs_env%auto_ri%ready)
          CALL cp_fm_to_fm(bs_env%auto_ri%M_pq_inv, bs_env%fm_Minv_Gamma)
       ELSE
+         ! M^-1(k=0), folded into W by compute_W_MIC: bare metric here, inverted below as the
+         ! relative-cut pseudo-inverse (metric_pinv) or plainly.
          metric_regularization = 0.0_dp
          eigenvalue_threshold = 0.0_dp
-         IF (bs_env%do_gw_ri_rs) THEN
-            metric_regularization = bs_env%regularization_RI
-            eigenvalue_threshold = bs_env%eps_eigval_mat_RI
-         END IF
-         CALL RI_2c_integral_mat(qs_env, fm_M, bs_env%fm_RI_RI%matrix_struct, bs_env%n_RI, &
+         CALL RI_2c_integral_mat(qs_env, fm_M, bs_env%fm_struct_RI_RI, bs_env%n_RI, &
                                  bs_env%ri_metric, &
                                  regularization_RI=metric_regularization)
-         CALL fm_invert(fm_M(1, 1), eigenvalue_threshold, bs_env%unit_nr)
+         IF (bs_env%metric_pinv) THEN
+            ! Periodic Gamma-only RI-RS: M^+(0) = U diag(1/m_i, m_i >= x m_max) U^T of the bare
+            ! metric, x = REGULARIZATION_RI; also used for M^-1(0) inside ε (compute_MinvVsqrt_Vsqrt).
+            gc => bs_env%ri_rs%gamma_corr
+            ! the Γ-point correction needs its separate set of modes only when its cut x_c lies above x_g
+            corr_cut = bs_env%regularization_RI < gc%metric_cut
+            IF (corr_cut) THEN
+               CALL fm_pseudo_inverse_relative(fm_M(1, 1), bs_env%regularization_RI, n_dropped, &
+                                               m_kept, m_max, rel_cut_low=gc%metric_cut, &
+                                               n_low=gc%n_low, fm_U_low=gc%fm_U_low, m_low=gc%m_low)
+            ELSE
+               CALL fm_pseudo_inverse_relative(fm_M(1, 1), bs_env%regularization_RI, n_dropped, &
+                                               m_kept, m_max)
+            END IF
+            IF (bs_env%unit_nr > 0) THEN
+               WRITE (bs_env%unit_nr, '(A)') ' '
+               WRITE (bs_env%unit_nr, '(T2,A,T71,ES10.2)') &
+                  'RI metric: relative eigenvalue cut of the pseudo-inverse', bs_env%regularization_RI
+               WRITE (bs_env%unit_nr, '(T2,A,T71,I10)') 'RI metric: removed auxiliary functions', &
+                  n_dropped
+               IF (corr_cut) THEN
+                  WRITE (bs_env%unit_nr, '(T2,A,T72,ES10.2)') &
+                     'RI metric: relative eigenvalue cut of the Γ-point correction', gc%metric_cut
+                  WRITE (bs_env%unit_nr, '(T2,A,T72,I10)') &
+                     'RI metric: auxiliary functions not used by the Γ-point correction', gc%n_low
+               END IF
+            END IF
+         ELSE
+            CALL fm_invert(fm_M(1, 1), eigenvalue_threshold, bs_env%unit_nr)
+         END IF
          CALL cp_fm_to_fm(fm_M(1, 1), bs_env%fm_Minv_Gamma)
          CALL cp_fm_release(fm_M)
       END IF
@@ -3523,7 +3687,9 @@ CONTAINS
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'setup_time_and_frequency_minimax_grid'
+      INTEGER, PARAMETER                                 :: n_fit_pade_warn = 4
 
+      CHARACTER(LEN=512)                                 :: message
       INTEGER                                            :: handle, homo, ispin, n_mo, n_top, &
                                                             num_time_freq_points, u
       REAL(KIND=dp)                                      :: E_max, E_max_ispin, E_min, E_min_ispin, &
@@ -3618,6 +3784,15 @@ CONTAINS
          bs_env%imag_freq_points_fit(:) = bs_env%time_frequency_grid%frequency
       END IF
 
+      ! PADE continuation with n <= n_fit_pade_warn fit points averages the Padé orders n, ..., 2
+      ! without outlier rejection, which biases Σ(ϵ); warn, do not change the fit.
+      IF (bs_env%ac_method /= gw_ac_nevanlinna .AND. bs_env%num_freq_points_fit <= n_fit_pade_warn) THEN
+         WRITE (message, '(A,I0,A)') 'Only ', bs_env%num_freq_points_fit, &
+            ' imaginary-frequency points lie below FREQ_MAX_FIT; the analytic continuation '// &
+            'then averages in very low Pade orders. Raise FREQ_MAX_FIT (e.g. 27.211 eV) or '// &
+            'NUM_TIME_FREQ_POINTS.'
+         CALL cp_warn(__LOCATION__, TRIM(message))
+      END IF
       u = bs_env%unit_nr
       IF (u > 0) THEN
          WRITE (u, '(T2,A)') ''

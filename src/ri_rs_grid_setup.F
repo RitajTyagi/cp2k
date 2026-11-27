@@ -111,6 +111,8 @@ CONTAINS
                                       bs_env%ri_rs%atomic_grids(iatom)%npts
       END DO
       bs_env%ri_rs%grid_atom_boundaries(natom + 1) = bs_env%ri_rs%n_grid_points + 1
+      IF (ALLOCATED(bs_env%ri_rs%grid_atom_order)) DEALLOCATE (bs_env%ri_rs%grid_atom_order)
+      ALLOCATE (bs_env%ri_rs%grid_atom_order, SOURCE=atom_order)
 
       IF (bs_env%unit_nr > 0 .AND. .NOT. bs_env%ri_rs%grid_opt%enabled) THEN
          WRITE (bs_env%unit_nr, FMT="(T2,A,T69,I12)") &

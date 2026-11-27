@@ -17,6 +17,8 @@ MODULE post_scf_bandstructure_types
    USE cp_dbcsr_api,                    ONLY: dbcsr_p_type,&
                                               dbcsr_release
    USE cp_dbcsr_operations,             ONLY: dbcsr_deallocate_matrix_set
+   USE cp_fm_struct,                    ONLY: cp_fm_struct_release,&
+                                              cp_fm_struct_type
    USE cp_fm_types,                     ONLY: cp_fm_release,&
                                               cp_fm_type
    USE dbt_api,                         ONLY: dbt_destroy,&
@@ -237,6 +239,9 @@ MODULE post_scf_bandstructure_types
                                                       eps_eigval_mat_RI = -1.0_dp, &
                                                       input_regularization_RI = -1.0_dp, &
                                                       regularization_RI = -1.0_dp
+      ! metric_pinv: periodic Gamma-only RI-RS GW inverts the RI metric M(0) as a pseudo-inverse
+      ! with relative eigenvalue cut regularization_RI (no Tikhonov shift); see compute_Minv_Gamma
+      LOGICAL                                      :: metric_pinv = .FALSE.
 
       ! global full cfm_1d used in GW
       TYPE(cp_fm_type)                             :: fm_s_Gamma = cp_fm_type(), &
@@ -255,6 +260,8 @@ MODULE post_scf_bandstructure_types
                                                       fm_W_MIC_freq_zero = cp_fm_type()
       TYPE(cp_cfm_type)                            :: cfm_work_mo = cp_cfm_type(), &
                                                       cfm_work_mo_2 = cp_cfm_type()
+      ! layout of the dense n_RI x n_RI matrices, kept for use after fm_RI_RI is released
+      TYPE(cp_fm_struct_type), POINTER             :: fm_struct_RI_RI => NULL()
 
       ! global dbcsr cfm_1d used in GW
       TYPE(dbcsr_p_type)                           :: mat_ao_ao = dbcsr_p_type(), &
@@ -519,6 +526,7 @@ CONTAINS
       CALL cp_fm_release(bs_env%fm_work_mo(3))
       CALL cp_fm_release(bs_env%fm_work_mo(4))
       CALL cp_fm_release(bs_env%fm_RI_RI)
+      CALL cp_fm_struct_release(bs_env%fm_struct_RI_RI)
       CALL cp_fm_release(bs_env%fm_Minv_Gamma)
       CALL cp_fm_release(bs_env%fm_chi_Gamma_freq)
       CALL cp_fm_release(bs_env%fm_W_MIC_freq)

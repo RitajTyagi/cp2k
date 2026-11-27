@@ -49,7 +49,7 @@ MODULE gw_utils_compute_integrals
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_utils_compute_integrals'
 
-   PUBLIC :: build_3c_integral_block, build_3c_integral_block_ctx, &
+   PUBLIC :: build_3c_integral_block, build_3c_integral_block_ctx, build_3c_integral_block_images, &
              gw_3c_ctx_type, gw_3c_ctx_create, gw_3c_ctx_release, &
              gw_3c_ws_type, gw_3c_ws_create, gw_3c_ws_release
 
@@ -456,6 +456,149 @@ CONTAINS
       END DO
 
    END SUBROUTINE build_3c_integral_block_ctx
+
+! **************************************************************************************************
+!> \brief Image-summed 3c integral block for one atom triple, accumulated into int_3c,
+!>          (mu nu|P) = Σ_{R,S} (mu(atom_j, R) nu(atom_k, S) | P(atom_i, 0)),
+!>        R and S in [-image_extent, image_extent]. Screening and thread safety as in
+!>        build_3c_integral_block_ctx.
+!> \param int_3c accumulated target (atom_j sgf, atom_k sgf, atom_i RI sgf)
+!> \param ctx shared context from gw_3c_ctx_create
+!> \param ws per-thread workspace from gw_3c_ws_create
+!> \param atom_j ...
+!> \param atom_k ...
+!> \param atom_i ...
+!> \param image_extent largest image cell index of the AO atoms per direction
+!> \param any_kept .TRUE. if an image triple passed the kind-radius screen
+! **************************************************************************************************
+   SUBROUTINE build_3c_integral_block_images(int_3c, ctx, ws, atom_j, atom_k, atom_i, image_extent, &
+                                             any_kept)
+
+      REAL(KIND=dp), DIMENSION(:, :, :)                  :: int_3c
+      TYPE(gw_3c_ctx_type), INTENT(IN)                   :: ctx
+      TYPE(gw_3c_ws_type), INTENT(INOUT)                 :: ws
+      INTEGER, INTENT(IN)                                :: atom_j, atom_k, atom_i
+      INTEGER, DIMENSION(3), INTENT(IN)                  :: image_extent
+      LOGICAL, INTENT(OUT)                               :: any_kept
+
+      INTEGER :: ikind, img, iset, ix_R, ix_S, iy_R, iy_S, iz_R, iz_S, jkind, jset, kkind, kset, &
+         n_img, n_used, ncoi, ncoj, ncok, nseti, nsetj, nsetk, sgfi, sgfj, sgfk
+      INTEGER, DIMENSION(:), POINTER                     :: lmax_i, lmax_j, lmax_k, lmin_i, lmin_j, &
+                                                            lmin_k, npgfi, npgfj, npgfk, nsgfi, &
+                                                            nsgfj, nsgfk
+      INTEGER, DIMENSION(:, :), POINTER                  :: first_sgf_i, first_sgf_j, first_sgf_k
+      REAL(KIND=dp)                                      :: dij, dik, djk, kind_radius_i, &
+                                                            kind_radius_j, kind_radius_k
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: img_dist, img_rj, img_rk
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: sijk, sijk_contr, sijk_sum
+      REAL(KIND=dp), DIMENSION(3)                        :: ri, rj, rj0, rk, rk0
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: set_radius_i, set_radius_j, set_radius_k
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: rpgf_i, rpgf_j, rpgf_k, zeti, zetj, zetk
+
+      ikind = ctx%kind_of(atom_i)
+      jkind = ctx%kind_of(atom_j)
+      kkind = ctx%kind_of(atom_k)
+
+      CALL get_gto_basis_set(ctx%basis_i(ikind)%gto_basis_set, first_sgf=first_sgf_i, &
+                             lmax=lmax_i, lmin=lmin_i, npgf=npgfi, nset=nseti, &
+                             nsgf_set=nsgfi, pgf_radius=rpgf_i, set_radius=set_radius_i, &
+                             zet=zeti, kind_radius=kind_radius_i)
+      CALL get_gto_basis_set(ctx%basis_j(jkind)%gto_basis_set, first_sgf=first_sgf_j, &
+                             lmax=lmax_j, lmin=lmin_j, npgf=npgfj, nset=nsetj, &
+                             nsgf_set=nsgfj, pgf_radius=rpgf_j, set_radius=set_radius_j, &
+                             zet=zetj, kind_radius=kind_radius_j)
+      CALL get_gto_basis_set(ctx%basis_k(kkind)%gto_basis_set, first_sgf=first_sgf_k, &
+                             lmax=lmax_k, lmin=lmin_k, npgf=npgfk, nset=nsetk, &
+                             nsgf_set=nsgfk, pgf_radius=rpgf_k, set_radius=set_radius_k, &
+                             zet=zetk, kind_radius=kind_radius_k)
+
+      ! Image triples that pass the kind-radius triangle screen, in the loop order R, S.
+      ri = pbc(ctx%particle_set(atom_i)%r(1:3), ctx%cell)
+      rj0 = pbc(ctx%particle_set(atom_j)%r(1:3), ctx%cell)
+      rk0 = pbc(ctx%particle_set(atom_k)%r(1:3), ctx%cell)
+      n_img = PRODUCT(2*image_extent + 1)**2
+      ALLOCATE (img_rj(3, n_img), img_rk(3, n_img), img_dist(3, n_img))
+      n_img = 0
+      DO ix_R = -image_extent(1), image_extent(1)
+      DO iy_R = -image_extent(2), image_extent(2)
+      DO iz_R = -image_extent(3), image_extent(3)
+         rj = rj0 + MATMUL(ctx%hmat, REAL([ix_R, iy_R, iz_R], dp))
+         dij = NORM2(rj - ri)
+         IF (kind_radius_j + kind_radius_i + ctx%dr_ij < dij) CYCLE
+         DO ix_S = -image_extent(1), image_extent(1)
+         DO iy_S = -image_extent(2), image_extent(2)
+         DO iz_S = -image_extent(3), image_extent(3)
+            rk = rk0 + MATMUL(ctx%hmat, REAL([ix_S, iy_S, iz_S], dp))
+            djk = NORM2(rk - rj)
+            dik = NORM2(rk - ri)
+            IF (kind_radius_j + kind_radius_k + ctx%dr_jk < djk .OR. &
+                kind_radius_k + kind_radius_i + ctx%dr_ik < dik) CYCLE
+            n_img = n_img + 1
+            img_rj(:, n_img) = rj
+            img_rk(:, n_img) = rk
+            img_dist(:, n_img) = [djk, dij, dik]
+         END DO
+         END DO
+         END DO
+      END DO
+      END DO
+      END DO
+      any_kept = n_img > 0
+
+      DO iset = 1, nseti
+         DO jset = 1, nsetj
+            DO kset = 1, nsetk
+               ncoi = npgfi(iset)*ncoset(lmax_i(iset))
+               ncoj = npgfj(jset)*ncoset(lmax_j(jset))
+               ncok = npgfk(kset)*ncoset(lmax_k(kset))
+               IF (ncoj*ncok*ncoi <= 0) CYCLE
+
+               ! Σ over the images of the primitive integrals of this set triple
+               n_used = 0
+               DO img = 1, n_img
+                  djk = img_dist(1, img)
+                  dij = img_dist(2, img)
+                  dik = img_dist(3, img)
+                  IF (set_radius_j(jset) + set_radius_i(iset) + ctx%dr_ij < dij) CYCLE
+                  IF (set_radius_j(jset) + set_radius_k(kset) + ctx%dr_jk < djk) CYCLE
+                  IF (set_radius_k(kset) + set_radius_i(iset) + ctx%dr_ik < dik) CYCLE
+                  IF (n_used == 0) THEN
+                     ALLOCATE (sijk(ncoj, ncok, ncoi), sijk_sum(ncoj, ncok, ncoi))
+                     sijk_sum(:, :, :) = 0.0_dp
+                  END IF
+                  n_used = n_used + 1
+                  ! compute_coulomb_3c writes only the primitives that pass its own screen
+                  sijk(:, :, :) = 0.0_dp
+                  CALL compute_coulomb_3c(ws%integrals, lmin_j(jset), lmax_j(jset), lmin_k(kset), lmax_k(kset), &
+                                          lmin_i(iset), lmax_i(iset), npgfj(jset), npgfk(kset), npgfi(iset), &
+                                          zetj(:, jset), zetk(:, kset), zeti(:, iset), rpgf_j(:, jset), &
+                                          rpgf_k(:, kset), rpgf_i(:, iset), img_rj(:, img), img_rk(:, img), ri, &
+                                          sijk, ctx%potential_parameter, dab=djk, dac=dij, dbc=dik)
+                  sijk_sum(:, :, :) = sijk_sum(:, :, :) + sijk(:, :, :)
+               END DO
+               IF (n_used == 0) CYCLE
+
+               ALLOCATE (sijk_contr(nsgfj(jset), nsgfk(kset), nsgfi(iset)))
+               CALL abc_contract_xsmm(sijk_contr, sijk_sum, ctx%tspj(jset, jkind)%array, &
+                                      ctx%spk(kset, kkind)%array, ctx%spi(iset, ikind)%array, &
+                                      ncoj, ncok, ncoi, nsgfj(jset), nsgfk(kset), &
+                                      nsgfi(iset), ws%cpp_buffer, ws%ccp_buffer)
+               DEALLOCATE (sijk, sijk_sum)
+
+               sgfi = first_sgf_i(1, iset)
+               sgfj = first_sgf_j(1, jset)
+               sgfk = first_sgf_k(1, kset)
+               int_3c(sgfj:sgfj + nsgfj(jset) - 1, sgfk:sgfk + nsgfk(kset) - 1, sgfi:sgfi + nsgfi(iset) - 1) = &
+                  int_3c(sgfj:sgfj + nsgfj(jset) - 1, sgfk:sgfk + nsgfk(kset) - 1, sgfi:sgfi + nsgfi(iset) - 1) + &
+                  sijk_contr(:, :, :)
+               DEALLOCATE (sijk_contr)
+            END DO
+         END DO
+      END DO
+
+      DEALLOCATE (img_rj, img_rk, img_dist)
+
+   END SUBROUTINE build_3c_integral_block_images
 
 ! **************************************************************************************************
 !> \brief ...

@@ -152,7 +152,7 @@ CONTAINS
 
       unit_nr = bs_env%unit_nr
       IF (unit_nr > 0) THEN
-         WRITE (unit_nr, '(T2,A)') 'Started RI-RS grid optimization'
+         WRITE (unit_nr, '(/,T2,A)') 'Started RI-RS grid optimization'
          CALL m_flush(unit_nr)
       END IF
    END SUBROUTINE prepare_ri_rs_grid_optimization
@@ -183,10 +183,8 @@ CONTAINS
       LOGICAL, INTENT(OUT)                               :: fit_successful
       REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: max_abs_error
 
-      INTEGER                                            :: evaluated_cluster_count, iatom, &
-                                                            icluster, ilocal, jatom, metadata(2), &
-                                                            ngroups, nvalues, root, &
-                                                            successful_ranks
+      INTEGER :: evaluated_cluster_count, iatom, icluster, ilocal, jatom, jcenter, metadata(2), &
+         ncenters, ngroups, nvalues, root, successful_ranks
       INTEGER, ALLOCATABLE                               :: cluster_atoms(:), gradient_offsets(:)
       LOGICAL                                            :: cluster_fit_successful
       REAL(KIND=dp)                                      :: cluster_max_abs_error, &
@@ -244,7 +242,8 @@ CONTAINS
       CALL para_env%sum(evaluated_cluster_count)
       CALL para_env%sum(successful_ranks)
       IF (PRESENT(max_abs_error)) CALL para_env%max(max_abs_error)
-      fit_successful = evaluated_cluster_count == bs_env%n_atom .AND. &
+      ncenters = SIZE(bs_env%ri_rs%grid_opt%grid_centers)
+      fit_successful = evaluated_cluster_count == ncenters .AND. &
                        successful_ranks == para_env%num_pe
       IF (.NOT. fit_successful) THEN
          normalized_error = HUGE(normalized_error)
@@ -252,10 +251,10 @@ CONTAINS
          RETURN
       END IF
       ! Add complete cluster contributions in atom order, independent of the rank assignment.
-      ngroups = MIN(bs_env%n_atom, para_env%num_pe)
-      DO iatom = 1, bs_env%n_atom
-         root = MOD(iatom - 1, ngroups)
-         ilocal = (iatom - 1)/ngroups + 1
+      ngroups = MIN(ncenters, para_env%num_pe)
+      DO jcenter = 1, ncenters
+         root = MOD(jcenter - 1, ngroups)
+         ilocal = (jcenter - 1)/ngroups + 1
          IF (para_env%mepos == root) THEN
             metadata = [SIZE(cluster_3c_int(ilocal)%atom_indices), &
                         gradient_offsets(ilocal + 1) - gradient_offsets(ilocal)]
@@ -278,8 +277,10 @@ CONTAINS
          DEALLOCATE (cluster_atoms, cluster_coordinate_gradient)
       END DO
       ! E_loc(norm) = (1/N_atom) Σ_A [E_A / Σ_{μνP ∈ C_A} |(μν|P)|²].
-      normalized_error = normalized_error/REAL(bs_env%n_atom, dp)
-      coordinate_gradient = coordinate_gradient/REAL(bs_env%n_atom, dp)
+      ! With tied grids of the translation orbits, E_{A+t} = E_A, so the average over the
+      ! representatives is the same E_loc.
+      normalized_error = normalized_error/REAL(ncenters, dp)
+      coordinate_gradient = coordinate_gradient/REAL(ncenters, dp)
    END SUBROUTINE grid_objective
 
 ! **************************************************************************************************
@@ -318,8 +319,8 @@ CONTAINS
 
       start_time = m_walltime()
 
-      CALL pack_lbfgs_grid_coordinates(bs_env%ri_rs%atomic_grids, grid_coordinates, &
-                                       atom_coordinate_offsets)
+      CALL pack_lbfgs_grid_coordinates(bs_env%ri_rs%atomic_grids, bs_env%ri_rs%grid_opt%grid_rep, &
+                                       grid_coordinates, atom_coordinate_offsets)
       CPASSERT(SIZE(grid_coordinates) > 0)
 
       ALLOCATE (best_grid_coordinates(SIZE(grid_coordinates)), &
@@ -370,6 +371,7 @@ CONTAINS
             IF (evaluation_count == 1 .AND. bs_env%unit_nr > 0) THEN
                WRITE (bs_env%unit_nr, '(T2,A,T61,ES20.12)') &
                   'RI-RS grid initial normalized error', normalized_error
+               WRITE (bs_env%unit_nr, '(A)') ' '
             END IF
             IF (bs_env%unit_nr > 0) THEN
                IF (bs_env%ri_rs%grid_opt%max_iter < 50 .OR. &
@@ -417,11 +419,15 @@ CONTAINS
          DO iatom = 1, SIZE(bs_env%ri_rs%atomic_grids)
             npoints = npoints + bs_env%ri_rs%atomic_grids(iatom)%npts
          END DO
+         WRITE (unit_nr, '(A)') ' '
          WRITE (unit_nr, '(T2,A,T72,ES9.1)') 'Normalized 3C error:', normalized_error
          WRITE (unit_nr, '(T2,A,T72,ES9.1)') 'Maximum absolute 3C error:', max_abs_error
+         WRITE (unit_nr, '(A)') ' '
          WRITE (unit_nr, '(T2,A,T69,I12)') 'Total grid points used for RI-RS:', npoints
-         WRITE (unit_nr, '(T2,A,T69,F10.1,A)') &
-            'RI-RS grid optimization completed, Exec. time:', m_walltime() - start_time, ' s'
+         WRITE (unit_nr, '(A)') ' '
+         WRITE (unit_nr, '(T2,A,T58,A,F7.1,A)') &
+            'RI-RS grid optimization completed,', 'Execution time', m_walltime() - start_time, ' s'
+         WRITE (unit_nr, '(A)') ' '
          FLUSH (unit_nr)
       END IF
 
@@ -444,7 +450,8 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_cluster_3c_int'
 
       INTEGER :: first_ri, handle, iatom, icenter, icluster, iimage, ij, ik, ikind, imu, inu, ip, &
-         jatom, katom, last_ri, my_group, nao, ngroups, nlocal, nri, p_first, p_last, patom
+         jatom, jcenter, katom, last_ri, my_group, nao, ncenters, ngroups, nlocal, nri, p_first, &
+         p_last, patom
       INTEGER, ALLOCATABLE                               :: ao_offset(:), cells(:, :), ri_offset(:), &
                                                             sizes_ri(:)
       REAL(KIND=dp)                                      :: available_GB, integral_bytes, &
@@ -455,11 +462,14 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      ngroups = MIN(bs_env%n_atom, bs_env%para_env%num_pe)
+      ! Clusters C_A only around the representatives A of the translation orbits: the clusters
+      ! of the images are translated copies and contribute identical E_A.
+      ncenters = SIZE(bs_env%ri_rs%grid_opt%grid_centers)
+      ngroups = MIN(ncenters, bs_env%para_env%num_pe)
       my_group = MOD(bs_env%para_env%mepos, ngroups)
       ALLOCATE (atom_env)
       CALL atom_env%from_split(bs_env%para_env, my_group)
-      nlocal = COUNT([(MOD(icenter - 1, ngroups) == my_group, icenter=1, bs_env%n_atom)])
+      nlocal = COUNT([(MOD(jcenter - 1, ngroups) == my_group, jcenter=1, ncenters)])
       ALLOCATE (cluster_3c_int(nlocal), sizes_ri(bs_env%n_atom))
       DO iatom = 1, bs_env%n_atom
          ikind = bs_env%ri_rs%particle_set(iatom)%atomic_kind%kind_number
@@ -472,8 +482,9 @@ CONTAINS
       CALL mp_mem_avail_per_rank_GB(bs_env%para_env, available_GB)
       resident_bytes = 0.0_dp
       icluster = 0
-      DO icenter = 1, bs_env%n_atom
-         IF (MOD(icenter - 1, ngroups) /= my_group) CYCLE
+      DO jcenter = 1, ncenters
+         IF (MOD(jcenter - 1, ngroups) /= my_group) CYCLE
+         icenter = bs_env%ri_rs%grid_opt%grid_centers(jcenter)
          icluster = icluster + 1
          CALL get_rirs_cluster_atoms(bs_env%ri_rs%particle_set, bs_env%ri_rs%cell, icenter, &
                                      bs_env%ri_rs%grid_opt%cutoff_atomic_cluster, &
@@ -666,31 +677,42 @@ CONTAINS
    END SUBROUTINE accumulate_atom_gradient
 
 ! **************************************************************************************************
-!> \brief Pack all atom-centred grids into the single Cartesian vector required by L-BFGS.
+!> \brief Pack the atom-centred grids into the single Cartesian vector required by L-BFGS.
 !> \param grids Atom-centred RI-RS grids.
+!> \param grid_rep Representative atom of the translation orbit of every atom.
 !> \param grid_coordinates Flattened atom-relative grid coordinates.
 !> \param atom_coordinate_offsets Starting coordinate offset for each atom.
 !>
-!> SIZE(grid_coordinates) = 3 Σ_A N_grid,A. Coordinates are ordered Cartesian component first,
-!> then grid point, then atom, matching the column-major layout of raw_points(3,N_grid,A).
+!> Only representatives A = grid_rep(A) own coordinates, SIZE(grid_coordinates) =
+!> 3 Σ_{A=rep(A)} N_grid,A; an image shares the slot of its representative.
+!> Coordinates are ordered Cartesian component first, then grid point, then atom, matching
+!> the column-major layout of raw_points(3,N_grid,A).
 ! **************************************************************************************************
-   SUBROUTINE pack_lbfgs_grid_coordinates(grids, grid_coordinates, atom_coordinate_offsets)
+   SUBROUTINE pack_lbfgs_grid_coordinates(grids, grid_rep, grid_coordinates, atom_coordinate_offsets)
       TYPE(rirs_grid_type), DIMENSION(:), INTENT(IN)     :: grids
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: grid_rep
       REAL(KIND=dp), ALLOCATABLE, INTENT(OUT)            :: grid_coordinates(:)
       INTEGER, ALLOCATABLE, INTENT(OUT)                  :: atom_coordinate_offsets(:)
 
       INTEGER                                            :: atom_coordinate_count, iatom, &
                                                             n_grid_coordinates
 
+      CPASSERT(SIZE(grid_rep) == SIZE(grids))
       ALLOCATE (atom_coordinate_offsets(SIZE(grids)))
       n_grid_coordinates = 0
       DO iatom = 1, SIZE(grids)
+         IF (grid_rep(iatom) /= iatom) CYCLE
          atom_coordinate_offsets(iatom) = n_grid_coordinates
          n_grid_coordinates = n_grid_coordinates + SIZE(grids(iatom)%raw_points)
+      END DO
+      ! grid_rep(A) <= A, so the representative's offset is already set.
+      DO iatom = 1, SIZE(grids)
+         atom_coordinate_offsets(iatom) = atom_coordinate_offsets(grid_rep(iatom))
       END DO
       ALLOCATE (grid_coordinates(n_grid_coordinates))
 
       DO iatom = 1, SIZE(grids)
+         IF (grid_rep(iatom) /= iatom) CYCLE
          atom_coordinate_count = SIZE(grids(iatom)%raw_points)
          grid_coordinates(atom_coordinate_offsets(iatom) + 1: &
                           atom_coordinate_offsets(iatom) + atom_coordinate_count) = &
@@ -739,14 +761,14 @@ CONTAINS
 
       CHARACTER(LEN=10)                                  :: count_text, error_text, max_iter_text
       CHARACTER(LEN=64)                                  :: progress_line
-      CHARACTER(LEN=8)                                   :: evaluation_text
+      CHARACTER(LEN=7)                                   :: evaluation_text
       INTEGER                                            :: iexponent
 
       WRITE (max_iter_text, '(I0)') max_iter
       WRITE (count_text, '(I10)') evaluation_count
       count_text = count_text(11 - LEN_TRIM(max_iter_text):)
-      WRITE (evaluation_text, '(F8.1)') evaluation_time
-      IF (INDEX(evaluation_text, '*') > 0) WRITE (evaluation_text, '(ES8.1E3)') evaluation_time
+      WRITE (evaluation_text, '(F7.1)') evaluation_time
+      IF (INDEX(evaluation_text, '*') > 0) WRITE (evaluation_text, '(ES7.1)') evaluation_time
       IF (evaluation_successful) THEN
          WRITE (error_text, '(ES10.1E3)') normalized_error
          error_text = ADJUSTL(error_text)
@@ -761,8 +783,8 @@ CONTAINS
       END IF
       progress_line = 'RI-RS grid eval '//TRIM(count_text)//' / '//TRIM(max_iter_text)// &
                       ',   3C error: '//TRIM(ADJUSTL(error_text))
-      IF (LEN_TRIM(progress_line) > 56) progress_line = 'RI-RS eval '//progress_line(16:)
-      WRITE (unit_nr, '(T2,A,T59,A,A,A)') TRIM(progress_line), 'Exec. time: ', evaluation_text, ' s'
+      IF (LEN_TRIM(progress_line) > 55) progress_line = 'RI-RS eval '//progress_line(16:)
+      WRITE (unit_nr, '(T2,A,T58,A,A,A)') TRIM(progress_line), 'Execution time', evaluation_text, ' s'
       CALL m_flush(unit_nr)
    END SUBROUTINE write_ri_rs_grid_progress
 

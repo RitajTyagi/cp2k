@@ -2516,6 +2516,20 @@ CONTAINS
       CALL add_eps_filter_keyword(section)
       CALL add_ri_keywords(section)
 
+      CALL keyword_create(keyword, __LOCATION__, name="REGULARIZATION_RI_CORRECTION", &
+                          description="Relative eigenvalue cut of the RI metric applied only by "// &
+                          "the Gamma-point correction of W (Gamma-only RI-RS GW). "// &
+                          "Metric eigenvectors with eigenvalues between "// &
+                          "REGULARIZATION_RI and this value times the largest eigenvalue are "// &
+                          "kept in the dielectric function, in the fold of W and in the exchange "// &
+                          "self-energy, and left out of the correction. A value at or below "// &
+                          "REGULARIZATION_RI makes the correction use the same pseudo-inverse as "// &
+                          "the regular terms.", &
+                          usage="REGULARIZATION_RI_CORRECTION 1.0E-4", &
+                          default_r_val=1.0E-4_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="MEMORY_PER_PROC", &
                           description="Specify the available memory per MPI process (in GB). The "// &
                           "default value -1 means that the available memory per MPI process is detected "// &
@@ -2558,7 +2572,10 @@ CONTAINS
          "For non-periodic directions α, choose N_α = 1. "// &
          "Automatic choice of the k-point mesh for negative "// &
          "values, i.e. KPOINTS_W -1 -1 -1. "// &
-         "K-point extrapolation of W is automatically switched on.", &
+         "K-point extrapolation of W is automatically switched on. "// &
+         "Gamma-only RI-RS GW (periodic cell without k-points in the SCF) always uses "// &
+         "KPOINTS_W 1 1 1 with the Gamma-point correction; that is its default, and any other "// &
+         "mesh is rejected.", &
          usage="KPOINTS_W N_x  N_y  N_z", &
          n_var=3, type_of_var=integer_t, default_i_vals=[-1, -1, -1])
       CALL section_add_keyword(section, keyword)
@@ -2935,7 +2952,10 @@ CONTAINS
          "mesh for the self-energy. For non-periodic directions α, choose N_α = 1. "// &
          "Automatic choice of the k-point mesh for negative "// &
          "values, i.e. KPOINTS_DOS -1 -1 -1 (automatic choice: N_α = 1 in non-periodic "// &
-         "direction, 8 k-points in periodic direction). If you like to compute a "// &
+         "direction, 2 k-points in periodic direction). The quasiparticle step of the "// &
+         "large-cell Gamma GW computes the self-energy at every point of this mesh and of "// &
+         "the band-structure path, so for a Gamma-only result use KPOINTS 1 1 1. The "// &
+         "small-cell full-k GW uses the SCF k-points instead. If you like to compute a "// &
          "band structure along a k-path, you can specify the k-path in "// &
          "&KPOINT_SET.", &
          usage="KPOINTS N_x  N_y  N_z", &

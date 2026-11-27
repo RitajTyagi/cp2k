@@ -13,13 +13,15 @@ MODULE ri_rs_types
    USE cell_types,                      ONLY: cell_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_release,&
                                               dbcsr_type
+   USE cp_fm_types,                     ONLY: cp_fm_release,&
+                                              cp_fm_type
    USE kinds,                           ONLY: dp
    USE particle_types,                  ONLY: particle_type
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
    PRIVATE
-   PUBLIC :: ri_rs_env, ri_rs_grid_opt_type, rirs_grid_type, ri_rs_release
+   PUBLIC :: ri_rs_env, ri_rs_grid_opt_type, rirs_grid_type, ri_rs_release, gamma_corr_type
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'ri_rs_types'
 
@@ -29,12 +31,55 @@ MODULE ri_rs_types
       REAL(KIND=dp), ALLOCATABLE :: raw_points(:, :)
    END TYPE rirs_grid_type
 
+   TYPE gamma_corr_type
+      LOGICAL                                          :: enabled = .FALSE.
+      LOGICAL                                          :: slab = .TRUE.
+      LOGICAL                                          :: ready = .FALSE.
+      REAL(KIND=dp)                                    :: metric_cut = 1.0E-4_dp
+      REAL(KIND=dp)                                    :: wall_time = 0.0_dp
+      REAL(KIND=dp)                                    :: measure = 0.0_dp
+      REAL(KIND=dp), DIMENSION(3, 3)                   :: b_recip = 0.0_dp
+      REAL(KIND=dp)                                    :: ewald_omega = 0.0_dp
+      LOGICAL                                          :: V_zero_cached = .FALSE.
+      TYPE(cp_fm_type)                                 :: fm_V_zero = cp_fm_type()
+      REAL(KIND=dp), ALLOCATABLE                       :: charge(:)
+      REAL(KIND=dp)                                    :: charge_norm = 0.0_dp
+      TYPE(cp_fm_type)                                 :: fm_F_density = cp_fm_type()
+      TYPE(cp_fm_type)                                 :: fm_G_extern = cp_fm_type()
+      REAL(KIND=dp), ALLOCATABLE                       :: T_RI(:, :, :)
+      REAL(KIND=dp), ALLOCATABLE                       :: S_head(:, :, :)
+      INTEGER, DIMENSION(2)                            :: n_tab = 0
+      REAL(KIND=dp), ALLOCATABLE                       :: K_head(:, :), K_wing(:, :, :)
+      REAL(KIND=dp), ALLOCATABLE                       :: K_head1(:, :), K_head2(:, :), &
+                                                          K_wing1(:, :, :)
+      INTEGER                                          :: q_form = 0
+      REAL(KIND=dp), ALLOCATABLE                       :: q_par(:, :)
+      INTEGER                                          :: n_class = 0, n_tab_rem = 0
+      INTEGER, ALLOCATABLE                             :: atom_class(:)
+      REAL(KIND=dp), ALLOCATABLE                       :: K_rem_head(:, :, :), K_rem_wing(:, :, :, :)
+      REAL(KIND=dp), ALLOCATABLE                       :: dir_hat(:, :), dir_radius(:)
+      REAL(KIND=dp), ALLOCATABLE                       :: head_pot_freq(:)
+      REAL(KIND=dp)                                    :: q_max = 0.0_dp
+      REAL(KIND=dp), ALLOCATABLE                       :: A_wing(:, :, :), B_hd(:, :, :)
+      REAL(KIND=dp)                                    :: xi_madelung = 0.0_dp
+      LOGICAL                                          :: tail_3d = .TRUE.
+      REAL(KIND=dp), ALLOCATABLE                       :: tail_factor(:)
+      TYPE(cp_fm_type)                                 :: fm_K_tail = cp_fm_type()
+      INTEGER                                          :: n_low = 0
+      TYPE(cp_fm_type)                                 :: fm_U_low = cp_fm_type()
+      REAL(KIND=dp), ALLOCATABLE                       :: m_low(:)
+      REAL(KIND=dp), ALLOCATABLE                       :: eigenval_dipole(:, :)
+      REAL(KIND=dp), ALLOCATABLE                       :: head_gamma(:)
+   END TYPE gamma_corr_type
+
    ! User input for the in-memory RI-RS grid optimization.
    TYPE ri_rs_grid_opt_type
       LOGICAL                                          :: enabled = .FALSE.
       REAL(KIND=dp)                                    :: cutoff_atomic_cluster = -1.0_dp
       REAL(KIND=dp)                                    :: rs_ao_ratio = -1.0_dp
       INTEGER                                          :: max_iter = 20
+      LOGICAL                                          :: reproducible_ties = .TRUE.
+      INTEGER, ALLOCATABLE                             :: grid_rep(:), grid_centers(:)
    END TYPE ri_rs_grid_opt_type
 
    TYPE ri_rs_env
@@ -56,9 +101,10 @@ MODULE ri_rs_types
       ! Data types for cutoffs based DBCSR matrices
       REAL(KIND=dp), ALLOCATABLE                       :: chunk_centroids(:, :)
       INTEGER, ALLOCATABLE                             :: grid_atom_boundaries(:)
+      INTEGER, ALLOCATABLE                             :: grid_atom_order(:)
       INTEGER, ALLOCATABLE                             :: pan_first(:), pan_last(:)
-      ! Panel plans share a fixed grid, process layout and message limit until release.
       REAL(KIND=dp)                                    :: panel_plan_cutoff = 0.0_dp
+      REAL(KIND=dp)                                    :: panel_reserve_GB = 0.0_dp
 
       ! Atom-specific grids used directly by the grid assembler
       TYPE(rirs_grid_type), ALLOCATABLE                :: atomic_grids(:)
@@ -100,6 +146,8 @@ MODULE ri_rs_types
       LOGICAL                                          :: V_grid_built = .FALSE.
       LOGICAL                                          :: W0_grid_built = .FALSE.
 
+      TYPE(gamma_corr_type)                            :: gamma_corr = gamma_corr_type()
+
    END TYPE ri_rs_env
 
 CONTAINS
@@ -127,10 +175,13 @@ CONTAINS
       END IF
       IF (ALLOCATED(ri_rs%grid_points)) DEALLOCATE (ri_rs%grid_points)
       IF (ALLOCATED(ri_rs%atomic_grids)) DEALLOCATE (ri_rs%atomic_grids)
+      IF (ALLOCATED(ri_rs%grid_opt%grid_rep)) DEALLOCATE (ri_rs%grid_opt%grid_rep)
+      IF (ALLOCATED(ri_rs%grid_opt%grid_centers)) DEALLOCATE (ri_rs%grid_opt%grid_centers)
       IF (ALLOCATED(ri_rs%radius_ao_per_atom)) DEALLOCATE (ri_rs%radius_ao_per_atom)
       IF (ALLOCATED(ri_rs%radius_ri_per_atom)) DEALLOCATE (ri_rs%radius_ri_per_atom)
       IF (ALLOCATED(ri_rs%chunk_centroids)) DEALLOCATE (ri_rs%chunk_centroids)
       IF (ALLOCATED(ri_rs%grid_atom_boundaries)) DEALLOCATE (ri_rs%grid_atom_boundaries)
+      IF (ALLOCATED(ri_rs%grid_atom_order)) DEALLOCATE (ri_rs%grid_atom_order)
       IF (ALLOCATED(ri_rs%pan_first)) DEALLOCATE (ri_rs%pan_first)
       IF (ALLOCATED(ri_rs%pan_last)) DEALLOCATE (ri_rs%pan_last)
       ri_rs%panel_plan_cutoff = 0.0_dp
@@ -141,6 +192,38 @@ CONTAINS
       ri_rs%grid_built = .FALSE.
       ri_rs%V_grid_built = .FALSE.
       ri_rs%W0_grid_built = .FALSE.
+
+      IF (ri_rs%gamma_corr%V_zero_cached) THEN
+         CALL cp_fm_release(ri_rs%gamma_corr%fm_V_zero)
+         ri_rs%gamma_corr%V_zero_cached = .FALSE.
+      END IF
+      IF (ALLOCATED(ri_rs%gamma_corr%charge)) DEALLOCATE (ri_rs%gamma_corr%charge)
+      CALL cp_fm_release(ri_rs%gamma_corr%fm_F_density)
+      CALL cp_fm_release(ri_rs%gamma_corr%fm_G_extern)
+      IF (ALLOCATED(ri_rs%gamma_corr%T_RI)) DEALLOCATE (ri_rs%gamma_corr%T_RI)
+      IF (ALLOCATED(ri_rs%gamma_corr%S_head)) DEALLOCATE (ri_rs%gamma_corr%S_head)
+      IF (ALLOCATED(ri_rs%gamma_corr%K_head)) DEALLOCATE (ri_rs%gamma_corr%K_head)
+      IF (ALLOCATED(ri_rs%gamma_corr%K_wing)) DEALLOCATE (ri_rs%gamma_corr%K_wing)
+      IF (ALLOCATED(ri_rs%gamma_corr%K_head1)) DEALLOCATE (ri_rs%gamma_corr%K_head1)
+      IF (ALLOCATED(ri_rs%gamma_corr%K_head2)) DEALLOCATE (ri_rs%gamma_corr%K_head2)
+      IF (ALLOCATED(ri_rs%gamma_corr%K_wing1)) DEALLOCATE (ri_rs%gamma_corr%K_wing1)
+      IF (ALLOCATED(ri_rs%gamma_corr%q_par)) DEALLOCATE (ri_rs%gamma_corr%q_par)
+      IF (ALLOCATED(ri_rs%gamma_corr%atom_class)) DEALLOCATE (ri_rs%gamma_corr%atom_class)
+      IF (ALLOCATED(ri_rs%gamma_corr%K_rem_head)) DEALLOCATE (ri_rs%gamma_corr%K_rem_head)
+      IF (ALLOCATED(ri_rs%gamma_corr%K_rem_wing)) DEALLOCATE (ri_rs%gamma_corr%K_rem_wing)
+      IF (ALLOCATED(ri_rs%gamma_corr%dir_hat)) DEALLOCATE (ri_rs%gamma_corr%dir_hat)
+      IF (ALLOCATED(ri_rs%gamma_corr%dir_radius)) DEALLOCATE (ri_rs%gamma_corr%dir_radius)
+      IF (ALLOCATED(ri_rs%gamma_corr%head_pot_freq)) DEALLOCATE (ri_rs%gamma_corr%head_pot_freq)
+      IF (ALLOCATED(ri_rs%gamma_corr%A_wing)) DEALLOCATE (ri_rs%gamma_corr%A_wing)
+      IF (ALLOCATED(ri_rs%gamma_corr%B_hd)) DEALLOCATE (ri_rs%gamma_corr%B_hd)
+      IF (ALLOCATED(ri_rs%gamma_corr%tail_factor)) DEALLOCATE (ri_rs%gamma_corr%tail_factor)
+      CALL cp_fm_release(ri_rs%gamma_corr%fm_K_tail)
+      CALL cp_fm_release(ri_rs%gamma_corr%fm_U_low)
+      IF (ALLOCATED(ri_rs%gamma_corr%m_low)) DEALLOCATE (ri_rs%gamma_corr%m_low)
+      ri_rs%gamma_corr%n_low = 0
+      IF (ALLOCATED(ri_rs%gamma_corr%eigenval_dipole)) DEALLOCATE (ri_rs%gamma_corr%eigenval_dipole)
+      IF (ALLOCATED(ri_rs%gamma_corr%head_gamma)) DEALLOCATE (ri_rs%gamma_corr%head_gamma)
+      ri_rs%gamma_corr%ready = .FALSE.
 
       CALL timestop(handle)
 

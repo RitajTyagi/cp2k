@@ -17,6 +17,7 @@ MODULE ri_rs_fitting
    USE cp_fm_cholesky,                  ONLY: cp_fm_cholesky_decompose,&
                                               cp_fm_cholesky_solve
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
+                                              cp_fm_struct_get,&
                                               cp_fm_struct_release,&
                                               cp_fm_struct_type
    USE cp_fm_types,                     ONLY: cp_fm_create,&
@@ -499,7 +500,7 @@ CONTAINS
             loc_ptr = loc_ptr + 1
          END DO
 
-         ! DBCSR routes each retained block to its global owner when the caller finalizes mat_Z_lP.
+         ! The block stays on this rank; compute_Z_lP moves it to its owner (place_blocks_on_owners).
          IF (MAXVAL(ABS(Z_blk(1:current_chunk_size, 1:n_loc_ri))) > eps_filter) THEN
             CALL dbcsr_put_block(mat_Z_lP, row=i_blk, col=atom_P, &
                                  block=Z_blk(1:current_chunk_size, 1:n_loc_ri))
@@ -541,7 +542,7 @@ CONTAINS
 
       INTEGER                                            :: handle, i_loc, ig, info, j_loc, jg, &
                                                             n_ao, n_loc, n_rhs, ncol_local, &
-                                                            nrow_local
+                                                            nrow_block_D, nrow_local
       INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
       REAL(KIND=dp), CONTIGUOUS, DIMENSION(:, :), &
          POINTER                                         :: local_data
@@ -557,9 +558,12 @@ CONTAINS
       CALL cp_fm_struct_create(fm_struct_D, para_env=para_env_sub, &
                                context=blacs_env_sub, &
                                nrow_global=n_loc, ncol_global=n_loc)
+      CALL cp_fm_struct_get(fm_struct_D, nrow_block=nrow_block_D)
       CALL cp_fm_struct_create(fm_struct_b, para_env=para_env_sub, &
                                context=blacs_env_sub, &
-                               nrow_global=n_loc, ncol_global=n_rhs)
+                               nrow_global=n_loc, ncol_global=n_rhs, &
+                               nrow_block=nrow_block_D, ncol_block=nrow_block_D, &
+                               square_blocks=.FALSE., force_block=.TRUE.)
       CALL cp_fm_create(fm_D, fm_struct_D)
       CALL cp_fm_create(fm_b, fm_struct_b)
 

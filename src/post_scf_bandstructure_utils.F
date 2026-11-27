@@ -3401,7 +3401,7 @@ CONTAINS
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_from_bf_index
       INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
       INTEGER, DIMENSION(:, :), POINTER                  :: index_to_cell
-      REAL(KIND=dp)                                      :: contribution, weight_im, weight_re, &
+      REAL(KIND=dp)                                      :: contribution, phase_im, phase_re, &
                                                             wkp_of_ikp
       REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat
       REAL(KIND=dp), DIMENSION(:), POINTER               :: wkp
@@ -3465,10 +3465,14 @@ CONTAINS
                END SELECT
             END IF
 
+            ! Minimum-image phase of the atom pair for unit weight, cached per atom pair:
+            !   phase_re + i phase_im = (1/n) sum_{R equidistant} exp(2 pi i k.R) .
+            ! The k-point weight depends on l_P + l_Q, so it is applied per matrix element:
+            !   W^MIC_PQ += w_k(l_P + l_Q) * [phase_re Re W_PQ(k) + phase_im Im W_PQ(k)] .
             IF (iatom /= iatom_old .OR. jatom /= jatom_old) THEN
 
-               CALL compute_weight_re_im(weight_re, weight_im, &
-                                         num_cells, iatom, jatom, xkp(1:3, ikp), wkp_of_ikp, &
+               CALL compute_weight_re_im(phase_re, phase_im, &
+                                         num_cells, iatom, jatom, xkp(1:3, ikp), 1.0_dp, &
                                          cell, index_to_cell, hmat, particle_set)
 
                iatom_old = iatom
@@ -3476,8 +3480,8 @@ CONTAINS
 
             END IF
 
-            contribution = weight_re*REAL(cfm_W_ikp_freq_j%local_data(irow, jcol)) + &
-                           weight_im*AIMAG(cfm_W_ikp_freq_j%local_data(irow, jcol))
+            contribution = wkp_of_ikp*(phase_re*REAL(cfm_W_ikp_freq_j%local_data(irow, jcol)) + &
+                                       phase_im*AIMAG(cfm_W_ikp_freq_j%local_data(irow, jcol)))
 
             fm_W_MIC_freq_j%local_data(irow, jcol) = fm_W_MIC_freq_j%local_data(irow, jcol) &
                                                      + contribution

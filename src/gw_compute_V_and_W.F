@@ -36,6 +36,7 @@ MODULE gw_compute_V_and_W
    USE cp_fm_basic_linalg,              ONLY: cp_fm_add_on_diag,&
                                               cp_fm_scale_and_add,&
                                               cp_fm_syrk,&
+                                              cp_fm_transpose,&
                                               cp_fm_triangular_multiply,&
                                               cp_fm_uplo_to_full
    USE cp_fm_cholesky,                  ONLY: cp_fm_cholesky_decompose
@@ -55,6 +56,7 @@ MODULE gw_compute_V_and_W
                                               cp_print_key_should_output,&
                                               cp_print_key_unit_nr
    USE distribution_2d_types,           ONLY: distribution_2d_type
+   USE gw_gamma_correction,             ONLY: gamma_corr_add_folded_to_W
    USE gw_utils_fm,                     ONLY: cfm_contract_ABA,&
                                               fm_contract_ABA,&
                                               fm_sqrt
@@ -88,6 +90,8 @@ MODULE gw_compute_V_and_W
    IMPLICIT NONE
    PRIVATE
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_compute_V_and_W'
+   ! a W k-point with all fractional coordinates below eps_kp_gamma is Γ
+   REAL(KIND=dp), PARAMETER, PRIVATE :: eps_kp_gamma = 1.0E-12_dp
    PUBLIC :: compute_W, &
              get_W_MIC, &
              compute_V_k_by_lattice_sum, &
@@ -134,9 +138,9 @@ CONTAINS
       CALL create_fm_W_MIC_time(bs_env, fm_W_time)
 
       ! 1. Allocate V and M matrices
-      CALL cp_fm_create(fm_Minv_V_Minv, bs_env%fm_RI_RI%matrix_struct)
-      CALL cp_fm_create(fm_coulomb_factor, bs_env%fm_RI_RI%matrix_struct)
-      CALL cp_fm_create(fm_Minv_coulomb_factor, bs_env%fm_RI_RI%matrix_struct)
+      CALL cp_fm_create(fm_Minv_V_Minv, bs_env%fm_struct_RI_RI)
+      CALL cp_fm_create(fm_coulomb_factor, bs_env%fm_struct_RI_RI)
+      CALL cp_fm_create(fm_Minv_coulomb_factor, bs_env%fm_struct_RI_RI)
 
       ! Compute V = B^T B and A = M^-1 B^T.
       CALL compute_coulomb_factors(bs_env, qs_env, fm_Minv_V_Minv, fm_coulomb_factor, fm_Minv_coulomb_factor)
@@ -228,11 +232,13 @@ CONTAINS
    END SUBROUTINE get_W_MIC
 
 ! **************************************************************************************************
-!> \brief ...
-!> \param bs_env ...
-!> \param qs_env ...
-!> \param mat_chi_Gamma_tau ...
-!> \param fm_W_MIC_time ...
+!> \brief Screened interaction of a periodic cell on the imaginary-time grid, folded with the
+!>        inverse RI metric at k = 0: W_f(iτ_i) = M⁺(0) W^MIC(iτ_i) M⁺(0) (+ Γ-point correction).
+!>        A W mesh with the single point k = 0 takes the real path compute_W_MIC_Gamma_real.
+!> \param bs_env band-structure environment; time-frequency grid, k mesh, M⁺(0)
+!> \param qs_env QS environment
+!> \param mat_chi_Gamma_tau χ_PQ(iτ_i, k = 0) for every time point; deallocated here
+!> \param fm_W_MIC_time W_f(iτ_i) = M⁺(0) W^MIC(iτ_i) M⁺(0); allocated here
 ! **************************************************************************************************
    SUBROUTINE compute_W_MIC(bs_env, qs_env, mat_chi_Gamma_tau, fm_W_MIC_time)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
@@ -243,20 +249,57 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_W_MIC'
 
       INTEGER                                            :: handle, i_t, ikp, ikp_batch, &
-                                                            ikp_in_batch, j_w
+                                                            ikp_in_batch, j_w, n_batches
+      LOGICAL                                            :: gamma_only
       REAL(KIND=dp)                                      :: t1
       TYPE(cp_cfm_type)                                  :: cfm_M_inv_V_sqrt_ikp, cfm_V_sqrt_ikp
       TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:)       :: cfm_V_kp
+      TYPE(cp_fm_type)                                   :: fm_A
 
       CALL timeset(routineN, handle)
 
-      CALL create_fm_W_MIC_time(bs_env, fm_W_MIC_time)
+      ! 1. A periodic cell whose W mesh is the single point k = 0 (KPOINTS_W 1 1 1, no
+      !    extrapolation mesh) has real χ, V, M, ε and W
+      gamma_only = bs_env%do_periodic .AND. bs_env%nkp_chi_eps_W_orig_plus_extra == 1 .AND. &
+                   .NOT. bs_env%approx_kp_extrapol
+      IF (gamma_only) gamma_only = ALL(ABS(bs_env%kpoints_chi_eps_W%xkp(:, 1)) < eps_kp_gamma)
 
-      DO ikp_batch = 1, bs_env%num_chi_eps_W_batches
+      IF (gamma_only) THEN
 
          t1 = m_walltime()
 
-         ! Compute V_PQ(k) = sum_R e^(ikR) <phi_P, cell 0 | 1/r | phi_Q, cell R>
+         ! 2a. Γ-only path, real arithmetic:
+         !       A = M⁺(0) Bᵀ,  Bᵀ B = V(0)
+         !       ε(iω_j) = Id + Aᵀ χ(iω_j) A,  W_f(iω_j) = A (ε⁻¹(iω_j) − Id) Aᵀ
+         !       W_f(iτ_i) = Σ_j T^(ω→τ)_ij W_f(iω_j)
+         !     χ(iτ) is released and W_f(iτ) created in its place.
+         CALL compute_coulomb_factor_Gamma(bs_env, qs_env, fm_A)
+         CALL compute_W_MIC_Gamma_real(bs_env, mat_chi_Gamma_tau, fm_A, fm_W_MIC_time)
+
+         IF (bs_env%unit_nr > 0) THEN
+            WRITE (bs_env%unit_nr, '(T2,A,T58,A,F7.1,A)') &
+               'Computed W(iτ,k=0),', ' Execution time', m_walltime() - t1, ' s'
+         END IF
+
+         ! the k-point loop of step 2b is not entered
+         n_batches = 0
+
+      ELSE
+
+         CALL create_fm_W_MIC_time(bs_env, fm_W_MIC_time)
+         n_batches = bs_env%num_chi_eps_W_batches
+
+      END IF
+
+      DO ikp_batch = 1, n_batches
+
+         t1 = m_walltime()
+
+         ! 2b. k-point path, per batch of k points and per frequency ω_j:
+         !       V_PQ(k) = Σ_R e^(ik·R) (P, cell 0 | 1/r | Q, cell R)
+         !       ε(iω_j, k) = Id + V^½(k) M⁻¹(k) χ(iω_j, k) M⁻¹(k) V^½(k)
+         !       W(iω_j, k) = V^½(k) (ε⁻¹(iω_j, k) − Id) V^½(k)
+         !       W^MIC(iω_j) += w_k W(iω_j, k) (minimum-image phases), then ω_j → τ_i
          CALL compute_V_k_by_lattice_sum(bs_env, qs_env, cfm_V_kp, ikp_batch)
 
          DO ikp_in_batch = 1, bs_env%nkp_chi_eps_W_batch
@@ -305,16 +348,35 @@ CONTAINS
          CALL apply_extrapol_factor(bs_env, fm_W_MIC_time)
       END IF
 
-      ! M^-1(k=0) W^MIC(iτ) M^-1(k=0) -> fm_W_MIC_time
-      CALL fm_contract_ABA(bs_env%fm_Minv_Gamma, fm_W_MIC_time)
+      IF (gamma_only) THEN
 
+         ! 3a. fm_W_MIC_time holds W_f(iτ) = M⁺ W^MIC(iτ) M⁺ already; the Γ-point correction is
+         !     added in the same folded representation:
+         !       slabs: W_f(iτ) += M⁺_c ΔW(iτ) M⁺_c = F K(iτ) Fᵀ,  F = M⁺_c E  (head and wings)
+         !       bulk:  W_f(iτ) += [Σ_k T^(ω→τ)(1/ε_0(iω_k) − 1)] M⁺ K M⁺  (sphere-tail term;
+         !              head and wings go to Σ^c, gamma_corr_sigma_shifts)
+         IF (bs_env%ri_rs%gamma_corr%enabled) THEN
+            CALL gamma_corr_add_folded_to_W(bs_env, qs_env, fm_W_MIC_time)
+         END IF
+
+      ELSE
+
+         ! 3b. W_f(iτ) = M⁻¹(k=0) W^MIC(iτ) M⁻¹(k=0) -> fm_W_MIC_time (no Γ-point correction)
+         CALL fm_contract_ABA(bs_env%fm_Minv_Gamma, fm_W_MIC_time)
+
+      END IF
+
+      ! 4. Restart files: W_f(iτ_i) per time point, when the print key asks for them
       DO i_t = 1, bs_env%num_time_freq_points
          CALL fm_write(fm_W_MIC_time(i_t), i_t, bs_env%W_time_name, qs_env)
       END DO
 
-      CALL cp_cfm_release(cfm_M_inv_V_sqrt_ikp)
-      CALL cp_cfm_release(cfm_V_sqrt_ikp)
-      CALL dbcsr_deallocate_matrix_set(mat_chi_Gamma_tau)
+      ! (the Γ-only path has released all of these already)
+      IF (.NOT. gamma_only) THEN
+         CALL cp_cfm_release(cfm_M_inv_V_sqrt_ikp)
+         CALL cp_cfm_release(cfm_V_sqrt_ikp)
+         CALL dbcsr_deallocate_matrix_set(mat_chi_Gamma_tau)
+      END IF
 
       ! W^MIC(iω=0) from W^MIC(iτ) for the post-GW consumers; the file is the RT-BSE restart's
       IF (bs_env%rtp_method == rtp_method_bse .OR. &
@@ -332,11 +394,208 @@ CONTAINS
    END SUBROUTINE compute_W_MIC
 
 ! **************************************************************************************************
-!> \brief ...
-!> \param bs_env ...
-!> \param qs_env ...
-!> \param cfm_V_kp ...
-!> \param ikp_batch ...
+!> \brief Folded screened interaction W_f(iτ) = M⁺ W^MIC(iτ) M⁺ for the single-point W mesh k = 0,
+!>        in real arithmetic and in place of χ_PQ(iτ). With Bᵀ B = V(0) and A = M⁺(0) Bᵀ,
+!>        ε(iω) = Id + Aᵀ χ(iω) A and M⁺ W(iω) M⁺ = A (ε⁻¹(iω) − Id) Aᵀ; χ(Γ) is positive
+!>        semidefinite, so no eigenvalue clipping is needed.
+!> \param bs_env band-structure environment; time-frequency grid, work matrices
+!>        fm_chi_Gamma_freq and fm_W_MIC_freq
+!> \param mat_chi_Gamma_tau χ_PQ(iτ_i, k=0) for every time point; deallocated here
+!> \param fm_A A = M⁺(0) Bᵀ from compute_coulomb_factor_Gamma; released here
+!> \param fm_W_MIC_time W_f(iτ_i) = M⁺ W^MIC(iτ_i) M⁺ for every time point; allocated here
+! **************************************************************************************************
+   SUBROUTINE compute_W_MIC_Gamma_real(bs_env, mat_chi_Gamma_tau, fm_A, fm_W_MIC_time)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: mat_chi_Gamma_tau
+      TYPE(cp_fm_type), INTENT(INOUT)                    :: fm_A
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_W_MIC_time
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_W_MIC_Gamma_real'
+
+      INTEGER                                            :: handle, i_t, info, j_w, n_RI, n_t
+      TYPE(cp_fm_type)                                   :: fm_AAt
+
+      CALL timeset(routineN, handle)
+
+      n_RI = bs_env%n_RI
+      n_t = bs_env%num_time_freq_points
+
+      ! 1. A Aᵀ (upper triangle) = M⁺ V(0) M⁺, or M⁺ V_+(0) M⁺ with the positive part V_+ of
+      !    V(0) if its square root came from diagonalization
+      CALL cp_fm_create(fm_AAt, bs_env%fm_struct_RI_RI)
+      CALL cp_fm_syrk('U', 'N', n_RI, 1.0_dp, fm_A, 1, 1, 0.0_dp, fm_AAt)
+
+      ! 2. X_i = χ(iτ_i): dense copy, the sparse original is released at once
+      ALLOCATE (fm_W_MIC_time(n_t))
+      DO i_t = 1, n_t
+         CALL cp_fm_create(fm_W_MIC_time(i_t), bs_env%fm_struct_RI_RI, set_zero=.TRUE.)
+         CALL copy_dbcsr_to_fm(mat_chi_Gamma_tau(i_t)%matrix, fm_W_MIC_time(i_t))
+         CALL dbcsr_deallocate_matrix(mat_chi_Gamma_tau(i_t)%matrix)
+      END DO
+      DEALLOCATE (mat_chi_Gamma_tau)
+
+      ! 3. X_j <- Σ_i T^(τ→ω)_ji X_i = χ(iω_j)
+      CALL transform_fm_set_in_place(fm_W_MIC_time, &
+                                     bs_env%time_frequency_grid%cosine_time_to_frequency)
+
+      ! 4. Per frequency, X_j <- M⁺ W(iω_j) M⁺;
+      !    bs_env%fm_chi_Gamma_freq and bs_env%fm_W_MIC_freq serve as the two work matrices
+      DO j_w = 1, n_t
+
+         ! ε(iω_j) = Id + Aᵀ χ(iω_j) A
+         CALL parallel_gemm('N', 'N', n_RI, n_RI, n_RI, 1.0_dp, fm_W_MIC_time(j_w), fm_A, &
+                            0.0_dp, bs_env%fm_chi_Gamma_freq)
+         CALL parallel_gemm('T', 'N', n_RI, n_RI, n_RI, 1.0_dp, fm_A, bs_env%fm_chi_Gamma_freq, &
+                            0.0_dp, bs_env%fm_W_MIC_freq)
+         CALL cp_fm_add_on_diag(bs_env%fm_W_MIC_freq, 1.0_dp)
+
+         ! ε = Uᵀ U (upper triangle of ε); χ(Γ) is positive semidefinite, so ε ≥ Id
+         CALL cp_fm_cholesky_decompose(bs_env%fm_W_MIC_freq, info_out=info)
+         CPASSERT(info == 0)
+
+         ! Z = U⁻ᵀ Aᵀ, so that Zᵀ Z = A ε⁻¹ Aᵀ
+         CALL cp_fm_transpose(fm_A, bs_env%fm_chi_Gamma_freq)
+         CALL cp_fm_triangular_multiply(bs_env%fm_W_MIC_freq, bs_env%fm_chi_Gamma_freq, side='L', &
+                                        transpose_tr=.TRUE., invert_tr=.TRUE.)
+
+         ! M⁺ W(iω_j) M⁺ = A (ε⁻¹ − Id) Aᵀ = Zᵀ Z − A Aᵀ, written over χ(iω_j)
+         CALL cp_fm_to_fm(fm_AAt, fm_W_MIC_time(j_w))
+         CALL cp_fm_syrk('U', 'T', n_RI, 1.0_dp, bs_env%fm_chi_Gamma_freq, 1, 1, -1.0_dp, &
+                         fm_W_MIC_time(j_w))
+         CALL cp_fm_uplo_to_full(fm_W_MIC_time(j_w), bs_env%fm_chi_Gamma_freq)
+
+      END DO
+
+      CALL cp_fm_release(fm_A)
+      CALL cp_fm_release(fm_AAt)
+
+      ! 5. X_i <- Σ_j T^(ω→τ)_ij X_j = M⁺ W^MIC(iτ_i) M⁺  (k = 0 with weight 1)
+      CALL transform_fm_set_in_place(fm_W_MIC_time, &
+                                     bs_env%time_frequency_grid%cosine_frequency_to_time)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE compute_W_MIC_Gamma_real
+
+! **************************************************************************************************
+!> \brief Linear transformation of a set of full matrices with one layout, in place:
+!>        X_out(P,Q) <- Σ_in T(out, in) X_in(P,Q) for every matrix element (P,Q), e.g. the cosine
+!>        transform between imaginary time and frequency.
+!> \param fm_set the n_set matrices, replaced by their transform
+!> \param transform T(out, in), n_set x n_set
+! **************************************************************************************************
+   SUBROUTINE transform_fm_set_in_place(fm_set, transform)
+      TYPE(cp_fm_type), DIMENSION(:), INTENT(INOUT)      :: fm_set
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: transform
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'transform_fm_set_in_place'
+
+      INTEGER                                            :: handle, i_col, i_in, i_out, n_set, &
+                                                            ncol_local, nrow_local
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: x_in, x_out
+
+      CALL timeset(routineN, handle)
+
+      n_set = SIZE(fm_set)
+      CPASSERT(SIZE(transform, 1) == n_set .AND. SIZE(transform, 2) == n_set)
+      CALL cp_fm_get_info(fm_set(1), nrow_local=nrow_local, ncol_local=ncol_local)
+
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP          SHARED(fm_set, transform, n_set, nrow_local, ncol_local) &
+!$OMP          PRIVATE(i_col, i_in, i_out, x_in, x_out)
+      ALLOCATE (x_in(nrow_local, n_set), x_out(nrow_local, n_set))
+!$OMP DO SCHEDULE(static)
+      DO i_col = 1, ncol_local
+         DO i_in = 1, n_set
+            x_in(:, i_in) = fm_set(i_in)%local_data(1:nrow_local, i_col)
+         END DO
+         DO i_out = 1, n_set
+            x_out(:, i_out) = 0.0_dp
+            DO i_in = 1, n_set
+               x_out(:, i_out) = x_out(:, i_out) + transform(i_out, i_in)*x_in(:, i_in)
+            END DO
+         END DO
+         DO i_out = 1, n_set
+            fm_set(i_out)%local_data(1:nrow_local, i_col) = x_out(:, i_out)
+         END DO
+      END DO
+!$OMP END DO
+      DEALLOCATE (x_in, x_out)
+!$OMP END PARALLEL
+
+      CALL timestop(handle)
+
+   END SUBROUTINE transform_fm_set_in_place
+
+! **************************************************************************************************
+!> \brief Real Coulomb factor of a periodic cell at the single point k = 0, A = M⁺(0) Bᵀ with
+!>        Bᵀ B = V(0) (B = V_+^½ of the positive part if V(0) is not positive definite); from the
+!>        cached V(0) with metric_pinv, otherwise from the k-point routines at k = 0.
+!> \param bs_env band-structure environment; cached V(0) and fm_Minv_Gamma, both consumed or
+!>        read here
+!> \param qs_env QS environment
+!> \param fm_A A = M⁺(0) Bᵀ (N_RI x N_RI); created here
+! **************************************************************************************************
+   SUBROUTINE compute_coulomb_factor_Gamma(bs_env, qs_env, fm_A)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(cp_fm_type), INTENT(OUT)                      :: fm_A
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_coulomb_factor_Gamma'
+
+      INTEGER                                            :: handle, n_RI
+      TYPE(cp_cfm_type)                                  :: cfm_M_inv_V_sqrt, cfm_V_sqrt
+      TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:)       :: cfm_V_kp
+      TYPE(cp_fm_type)                                   :: fm_B
+
+      CALL timeset(routineN, handle)
+
+      n_RI = bs_env%n_RI
+
+      IF (bs_env%ri_rs%gamma_corr%enabled .AND. bs_env%ri_rs%gamma_corr%V_zero_cached .AND. &
+          bs_env%metric_pinv) THEN
+
+         ! 1. V(0) = Bᵀ B, upper Cholesky factor; for a slab V(0) is not positive definite and
+         !    fm_sqrt returns the symmetric B = V_+^½ of the eigenvalues > 0.
+         CALL cp_fm_create(fm_B, bs_env%fm_struct_RI_RI)
+         CALL fm_sqrt(bs_env%ri_rs%gamma_corr%fm_V_zero, fm_B)
+         CALL cp_fm_release(bs_env%ri_rs%gamma_corr%fm_V_zero)
+         bs_env%ri_rs%gamma_corr%V_zero_cached = .FALSE.
+
+         !    A = M⁺(0) Bᵀ
+         CALL cp_fm_create(fm_A, bs_env%fm_struct_RI_RI)
+         CALL parallel_gemm('N', 'T', n_RI, n_RI, n_RI, 1.0_dp, bs_env%fm_Minv_Gamma, fm_B, &
+                            0.0_dp, fm_A)
+         CALL cp_fm_release(fm_B)
+
+      ELSE
+
+         ! 2. V(k=0), V^½(0) and M⁻¹(0) [V^½(0)]ᴴ from the k-point routines; the imaginary
+         !    part of the latter vanishes at k = 0, A = Re[M⁻¹(0) V^½(0)ᴴ]
+         CALL compute_V_k_by_lattice_sum(bs_env, qs_env, cfm_V_kp, 1)
+         CALL compute_MinvVsqrt_Vsqrt(bs_env, qs_env, cfm_V_kp, cfm_V_sqrt, cfm_M_inv_V_sqrt, 1)
+         CALL bs_env%para_env%sync()
+         CALL cp_cfm_release(cfm_V_kp(1))
+         DEALLOCATE (cfm_V_kp)
+         CALL cp_cfm_release(cfm_V_sqrt)
+         CALL cp_fm_create(fm_A, bs_env%fm_struct_RI_RI)
+         fm_A%local_data(:, :) = REAL(cfm_M_inv_V_sqrt%local_data(:, :), KIND=dp)
+         CALL cp_cfm_release(cfm_M_inv_V_sqrt)
+
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE compute_coulomb_factor_Gamma
+
+! **************************************************************************************************
+!> \brief Coulomb matrix V_PQ(k) = Σ_R e^(ik·R) (P, cell 0 | 1/r | Q, cell R) of the auxiliary
+!>        basis for one batch of k points of the W mesh. With the Γ-point correction, V(0) is the
+!>        Ewald sum without its singular G = 0 term, cached by gamma_corr_coulomb_at_zero.
+!> \param bs_env band-structure environment; k mesh of χ, ε, W and its batching
+!> \param qs_env QS environment
+!> \param cfm_V_kp V_PQ(k) for the k points ikp_start..ikp_end of the batch; allocated here
+!> \param ikp_batch index of the k-point batch
 ! **************************************************************************************************
    SUBROUTINE compute_V_k_by_lattice_sum(bs_env, qs_env, cfm_V_kp, ikp_batch)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
@@ -348,6 +607,7 @@ CONTAINS
 
       INTEGER                                            :: handle, ikp, ikp_end, ikp_start, &
                                                             nkp_chi_eps_W_batch, re_im
+      LOGICAL                                            :: use_cached_V
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_fm_type)                                   :: fm_V_kp_work
@@ -398,32 +658,52 @@ CONTAINS
 
       END IF
 
-      CALL build_2c_coulomb_matrix_kp(mat_V_kp, &
-                                      bs_env%kpoints_chi_eps_W, &
-                                      basis_type="RI_AUX", &
-                                      cell=cell, &
-                                      particle_set=particle_set, &
-                                      qs_kind_set=qs_kind_set, &
-                                      atomic_kind_set=atomic_kind_set, &
-                                      size_lattice_sum=bs_env%size_lattice_sum_V, &
-                                      operator_type=operator_coulomb, &
-                                      ikp_start=ikp_start, &
-                                      ikp_end=ikp_end)
+      ! With the Γ-point correction the mesh is Γ only: reuse V(q=0) from gamma_corr_coulomb_at_zero
+      ! (Ewald sum without its singular G = 0 term)
+      use_cached_V = bs_env%ri_rs%gamma_corr%enabled .AND. bs_env%ri_rs%gamma_corr%V_zero_cached
+      IF (use_cached_V) THEN
+         CPASSERT(ikp_start == 1 .AND. ikp_end == 1)
+      ELSE
+         CALL build_2c_coulomb_matrix_kp(mat_V_kp, &
+                                         bs_env%kpoints_chi_eps_W, &
+                                         basis_type="RI_AUX", &
+                                         cell=cell, &
+                                         particle_set=particle_set, &
+                                         qs_kind_set=qs_kind_set, &
+                                         atomic_kind_set=atomic_kind_set, &
+                                         size_lattice_sum=bs_env%size_lattice_sum_V, &
+                                         operator_type=operator_coulomb, &
+                                         ikp_start=ikp_start, &
+                                         ikp_end=ikp_end)
+      END IF
 
       bs_env%kpoints_chi_eps_W%nkp_grid = bs_env%nkp_grid_chi_eps_W_orig
 
       ALLOCATE (cfm_V_kp(ikp_start:ikp_end))
-      CALL cp_fm_create(fm_V_kp_work, bs_env%fm_RI_RI%matrix_struct)
+      CALL cp_fm_create(fm_V_kp_work, bs_env%fm_struct_RI_RI)
       DO ikp = ikp_start, ikp_end
-         CALL cp_cfm_create(cfm_V_kp(ikp), bs_env%fm_RI_RI%matrix_struct)
-         CALL cp_fm_set_all(fm_V_kp_work, 0.0_dp)
-         CALL copy_dbcsr_to_fm(mat_V_kp(ikp, 1)%matrix, fm_V_kp_work)
-         cfm_V_kp(ikp)%local_data = CMPLX(fm_V_kp_work%local_data, 0.0_dp, KIND=dp)
+         CALL cp_cfm_create(cfm_V_kp(ikp), bs_env%fm_struct_RI_RI)
+         IF (use_cached_V) THEN
+            ! Real by construction at q = 0 (gamma_corr_coulomb_at_zero checks the imaginary part).
+            cfm_V_kp(ikp)%local_data = CMPLX(bs_env%ri_rs%gamma_corr%fm_V_zero%local_data, &
+                                             0.0_dp, KIND=dp)
+            CALL cp_fm_release(bs_env%ri_rs%gamma_corr%fm_V_zero)
+            bs_env%ri_rs%gamma_corr%V_zero_cached = .FALSE.
+         ELSE
+            CALL cp_fm_set_all(fm_V_kp_work, 0.0_dp)
+            CALL copy_dbcsr_to_fm(mat_V_kp(ikp, 1)%matrix, fm_V_kp_work)
+            cfm_V_kp(ikp)%local_data = CMPLX(fm_V_kp_work%local_data, 0.0_dp, KIND=dp)
 
-         CALL cp_fm_set_all(fm_V_kp_work, 0.0_dp)
-         CALL copy_dbcsr_to_fm(mat_V_kp(ikp, 2)%matrix, fm_V_kp_work)
-         cfm_V_kp(ikp)%local_data = CMPLX(REAL(cfm_V_kp(ikp)%local_data, KIND=dp), &
-                                          fm_V_kp_work%local_data, KIND=dp)
+            CALL cp_fm_set_all(fm_V_kp_work, 0.0_dp)
+            CALL copy_dbcsr_to_fm(mat_V_kp(ikp, 2)%matrix, fm_V_kp_work)
+            cfm_V_kp(ikp)%local_data = CMPLX(REAL(cfm_V_kp(ikp)%local_data, KIND=dp), &
+                                             fm_V_kp_work%local_data, KIND=dp)
+         END IF
+
+         ! With the correction enabled the W mesh is Γ only and the cached V is V(q = 0).
+         IF (bs_env%ri_rs%gamma_corr%enabled) THEN
+            CPASSERT(ALL(ABS(bs_env%kpoints_chi_eps_W%xkp(:, ikp)) < eps_kp_gamma))
+         END IF
       END DO
       CALL cp_fm_release(fm_V_kp_work)
       CALL dbcsr_deallocate_matrix_set(mat_V_kp)
@@ -433,13 +713,15 @@ CONTAINS
    END SUBROUTINE compute_V_k_by_lattice_sum
 
 ! **************************************************************************************************
-!> \brief ...
-!> \param bs_env ...
-!> \param qs_env ...
-!> \param cfm_V_kp ...
-!> \param cfm_V_sqrt_ikp ...
-!> \param cfm_M_inv_V_sqrt_ikp ...
-!> \param ikp ...
+!> \brief Coulomb square root L(k) = V^½(k), L(k)ᴴ L(k) = V(k), and the product M⁻¹(k) L(k)ᴴ at one
+!>        k point, M_PQ(k) = Σ_R e^(ik·R) (P, cell 0 | m | Q, cell R) with the RI metric m. With
+!>        metric_pinv (single-point mesh k = 0 only), M⁻¹(0) is the pseudo-inverse fm_Minv_Gamma.
+!> \param bs_env band-structure environment; metric, regularization, k mesh
+!> \param qs_env QS environment
+!> \param cfm_V_kp V_PQ(k) for the k points of the current batch
+!> \param cfm_V_sqrt_ikp L(k) = V^½(k); created at ikp = 1, overwritten for every later k
+!> \param cfm_M_inv_V_sqrt_ikp M⁻¹(k) L(k)ᴴ; created at ikp = 1, overwritten for every later k
+!> \param ikp index of the k point in the W mesh
 ! **************************************************************************************************
    SUBROUTINE compute_MinvVsqrt_Vsqrt(bs_env, qs_env, cfm_V_kp, cfm_V_sqrt_ikp, &
                                       cfm_M_inv_V_sqrt_ikp, ikp)
@@ -452,6 +734,8 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_MinvVsqrt_Vsqrt'
 
       INTEGER                                            :: handle, info, n_RI
+      LOGICAL                                            :: at_gamma
+      REAL(KIND=dp)                                      :: shift
       TYPE(cp_cfm_type)                                  :: cfm_M_inv_ikp, cfm_work
       TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:)       :: cfm_M_ikp
 
@@ -459,9 +743,15 @@ CONTAINS
 
       n_RI = bs_env%n_RI
 
+      ! metric_pinv: M⁻¹(0) = fm_Minv_Gamma = U diag(1/m_i, m_i ≥ x m_max) Uᵀ, x = REGULARIZATION_RI,
+      ! the same metric as in the outer fold M⁺ W M⁺; no Tikhonov shift is added to M(k)
+      at_gamma = ALL(ABS(bs_env%kpoints_chi_eps_W%xkp(:, ikp)) < eps_kp_gamma)
+      shift = bs_env%regularization_RI
+      IF (bs_env%metric_pinv) shift = 0.0_dp
+
       ! get here M(k) and write it to cfm_M_ikp
       CALL RI_2c_integral_mat_kp(qs_env, cfm_M_ikp, cfm_V_kp(ikp)%matrix_struct, n_RI, bs_env%ri_metric, &
-                                 bs_env%kpoints_chi_eps_W, regularization_RI=bs_env%regularization_RI, &
+                                 bs_env%kpoints_chi_eps_W, regularization_RI=shift, &
                                  ikp_ext=ikp, do_build_cell_index=(ikp == 1))
 
       IF (ikp == 1) THEN
@@ -478,18 +768,24 @@ CONTAINS
 
       CALL cp_cfm_create(cfm_work, cfm_V_kp(ikp)%matrix_struct)
 
-      ! M(k) -> M^-1(k)
-      CALL cp_cfm_to_cfm(cfm_M_inv_ikp, cfm_work)
-      CALL cp_cfm_cholesky_decompose(matrix=cfm_M_inv_ikp, n=n_RI, info_out=info)
-      IF (info == 0) THEN
-         ! successful Cholesky decomposition
-         CALL cp_cfm_cholesky_invert(cfm_M_inv_ikp)
-         ! symmetrize the result
-         CALL cp_cfm_uplo_to_full(cfm_M_inv_ikp)
+      ! M(k) -> M⁻¹(k)
+      IF (bs_env%metric_pinv) THEN
+         ! M⁺(0) = fm_Minv_Gamma, real; metric_pinv comes with the mesh k = 0 only
+         CPASSERT(at_gamma)
+         cfm_M_inv_ikp%local_data = CMPLX(bs_env%fm_Minv_Gamma%local_data, 0.0_dp, KIND=dp)
       ELSE
-         ! Cholesky decomposition not successful: use expensive diagonalization
-         CALL cp_cfm_power(cfm_work, threshold=bs_env%eps_eigval_mat_RI, exponent=-1.0_dp)
-         CALL cp_cfm_to_cfm(cfm_work, cfm_M_inv_ikp)
+         CALL cp_cfm_to_cfm(cfm_M_inv_ikp, cfm_work)
+         CALL cp_cfm_cholesky_decompose(matrix=cfm_M_inv_ikp, n=n_RI, info_out=info)
+         IF (info == 0) THEN
+            ! successful Cholesky decomposition
+            CALL cp_cfm_cholesky_invert(cfm_M_inv_ikp)
+            ! symmetrize the result
+            CALL cp_cfm_uplo_to_full(cfm_M_inv_ikp)
+         ELSE
+            ! Cholesky decomposition not successful: use expensive diagonalization
+            CALL cp_cfm_power(cfm_work, threshold=bs_env%eps_eigval_mat_RI, exponent=-1.0_dp)
+            CALL cp_cfm_to_cfm(cfm_work, cfm_M_inv_ikp)
+         END IF
       END IF
 
       ! V(k) -> L(k) with L^H(k)*L(k) = V(k) [L(k) can be just considered to be V^0.5(k)]
@@ -534,7 +830,7 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      ! 1. epsilon(iw,k) = Id - V^0.5(k)*M^-1(k)*chi(iw,k)*M^-1(k)*V^0.5(k)
+      ! 1. epsilon(iw,k) = Id + V^0.5(k)*M^-1(k)*chi(iw,k)*M^-1(k)*V^0.5(k)
 
       ! 1. a) Form V^0.5(k)*M^-1(k)*chi(iw,k)*M^-1(k)*V^0.5(k).
       CALL cfm_contract_ABA(cfm_M_inv_V_sqrt_ikp, cfm_chi_eps_W_ikp_freq_j)
@@ -544,7 +840,8 @@ CONTAINS
 
       ! 2. W(iw,k) = V^0.5(k)*(epsilon^-1(iw,k)-Id)*V^0.5(k)
 
-      ! 2. a) Cholesky-factorize epsilon before inversion.
+      ! 2. a) Cholesky-factorize ε before inversion. The caller clipped χ into the positive
+      !       semidefinite cone, so ε = Id + V^½ M⁻¹ χ M⁻¹ V^½ ≥ Id.
       CALL cp_cfm_cholesky_decompose(matrix=cfm_chi_eps_W_ikp_freq_j, n=bs_env%n_RI, info_out=info)
       CPASSERT(info == 0)
 
@@ -681,10 +978,13 @@ CONTAINS
       CALL cfm_ikp_from_fm_Gamma(cfm_chi_eps_W_ikp_freq_j, bs_env%fm_chi_Gamma_freq, &
                                  ikp, qs_env, bs_env%kpoints_chi_eps_W, "RI_AUX")
 
-      ! 2. Remove all negative eigenvalues from χ_PQ(iω_j,k_i)
+      ! 2. Remove the negative eigenvalues of χ_PQ(iω_j,k_i). The exact χ is positive semidefinite;
+      !    the negative modes come from the minimum-image reconstruction χ(k) = Λ(k) ∘ χ(Γ),
+      !    Λ_PQ = e^(ik·R^MIC_PQ). The Cholesky factorization of ε in step 3 relies on this.
       CALL cp_cfm_power(cfm_chi_eps_W_ikp_freq_j, threshold=0.0_dp, exponent=1.0_dp)
 
-      ! 3. ε(iω_j,k_i) = Id - V^0.5(k_i)*M^-1(k_i)*χ(iω_j,k_i)*M^-1(k_i)*V^0.5(k_i)
+      ! 3. ε(iω_j,k_i) = Id + V^½(k_i) M⁻¹(k_i) χ(iω_j,k_i) M⁻¹(k_i) V^½(k_i)
+      !    W(iω_j,k_i) = V^½(k_i) (ε⁻¹(iω_j,k_i) − Id) V^½(k_i)
       CALL compute_cfm_W_ikp_freq_j(bs_env, cfm_chi_eps_W_ikp_freq_j, cfm_V_sqrt_ikp, &
                                     cfm_M_inv_V_sqrt_ikp)
 
@@ -1161,7 +1461,7 @@ CONTAINS
 
       ALLOCATE (fm_W_MIC_time(bs_env%num_time_freq_points))
       DO i_t = 1, bs_env%num_time_freq_points
-         CALL cp_fm_create(fm_W_MIC_time(i_t), bs_env%fm_RI_RI%matrix_struct, set_zero=.TRUE.)
+         CALL cp_fm_create(fm_W_MIC_time(i_t), bs_env%fm_struct_RI_RI, set_zero=.TRUE.)
       END DO
 
       CALL timestop(handle)
@@ -1270,7 +1570,7 @@ CONTAINS
 
       ALLOCATE (fm_V_tr_R(nimages_scf_desymm))
       DO img = 1, nimages_scf_desymm
-         CALL cp_fm_create(fm_V_tr_R(img), bs_env%fm_RI_RI%matrix_struct)
+         CALL cp_fm_create(fm_V_tr_R(img), bs_env%fm_struct_RI_RI)
          CALL copy_dbcsr_to_fm(mat_V_tr_R(img), fm_V_tr_R(img))
          CALL dbcsr_release(mat_V_tr_R(img))
       END DO

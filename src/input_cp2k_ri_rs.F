@@ -116,8 +116,9 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="REGULARIZATION_RI", &
                           description="Regularization applied to the RI fitting matrix $M_{PQ}$ of RPA "// &
                           "and GW. A negative value selects the context-dependent default: "// &
-                          "zero for molecules, 1.0E-4 for periodic RI-RS RPA and GW and 1.0E-2 "// &
-                          "for other periodic systems.", &
+                          "zero for molecules, 1.0E-4 for periodic RI-RS RPA and GW with k-points, "// &
+                          "1.0E-8 for periodic Gamma-only RI-RS GW and 1.0E-2 for other periodic "// &
+                          "systems.", &
                           usage="REGULARIZATION_RI 1.0E-4", &
                           default_r_val=-1.0_dp)
       CALL section_add_keyword(section, keyword)
@@ -128,8 +129,8 @@ CONTAINS
                           "Coulomb operator. The larger the cutoff radius, the faster "// &
                           "converges the resolution of the identity (RI) with respect to the "// &
                           "RI basis set size. Larger cutoff radius means higher computational "// &
-                          "cost. Not used in periodic RI-RS RPA and GW with k-points, where "// &
-                          "RI_CUTOFF_ATTENUATION sets the RI metric.", &
+                          "cost. Not used in periodic RI-RS RPA and GW, with k-points or "// &
+                          "Gamma-only, where RI_CUTOFF_ATTENUATION sets the RI metric.", &
                           usage="CUTOFF_RADIUS_RI 3.0", &
                           default_r_val=cp_unit_to_cp2k(value=3.0_dp, unit_str="angstrom"), &
                           type_of_var=real_t, unit_str="angstrom")
@@ -138,10 +139,12 @@ CONTAINS
 
       CALL keyword_create(keyword, __LOCATION__, name="RI_CUTOFF_ATTENUATION", &
                           description="Positive attenuation omega (in inverse bohr) of the "// &
-                          "erfc(omega*r)/r RI metric used by periodic RI-RS RPA and GW with k-points. "// &
-                          "The default is 0.3 bohr^-1. Other GW implementations use "// &
-                          "the truncated Coulomb metric set by CUTOFF_RADIUS_RI.", &
-                          usage="RI_CUTOFF_ATTENUATION 0.3", default_r_val=0.3_dp, &
+                          "erfc(omega*r)/r RI metric used by periodic RI-RS RPA and GW, with "// &
+                          "k-points or Gamma-only. A negative value selects the default: "// &
+                          "0.3 bohr^-1 with k-points and 0.8 bohr^-1 for Gamma-only RI-RS GW. "// &
+                          "Other GW implementations use the truncated Coulomb metric set by "// &
+                          "CUTOFF_RADIUS_RI.", &
+                          usage="RI_CUTOFF_ATTENUATION 0.3", default_r_val=-1.0_dp, &
                           type_of_var=real_t, unit_str="bohr^-1")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
@@ -294,9 +297,11 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="CUTOFF_RADIUS_RL_W", &
-                          description="Real-space cutoff radius (in Angstrom) for W(r,r') in the "// &
-                          "RI-RS GW self-energy Sigma(r,r') = G(r,r') W(r,r'). The Green's function "// &
-                          "G(r,r') decays to zero when r and r' are far apart, so W(r,r') is only "// &
+                          description="Real-space cutoff radius (in Angstrom) of the point-wise "// &
+                          "products in the RI-RS GW polarizability chi(r,r') = G(r,r') G(r',r) and "// &
+                          "self-energy Sigma(r,r') = G(r,r') W(r,r'): only pairs of grid blocks whose "// &
+                          "centres are closer than this radius enter. The Green's function G(r,r') "// &
+                          "decays to zero when r and r' are far apart, so the products are only "// &
                           "needed for |r-r'| below this radius, which saves computation time. "// &
                           "This helps only for very large systems and requires knowing the distance "// &
                           "beyond which G(r,r') is zero. Expert keyword: keep the default -1 "// &

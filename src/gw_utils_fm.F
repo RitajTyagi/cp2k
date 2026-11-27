@@ -15,15 +15,21 @@ MODULE gw_utils_fm
                                               cp_cfm_get_info,&
                                               cp_cfm_release,&
                                               cp_cfm_type
-   USE cp_fm_basic_linalg,              ONLY: cp_fm_uplo_to_full
+   USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale,&
+                                              cp_fm_uplo_to_full
    USE cp_fm_cholesky,                  ONLY: cp_fm_cholesky_decompose,&
                                               cp_fm_cholesky_invert
-   USE cp_fm_diag,                      ONLY: cp_fm_power
-   USE cp_fm_struct,                    ONLY: cp_fm_struct_equivalent
+   USE cp_fm_diag,                      ONLY: cp_fm_power,&
+                                              cp_fm_syevd
+   USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
+                                              cp_fm_struct_equivalent,&
+                                              cp_fm_struct_release,&
+                                              cp_fm_struct_type
    USE cp_fm_types,                     ONLY: cp_fm_create,&
                                               cp_fm_get_info,&
                                               cp_fm_release,&
                                               cp_fm_to_fm,&
+                                              cp_fm_to_fm_submat,&
                                               cp_fm_type
    USE kinds,                           ONLY: dp
    USE mathconstants,                   ONLY: z_one,&
@@ -38,8 +44,8 @@ MODULE gw_utils_fm
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_utils_fm'
 
-   PUBLIC :: cfm_contract_ABA, fm_contract_ABA, fm_invert, fm_sqrt, &
-             local_add_on_diag, local_complex_power
+   PUBLIC :: cfm_contract_ABA, fm_contract_ABA, fm_invert, fm_pseudo_inverse_relative, &
+             fm_sqrt, local_add_on_diag, local_complex_power
 
    INTERFACE fm_contract_ABA
       MODULE PROCEDURE fm_contract_ABA, fm_contract_ABA_set
@@ -353,5 +359,100 @@ CONTAINS
       CALL cp_fm_release(work)
 
    END SUBROUTINE fm_contract_ABA_set
+
+! **************************************************************************************************
+!> \brief Relative-cut pseudo-inverse of a real symmetric matrix M = U diag(m_i) Uᵀ, in place:
+!>          M⁺ = U diag(f_i) Uᵀ,   f_i = 1/m_i  for m_i ≥ x m_max,   f_i = 0  otherwise.
+!>        Optionally the retained modes L = {i : x m_max ≤ m_i < x_c m_max} are returned as U_L
+!>        and m_L, e.g. for M⁺_c = M⁺ − U_L diag(1/m_L) U_Lᵀ.
+!> \param matrix symmetric matrix M on input, its pseudo-inverse M⁺ on output
+!> \param rel_cut relative cut x (> 0)
+!> \param n_dropped number of eigenvalues m_i < x m_max
+!> \param m_kept smallest retained eigenvalue
+!> \param m_max largest eigenvalue
+!> \param rel_cut_low optional second cut x_c > x defining the set L above
+!> \param n_low number of modes in L (0 if rel_cut_low is absent or L is empty)
+!> \param fm_U_low the eigenvectors U_L, n x n_low, distributed like matrix; created only if
+!>        n_low > 0
+!> \param m_low their eigenvalues m_L (allocated with n_low entries)
+! **************************************************************************************************
+   SUBROUTINE fm_pseudo_inverse_relative(matrix, rel_cut, n_dropped, m_kept, m_max, &
+                                         rel_cut_low, n_low, fm_U_low, m_low)
+      TYPE(cp_fm_type), INTENT(IN)                       :: matrix
+      REAL(KIND=dp), INTENT(IN)                          :: rel_cut
+      INTEGER, INTENT(OUT)                               :: n_dropped
+      REAL(KIND=dp), INTENT(OUT)                         :: m_kept, m_max
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: rel_cut_low
+      INTEGER, INTENT(OUT), OPTIONAL                     :: n_low
+      TYPE(cp_fm_type), INTENT(INOUT), OPTIONAL          :: fm_U_low
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:), &
+         INTENT(INOUT), OPTIONAL                         :: m_low
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'fm_pseudo_inverse_relative'
+
+      INTEGER                                            :: handle, i, i_first, n, n_l
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigval, factor
+      TYPE(cp_fm_struct_type), POINTER                   :: struct_low
+      TYPE(cp_fm_type)                                   :: fm_U, fm_U_scaled
+
+      CALL timeset(routineN, handle)
+      CPASSERT(rel_cut > 0.0_dp)
+
+      CALL cp_fm_get_info(matrix, nrow_global=n)
+      ALLOCATE (eigval(n), factor(n))
+      CALL cp_fm_create(fm_U, matrix%matrix_struct)
+      CALL cp_fm_create(fm_U_scaled, matrix%matrix_struct)
+
+      ! M = U diag(m_i) Uᵀ, eigenvalues ascending (cp_fm_syevd destroys M). ScaLAPACK, not ELPA:
+      ! rounding errors in the small retained m_i are amplified by 1/m_i.
+      CALL cp_fm_syevd(matrix, fm_U, eigval)
+      m_max = eigval(n)
+      ! f_i = 1/m_i on the retained modes m_i ≥ x m_max, 0 on the dropped ones
+      n_dropped = 0
+      m_kept = m_max
+      DO i = 1, n
+         IF (eigval(i) < rel_cut*m_max) THEN
+            factor(i) = 0.0_dp
+            n_dropped = n_dropped + 1
+         ELSE
+            factor(i) = 1.0_dp/eigval(i)
+            m_kept = MIN(m_kept, eigval(i))
+         END IF
+      END DO
+      ! M⁺ = (U diag(f)) Uᵀ
+      CALL cp_fm_to_fm(fm_U, fm_U_scaled)
+      CALL cp_fm_column_scale(fm_U_scaled, factor)
+      CALL parallel_gemm("N", "T", n, n, n, 1.0_dp, fm_U_scaled, fm_U, 0.0_dp, matrix)
+
+      ! Optional: the retained modes below the second cut, L = {i : x m_max ≤ m_i < x_c m_max},
+      ! i.e. the columns i_first .. i_first+n_l-1 of U (eigenvalues ascending)
+      IF (PRESENT(rel_cut_low)) THEN
+         CPASSERT(PRESENT(n_low) .AND. PRESENT(fm_U_low) .AND. PRESENT(m_low))
+         i_first = n_dropped + 1
+         n_l = 0
+         DO i = i_first, n
+            IF (eigval(i) < rel_cut_low*m_max) n_l = n_l + 1
+         END DO
+         n_low = n_l
+         IF (ALLOCATED(m_low)) DEALLOCATE (m_low)
+         ALLOCATE (m_low(n_l))
+         IF (n_l > 0) THEN
+            m_low(:) = eigval(i_first:i_first + n_l - 1)
+            NULLIFY (struct_low)
+            CALL cp_fm_struct_create(struct_low, template_fmstruct=matrix%matrix_struct, &
+                                     ncol_global=n_l)
+            CALL cp_fm_create(fm_U_low, struct_low)
+            CALL cp_fm_struct_release(struct_low)
+            CALL cp_fm_to_fm_submat(fm_U, fm_U_low, n, n_l, 1, i_first, 1, 1)
+         END IF
+      END IF
+
+      CALL cp_fm_release(fm_U)
+      CALL cp_fm_release(fm_U_scaled)
+      DEALLOCATE (eigval, factor)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE fm_pseudo_inverse_relative
 
 END MODULE gw_utils_fm
